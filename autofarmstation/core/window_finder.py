@@ -219,8 +219,15 @@ def list_visible_windows(
     return out
 
 
-def find_windows_for_pids(pids: Iterable[int]) -> dict[int, list[WindowInfo]]:
-    """按 PID 分组返回该进程的所有可见顶层窗口."""
+def find_windows_for_pids(
+    pids: Iterable[int],
+    *,
+    include_hidden: bool = False,
+) -> dict[int, list[WindowInfo]]:
+    """按 PID 分组返回该进程的所有可见顶层窗口.
+
+    include_hidden=True 时把隐藏 / 无标题窗口也带回来(给「按 PID / 按进程名添加」用)。
+    """
     pid_set = set(int(p) for p in pids if p)
     out: dict[int, list[WindowInfo]] = {p: [] for p in pid_set}
     if not pid_set:
@@ -228,13 +235,88 @@ def find_windows_for_pids(pids: Iterable[int]) -> dict[int, list[WindowInfo]]:
 
     def cb(hwnd: int, _lparam: int) -> bool:
         info = get_window_info(hwnd)
-        if info is None or not info.visible or not info.title.strip():
+        if info is None:
+            return True
+        if not include_hidden and (not info.visible or not info.title.strip()):
             return True
         if info.pid in pid_set:
             out[info.pid].append(info)
         return True
 
     _user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return out
+
+
+def list_all_windows_for_pid(
+    pid: int,
+    *,
+    include_hidden: bool = True,
+    only_toplevel: bool = True,
+) -> list[WindowInfo]:
+    """单个 PID 的所有窗口列表(默认含隐藏 / 无标题,排除 WS_CHILD 子窗口).
+
+    给 ProcessManager.add_by_pid_force / add_by_process_name 用:
+    即使目标游戏的窗口被隐藏或无标题,也能被枚举出来供用户「强制添加」。
+    """
+    out: list[WindowInfo] = []
+    if not pid:
+        return out
+
+    def cb(hwnd: int, _lparam: int) -> bool:
+        info = get_window_info(hwnd)
+        if info is None or info.pid != pid:
+            return True
+        if not include_hidden and (not info.visible or not info.title.strip()):
+            return True
+        if only_toplevel:
+            try:
+                style = _user32.GetWindowLongW(hwnd, GWL_STYLE)
+            except Exception:
+                style = 0
+            if style & WS_CHILD:
+                return True
+        out.append(info)
+        return True
+
+    _user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return out
+
+
+def list_all_windows_across_processes(
+    *,
+    include_hidden: bool = True,
+    only_toplevel: bool = True,
+    pid_limit: int = 600,
+) -> list[WindowInfo]:
+    """枚举所有 PID 的所有窗口(含隐藏 / 无标题)。「选择窗口」对话框勾选
+    「包含隐藏窗口」时用这个;成本比 list_visible_windows 高(遍历每个 PID)。
+
+    pid_limit 默认 600,防止某些机器进程数爆炸把 UI 卡住。
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return []
+    out: list[WindowInfo] = []
+    pids: list[int] = []
+    try:
+        for p in psutil.process_iter(["pid"]):
+            pid = int(p.info.get("pid") or 0)
+            if pid:
+                pids.append(pid)
+                if len(pids) >= pid_limit:
+                    break
+    except Exception:
+        return out
+    for pid in pids:
+        try:
+            out.extend(
+                list_all_windows_for_pid(
+                    pid, include_hidden=include_hidden, only_toplevel=only_toplevel,
+                )
+            )
+        except Exception:
+            continue
     return out
 
 
@@ -283,6 +365,7 @@ SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
+SWP_FRAMECHANGED = 0x0020
 
 
 def set_window_pos(
@@ -384,6 +467,31 @@ def work_area(hwnd: int = 0) -> tuple[int, int, int, int] | None:
     return None
 
 
+# GetSystemMetrics 原型(虚拟屏幕范围用于 SendInput ABSOLUTE 坐标归一化)
+_user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+_user32.GetSystemMetrics.restype = ctypes.c_int
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+
+def virtual_screen() -> tuple[int, int, int, int]:
+    """整个虚拟桌面(所有显示器拼起来)的范围:(vx, vy, vw, vh).
+
+    SendInput ABSOLUTE 坐标是基于虚拟桌面归一化到 0..65535 的,所以必须按这个范围计算,
+    不能用主显示器像素数 —— 多显示器场景下主显示器之外的点会被错误归一化。
+    失败时回退 (0, 0, 1, 1),保证调用方不会除零。
+    """
+    vx = int(_user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+    vy = int(_user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+    vw = int(_user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+    vh = int(_user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    if vw <= 0 or vh <= 0:
+        return (0, 0, 1, 1)
+    return (vx, vy, vw, vh)
+
+
 def is_minimized(hwnd: int) -> bool:
     return bool(_user32.IsIconic(hwnd))
 
@@ -419,8 +527,19 @@ def force_foreground(hwnd: int) -> bool:
         _user32.AttachThreadInput(tid_me, tid_fg, False)
 
 
-def fit_to_work_area(hwnd: int, *, margin: int = 0) -> bool:
-    """把窗口调整成所在显示器工作区大小,保证整个界面完整可见.
+def fit_to_work_area(
+    hwnd: int,
+    *,
+    margin: int | tuple[int, int, int, int] | None = None,
+    scale: float | None = None,
+) -> bool:
+    """把窗口调整成所在显示器工作区大小,可按边收缩 / 按比例缩放.
+
+    margin 接受:
+    - int           —— 四边各减同样的像素(默认 0 = 完全铺满,行为与旧版一致);
+    - (l, t, r, b)  —— 各边独立减多少像素;
+    - None          —— 视为 0。
+    scale ∈ (0, 2] —— 在裁出来的矩形基础上按比例居中缩放;None 表示不缩。
 
     已经是最大化状态时保持最大化(游戏全屏更完整)。
     """
@@ -428,18 +547,59 @@ def fit_to_work_area(hwnd: int, *, margin: int = 0) -> bool:
     if wa is None:
         return False
     left, top, right, bottom = wa
-    left += margin
-    top += margin
-    right -= margin
-    bottom -= margin
+    ml, mt, mr, mb = _resolve_margin(margin)
+    left += ml
+    top += mt
+    right -= mr
+    bottom -= mb
     w = max(200, right - left)
     h = max(150, bottom - top)
+    if scale is not None and 0 < scale <= 2:
+        w = max(160, int(w * scale))
+        h = max(120, int(h * scale))
+        cx = (left + right) // 2
+        cy = (top + bottom) // 2
+        left = cx - w // 2
+        top = cy - h // 2
+        right = left + w
+        bottom = top + h
     if is_maximized(hwnd):
         return True
-    return move_window(hwnd, left, top, w, h)
+    # SWP_SHOWWINDOW 让被最小化 / 隐藏的窗口显出来;
+    # SWP_FRAMECHANGED 让游戏重新计算非客户区 —— 修了部分游戏「改了尺寸但内容
+    # 仍按旧 client size 渲染」的毛病。
+    return set_window_pos(
+        hwnd, left, top, right - left, bottom - top,
+        flags=SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+    )
 
 
-def focus_window(hwnd: int, *, fit: bool = True, margin: int = 0) -> bool:
+def _resolve_margin(
+    margin: int | tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int]:
+    """把 margin 参数归一为 (left, top, right, bottom)."""
+    if margin is None:
+        return (0, 0, 0, 0)
+    if isinstance(margin, int):
+        m = max(0, margin)
+        return (m, m, m, m)
+    if len(margin) == 4:
+        return (
+            max(0, int(margin[0])),
+            max(0, int(margin[1])),
+            max(0, int(margin[2])),
+            max(0, int(margin[3])),
+        )
+    raise ValueError(f"margin 必须是 int 或 4-tuple,得到 {margin!r}")
+
+
+def focus_window(
+    hwnd: int,
+    *,
+    fit: bool = True,
+    margin: int | tuple[int, int, int, int] | None = None,
+    scale: float | None = None,
+) -> bool:
     """聚焦窗口:最小化则还原 → 可选铺满工作区 → 提到前台.
 
     返回是否成功提到前台。
@@ -449,7 +609,7 @@ def focus_window(hwnd: int, *, fit: bool = True, margin: int = 0) -> bool:
     if is_minimized(hwnd):
         show_window(hwnd, SW_RESTORE)
     if fit:
-        fit_to_work_area(hwnd, margin=margin)
+        fit_to_work_area(hwnd, margin=margin, scale=scale)
     return force_foreground(hwnd)
 
 

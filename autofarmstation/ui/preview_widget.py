@@ -126,6 +126,14 @@ class PreviewWidget(QFrame):
         self._btn_focus.clicked.connect(self._on_focus_clicked)
         title_bar.addWidget(self._btn_focus)
 
+        self._btn_edge = QPushButton("边距")
+        self._btn_edge.setFixedWidth(44)
+        self._btn_edge.setToolTip(
+            "设置这个窗口聚焦时的上/下/左/右边距和画面缩放比例,各窗口独立保存"
+        )
+        self._btn_edge.clicked.connect(self._on_edge_clicked)
+        title_bar.addWidget(self._btn_edge)
+
         self._btn_close = QPushButton("✕")
         self._btn_close.setFixedWidth(28)
         self._btn_close.setStyleSheet("QPushButton { color:#ff8888; }")
@@ -535,9 +543,56 @@ class PreviewWidget(QFrame):
                 fit = bool(_cfg_instance().get("ui.focus_fit_screen", True))
             except Exception:  # noqa: BLE001
                 fit = True
+        # 读取每窗口独立的边距 / 缩放偏好(空 → 全 0 + 100%)
+        margin: tuple[int, int, int, int] = (0, 0, 0, 0)
+        scale: float = 1.0
+        if self._pm is not None:
+            try:
+                item = self._pm.get(self.hwnd)
+                if item is not None:
+                    margin = item.margin_tuple()
+                    scale = float(getattr(item, "content_scale", 1.0) or 1.0)
+            except Exception:  # noqa: BLE001
+                margin, scale = (0, 0, 0, 0), 1.0
         if wf.get_window_info(self.hwnd) is not None:
-            wf.focus_window(self.hwnd, fit=fit)
+            wf.focus_window(self.hwnd, fit=fit, margin=margin, scale=scale)
         self.focused.emit(self.hwnd)
+
+    def _on_edge_clicked(self) -> None:
+        """打开「边距 / 缩放」对话框,保存到当前 TrackedProcess."""
+        if self._pm is None:
+            return
+        item = self._pm.get(self.hwnd)
+        if item is None:
+            return
+        from .edge_margin_dialog import EdgeMargin, EdgeMarginDialog
+        initial = EdgeMargin(
+            left=int(getattr(item, "margin_left", 0) or 0),
+            top=int(getattr(item, "margin_top", 0) or 0),
+            right=int(getattr(item, "margin_right", 0) or 0),
+            bottom=int(getattr(item, "margin_bottom", 0) or 0),
+            scale=float(getattr(item, "content_scale", 1.0) or 1.0),
+        )
+        dlg = EdgeMarginDialog(
+            self,
+            title=f"聚焦边距 / 缩放 · {item.display_name()}",
+            initial=initial,
+            info_text=(
+                "边距(单位 px)只在「聚焦」这个窗口时生效;画面缩放需要游戏本身是\n"
+                "「边框全屏 / 跟随窗口尺寸」渲染,否则缩放不会真的改变游戏画面。"
+                "\n默认 0 + 100% 与未设置时完全一致。"
+            ),
+        )
+        if dlg.exec() == EdgeMarginDialog.DialogCode.Accepted:
+            value = dlg.result_value()
+            try:
+                self._pm.set_margins(
+                    self.hwnd,
+                    margin=(value.left, value.top, value.right, value.bottom),
+                    scale=value.scale,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_autoclick_toggle(self, checked: bool) -> None:
         self.autoclick_toggle.emit(self.hwnd)

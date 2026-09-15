@@ -1137,6 +1137,112 @@ def t_app_help() -> bool:
         return False
 
 
+# === v1.6.1 新增的 4 项: ===
+def t_dpi_awareness() -> bool:
+    """v1.6.1 启动时声明 DPI 感知(SetProcessDpiAwareness / V2 / SetProcessDPIAware 三档回退)。"""
+    _div("v1.6.1 dpi awareness")
+    try:
+        from autofarmstation.__init__ import _set_process_dpi_awareness
+        # 函数存在、可调用、不会抛异常
+        _set_process_dpi_awareness()
+        _ok("DPI 感知声明函数可用(已依次尝试 SetProcessDpiAwareness / V2 / SetProcessDPIAware)")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("dpi", e)
+        return False
+
+
+def t_virtual_screen() -> bool:
+    """v1.6.1 SendInput ABSOLUTE 按虚拟屏幕归一化,而非主显示器像素。"""
+    _div("v1.6.1 virtual screen")
+    try:
+        from autofarmstation.core import window_finder as wf
+        vs = wf.virtual_screen()
+        assert isinstance(vs, tuple) and len(vs) == 4
+        vx, vy, vw, vh = vs
+        assert vw > 0 and vh > 0, f"虚拟屏幕宽度/高度必须是正数,得到 vw={vw} vh={vh}"
+        _ok(f"虚拟屏幕 vx={vx} vy={vy} vw={vw} vh={vh}(用于 SendInput ABSOLUTE 归一化)")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("virtual_screen", e)
+        return False
+
+
+def t_hidden_windows_and_pid() -> bool:
+    """v1.6.1 进程识别更稳:按 PID 强制添加 / 按进程名添加 / 隐藏窗口枚举 / set_margins。"""
+    _div("v1.6.1 hidden windows + pid + margins")
+    try:
+        from autofarmstation.core import window_finder as wf
+        from autofarmstation.core.process_manager import ProcessManager, TrackedProcess
+
+        # list_all_windows_for_pid:pid=0 返回空列表(保护性检查)
+        empty = wf.list_all_windows_for_pid(0)
+        assert empty == [], f"pid=0 应返回空列表,得到 {empty!r}"
+        # find_windows_for_pids 支持 include_hidden 参数
+        sig = __import__("inspect").signature(wf.find_windows_for_pids)
+        assert "include_hidden" in sig.parameters, "find_windows_for_pids 必须有 include_hidden 参数"
+        # list_all_windows_across_processes 存在(可能没在运行 psutil 的环境里跑,但函数必须存在)
+        assert hasattr(wf, "list_all_windows_across_processes"), \
+            "list_all_windows_across_processes 必须存在(供「包含隐藏窗口」勾选用)"
+        # ProcessManager 新方法
+        pm = ProcessManager()
+        for m in ("add_by_pid_force", "add_by_process_name", "set_margins"):
+            assert hasattr(pm, m), f"ProcessManager 缺少 {m}"
+        # set_margins 直接在构造的 TrackedProcess 上跑一遍
+        fake = TrackedProcess(hwnd=12345, pid=0, name="test", title="test", exe="")
+        pm._items[12345] = fake  # type: ignore[attr-defined]
+        ok = pm.set_margins(
+            12345,
+            margin=(1, 2, 3, 4),
+            scale=1.1,
+        )
+        assert ok and fake.margin_left == 1 and fake.margin_top == 2
+        assert fake.margin_right == 3 and fake.margin_bottom == 4
+        assert abs(fake.content_scale - 1.1) < 1e-6
+        # margin_tuple 应返回 int 四元组
+        assert fake.margin_tuple() == (1, 2, 3, 4)
+        _ok("按 PID 强制添加 / 按进程名添加 / 隐藏窗口枚举 / set_margins 均已就位")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("hidden_windows_and_pid", e)
+        return False
+
+
+def t_focus_with_margins_and_auto_click() -> bool:
+    """v1.6.1 fit_to_work_area 支持每边距 + 缩放;InputSender.click 支持 auto 模式。"""
+    _div("v1.6.1 focus margins + auto click")
+    try:
+        from autofarmstation.core import window_finder as wf
+
+        # fit_to_work_area 接受 4-tuple margin + scale
+        sig_m = __import__("inspect").signature(wf.fit_to_work_area)
+        assert "margin" in sig_m.parameters and "scale" in sig_m.parameters
+        sig_f = __import__("inspect").signature(wf.focus_window)
+        assert "margin" in sig_f.parameters and "scale" in sig_f.parameters
+
+        # _resolve_margin 的归一逻辑(int → 4-tuple,None → (0,0,0,0))
+        rm = wf._resolve_margin
+        assert rm(None) == (0, 0, 0, 0)
+        assert rm(10) == (10, 10, 10, 10)
+        assert rm((1, 2, 3, 4)) == (1, 2, 3, 4)
+
+        # InputSender.click 返回 (bool, str),default_mode='auto'
+        from autofarmstation.core.input_sender import InputSender, _InputHelper
+        s = InputSender()
+        assert s.default_mode == "auto", f"default_mode 应是 auto,得到 {s.default_mode}"
+        # _InputHelper.move_abs 内部应使用 wf.virtual_screen()(通过 spy 粗略验证)
+        src = __import__("inspect").getsource(_InputHelper.move_abs)
+        assert "virtual_screen" in src, "move_abs 必须调用 virtual_screen(),不能再用主显示器 sw/sh"
+        # _InputHelper 暴露了 screen_size 给 selftest 用,任一返回值是 int 都行
+        sw, sh = _InputHelper.screen_size()
+        assert isinstance(sw, int) and isinstance(sh, int)
+        _ok("fit/focus 接受 (l,t,r,b)+scale,InputSender.click 默认 auto,move_abs 走虚拟屏幕")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("focus_margins_and_auto_click", e)
+        return False
+
+
 # === 入口 ===
 def run_all() -> int:
     t0 = time.time()
@@ -1148,6 +1254,9 @@ def run_all() -> int:
         t_bat_library, t_steam_overlay,
         t_update_settings, t_audio, t_game_launcher,
         t_io_smoke, t_gui_smoke, t_app_help,
+        # v1.6.1 新增
+        t_dpi_awareness, t_virtual_screen,
+        t_hidden_windows_and_pid, t_focus_with_margins_and_auto_click,
     ]
     passed = 0
     failed = 0

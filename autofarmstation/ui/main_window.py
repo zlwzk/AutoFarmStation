@@ -116,6 +116,8 @@ class MainWindow(QMainWindow):
         self._monitor.on_event(self._on_monitor_event)
         # 自动重启节流:hwnd → 最近几次重启的时间戳
         self._restart_hist: dict[int, list[float]] = {}
+        # v1.6.1:「选择窗口」对话框是否列出隐藏 / 无标题窗口
+        self._include_hidden: bool = False
         self._bat_lib = BatLibrary()
         # 多窗口自动化中枢:每窗口独立配置 + 多窗口同步执行
         self._hub = AutomationHub(stats=self._stats, logger=self._log)
@@ -546,6 +548,20 @@ class MainWindow(QMainWindow):
         a_refresh.setShortcut("F5")
         a_refresh.triggered.connect(self._on_refresh_windows)
         menu_proc.addAction(a_refresh)
+        a_add_by_pid = QAction("按 PID 添加...", self)
+        a_add_by_pid.setToolTip("输入一个 PID(任务管理器能看到),强制把它的所有窗口加入追踪,适合主窗口被隐藏或无标题的游戏")
+        a_add_by_pid.triggered.connect(self._on_add_by_pid)
+        menu_proc.addAction(a_add_by_pid)
+        a_add_by_name = QAction("按进程名添加...", self)
+        a_add_by_name.setToolTip("输入 .exe 名(如 melvoridle.exe),把所有同名进程的窗口都加入追踪")
+        a_add_by_name.triggered.connect(self._on_add_by_name)
+        menu_proc.addAction(a_add_by_name)
+        a_include_hidden = QAction("包含隐藏窗口", self)
+        a_include_hidden.setCheckable(True)
+        a_include_hidden.setChecked(self._include_hidden)
+        a_include_hidden.setToolTip("勾选后,「添加窗口」对话框会列出隐藏 / 无标题的窗口")
+        a_include_hidden.triggered.connect(self._on_toggle_include_hidden)
+        menu_proc.addAction(a_include_hidden)
         a_clear = QAction("清空追踪", self)
         a_clear.triggered.connect(self._on_clear_all)
         menu_proc.addAction(a_clear)
@@ -751,7 +767,7 @@ class MainWindow(QMainWindow):
 
     # --- 进程操作 ---
     def _on_add_process(self) -> None:
-        dlg = ProcessSelectorDialog(self)
+        dlg = ProcessSelectorDialog(self, include_hidden=self._include_hidden)
         if dlg.exec():
             # 支持多选:这里取所有选中
             sels = dlg.selected_all()
@@ -773,6 +789,78 @@ class MainWindow(QMainWindow):
             self._statusBar().showMessage(
                 f"已添加 {len(sels)} 个窗口", 3000,  # type: ignore[union-attr]
             )
+
+    def _on_add_by_pid(self) -> None:
+        """按 PID 强制添加(支持主窗口被隐藏 / 无标题的游戏)。"""
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self,
+            "按 PID 添加",
+            "输入要添加的进程 PID(整数):",
+        )
+        if not ok:
+            return
+        s = str(text).strip()
+        if not s.isdigit():
+            self._statusBar().showMessage(
+                "请输入整数 PID", 3000,
+            )
+            return
+        pid = int(s)
+        added = self._pm.add_by_pid_force(pid)
+        if not added:
+            self._statusBar().showMessage(
+                f"PID {pid} 下没有可用的顶层窗口", 3000,
+            )
+            return
+        self._after_bulk_add(added)
+
+    def _on_add_by_name(self) -> None:
+        """按进程名添加(把同名进程的所有窗口都加入追踪)。"""
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self,
+            "按进程名添加",
+            "输入进程名(.exe),如 melvoridle.exe:",
+        )
+        if not ok:
+            return
+        name = str(text).strip()
+        if not name:
+            self._statusBar().showMessage("请输入进程名", 3000)
+            return
+        added = self._pm.add_by_process_name(name)
+        if not added:
+            self._statusBar().showMessage(
+                f"没找到名为 {name} 的进程,或它们都无可用窗口", 3000,
+            )
+            return
+        self._after_bulk_add(added)
+
+    def _on_toggle_include_hidden(self, checked: bool) -> None:
+        self._include_hidden = bool(checked)
+        self._statusBar().showMessage(
+            ("「选择窗口」对话框将包含隐藏 / 无标题窗口" if checked
+             else "「选择窗口」对话框只列可见且有标题的窗口"),
+            3000,
+        )
+
+    def _after_bulk_add(self, added: list) -> None:
+        """按 PID / 按名添加的统一收尾:匹配预设 + 保存 + 状态提示。"""
+        for tp in added:
+            auto_preset = self._presets.find_match(
+                process_name=tp.name, title=tp.title,
+            )
+            if auto_preset:
+                self._log.info(
+                    "为 %s 自动匹配预设:%s", tp.title, auto_preset.name,
+                )
+            self._remember_launch(int(tp.hwnd), int(tp.pid), tp.title)
+            self._apply_default_session_volume(int(tp.hwnd))
+        self._save_state()
+        self._statusBar().showMessage(
+            f"已添加 {len(added)} 个窗口", 3000,
+        )
 
     def _on_refresh_windows(self) -> None:
         gone = self._pm.refresh()

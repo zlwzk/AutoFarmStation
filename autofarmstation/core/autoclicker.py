@@ -74,7 +74,7 @@ class AutoClickerConfig:
     jitter_pct: int = 0  # 抖动百分比(0~100)
     total_clicks: int = 0  # 0 = 无限
     loop: bool = True  # 到尾后回到第一点
-    mode: str = "post"  # 'post' or 'send'
+    mode: str = "auto"  # 'auto' (默认先后台投递,失败改真实输入) / 'post' / 'send'
     # 记点位时该窗口的客户区尺寸,用来给老点位补算比例 / 「按当前窗口重算比例」
     client_w: int = 0
     client_h: int = 0
@@ -321,9 +321,14 @@ class AutoClicker:
                         cx, cy = p.resolve(cw, ch)
 
                 try:
-                    self._sender.click((self.config.hwnd, cx, cy), p.button, double=p.double)
+                    ok, reason = self._sender.click((self.config.hwnd, cx, cy), p.button, double=p.double)
+                    if not ok:
+                        self._log.warning("点击失败: %s", reason or "未知原因")
+                    elif reason:
+                        # auto 模式回退提示,不是错误
+                        self._log.info("连点回退: %s", reason)
                 except Exception as e:  # noqa: BLE001
-                    self._log.warning("点击失败: %s", e)
+                    self._log.warning("点击异常: %s", e)
 
                 with self._lock:
                     self._done_count += 1

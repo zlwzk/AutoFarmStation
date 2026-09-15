@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QPushButton, QLineEdit, QDialogButtonBox,
+    QCheckBox,
+    QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QPushButton, QVBoxLayout,
 )
 
 from ..core import window_finder as wf
@@ -15,7 +16,13 @@ from ..core.window_finder import WindowInfo
 class ProcessSelectorDialog(QDialog):
     """列出所有可见顶层窗口,让用户选择要添加的."""
 
-    def __init__(self, parent: QWidget | None = None, *, title_filter: str = "") -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        title_filter: str = "",
+        include_hidden: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("选择要追踪的窗口")
         self.resize(640, 480)
@@ -23,10 +30,17 @@ class ProcessSelectorDialog(QDialog):
 
         v = QVBoxLayout(self)
         v.addWidget(QLabel("勾选需要挂机管理的窗口(可多选,点击「追踪选中」)"))
+        h = QHBoxLayout()
         self._filter = QLineEdit()
         self._filter.setPlaceholderText("按窗口标题筛选...")
         self._filter.textChanged.connect(self._refresh)
-        v.addWidget(self._filter)
+        h.addWidget(self._filter, stretch=1)
+        self._chk_hidden = QCheckBox("包含隐藏窗口")
+        self._chk_hidden.setToolTip("勾选后,主窗口被隐藏 / 无标题的游戏也会出现在列表里")
+        self._chk_hidden.setChecked(include_hidden)
+        self._chk_hidden.toggled.connect(self._refresh)
+        h.addWidget(self._chk_hidden)
+        v.addLayout(h)
 
         self._list = QListWidget()
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -44,6 +58,18 @@ class ProcessSelectorDialog(QDialog):
     def _refresh(self, title_filter: str = "") -> None:
         self._list.clear()
         wins = wf.list_visible_windows(title_filter=self._filter.text() or title_filter)
+        if self._chk_hidden.isChecked():
+            seen = {(w.pid, w.hwnd) for w in wins}
+            try:
+                hidden_wins = wf.list_all_windows_across_processes()
+            except Exception:
+                hidden_wins = []
+            for w in hidden_wins:
+                if (w.pid, w.hwnd) in seen:
+                    continue
+                if title_filter and title_filter.lower() not in w.title.lower():
+                    continue
+                wins.append(w)
         for w in wins:
             label = f"[{w.pid}] {w.title}  ({w.class_name})"
             item = QListWidgetItem(label)

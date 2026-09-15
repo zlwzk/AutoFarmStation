@@ -202,10 +202,15 @@ class _InputHelper:
 
     @staticmethod
     def move_abs(x: int, y: int) -> None:
-        """鼠标绝对移动(0..65535 归一化坐标)."""
-        sw, sh = _InputHelper.screen_size()
-        nx = int(x * 65535 / max(1, sw - 1))
-        ny = int(y * 65535 / max(1, sh - 1))
+        """鼠标绝对移动(0..65535 归一化坐标).
+
+        SendInput 的 ABSOLUTE 归一化基准是**整个虚拟桌面**(所有显示器拼起来),
+        不是主显示器 —— 多显示器场景下若按主显示器 sw/sh 归一化,副屏(尤其高 DPI 屏)
+        上的点会偏到主屏里或屏幕外,这是 v1.6.0 之前连点器「点了没反应」的主要原因之一。
+        """
+        vx, vy, vw, vh = wf.virtual_screen()
+        nx = int((x - vx) * 65535 / max(1, vw - 1))
+        ny = int((y - vy) * 65535 / max(1, vh - 1))
         mi = MOUSEINPUT(nx, ny, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, 0)
         _send_inputs([INPUT(INPUT_MOUSE, INPUT_UNION(mi=mi))])
 
@@ -270,9 +275,10 @@ def _send_inputs(inputs: list[INPUT]) -> int:
 class InputSender:
     """对外的高级输入发送器."""
 
-    def __init__(self, *, default_mode: str = "post") -> None:
-        """default_mode: 'post' = PostMessage 模式;'send' = 真实输入模式."""
-        self.default_mode = default_mode if default_mode in ("post", "send") else "post"
+    def __init__(self, *, default_mode: str = "auto") -> None:
+        """default_mode: 'auto' (默认)= 先后台投递,失败改真实输入;
+        'post' = 仅后台投递;'send' = 直接真实输入。"""
+        self.default_mode = default_mode if default_mode in ("auto", "post", "send") else "auto"
 
     # --- 模式 ---
     def click(
@@ -282,37 +288,50 @@ class InputSender:
         *,
         double: bool = False,
         mode: str | None = None,
-    ) -> bool:
-        """点击.
+    ) -> tuple[bool, str]:
+        """点击;返回 (ok, reason)。
 
-        target:
-        - int = hwnd(用 post 模式按客户区坐标 (0,0) 点;或 send 模式按窗口中心点)
-        - (hwnd, x, y) = 按客户区坐标 (x, y) 精确点
+        mode:
+        - 'auto' (默认) — 先后台投递,PostMessage 失败(独占全屏 / UAC 隔离)时改用真实输入;
+        - 'post'        — 只用后台投递;
+        - 'send'        — 直接真实输入(需要前台权限 + 可能被目标检测为「模拟输入」)。
+
+        target: int=hwnd(按客户区中心) 或 (hwnd, x, y)=精确客户区坐标。
         """
-        m = mode or self.default_mode
+        m = (mode or self.default_mode).lower()
+        if m not in ("auto", "post", "send"):
+            m = "auto"
         if isinstance(target, int):
-            info = wf.get_window_info(target)
+            hwnd = int(target)
+            info = wf.get_window_info(hwnd)
             if info is None:
-                return False
-            ox, oy = wf.client_origin(target)
-            cw, ch = wf.client_size(target)
+                return (False, "窗口已失效")
+            ox, oy = wf.client_origin(hwnd)
+            cw, ch = wf.client_size(hwnd)
             x, y = cw // 2, ch // 2
         else:
-            hwnd, x, y = target
+            hwnd, x, y = int(target[0]), int(target[1]), int(target[2])
             ox, oy = wf.client_origin(hwnd)
 
-        if m == "post":
-            ok = wf.post_click(int(target) if isinstance(target, int) else int(target[0]), int(x), int(y), button.value, double=double)
-            return bool(ok)
-        # send 模式:需要前台
-        hwnd = int(target) if isinstance(target, int) else int(target[0])
-        wf.set_foreground(hwnd)
-        time.sleep(0.02)
-        sx, sy = ox + int(x), oy + int(y)
-        _InputHelper.click_at(sx, sy, button)
-        if double:
+        if m in ("post", "auto"):
+            ok = wf.post_click(hwnd, x, y, button.value, double=double)
+            if ok:
+                return (True, "")
+            if m == "post":
+                return (False, "post 返回 0(目标未响应消息,可能是独占全屏或 UAC 隔离)")
+
+        # send 模式 / auto 回退
+        try:
+            wf.set_foreground(hwnd)
+            time.sleep(0.02)
+            sx, sy = ox + x, oy + y
             _InputHelper.click_at(sx, sy, button)
-        return True
+            if double:
+                _InputHelper.click_at(sx, sy, button)
+            reason = "" if m == "send" else "post 失败,已改用真实输入"
+            return (True, reason)
+        except Exception as e:
+            return (False, f"send 失败:{e}")
 
     def move(
         self,

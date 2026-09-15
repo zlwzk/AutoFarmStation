@@ -2,7 +2,7 @@
 
 > 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.6.0-blue)
+![banner](https://img.shields.io/badge/version-1.6.1-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -101,7 +101,7 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
 
 ## 下载与使用
 
-下载 `AutoFarmStation.exe`(约 46 MB),双击启动,首次启动会创建数据目录。
+下载 `AutoFarmStation.exe`(约 60 MB),双击启动,首次启动会创建数据目录。
 
 数据目录(可在设置页查看):
 - `%APPDATA%\AutoFarmStation\config.json` — 主配置
@@ -192,7 +192,7 @@ A:实测 `offline` 走这个协议在当前 Steam 客户端不生效(状态不�
 ## 自检与开发
 
 ```bash
-python -m scripts.selftest   # 27 项自检
+python -m scripts.selftest   # 31 项自检(v1.6.1,v1.6.0 是 27 项)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe)
 powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(可选)
 ```
