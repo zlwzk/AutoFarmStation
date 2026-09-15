@@ -1440,6 +1440,155 @@ def t_builtin_manifest_merges() -> bool:
         return False
 
 
+# === v1.6.4 新增:bat 库拖拽导入 ===
+def t_bat_drag_import_basic() -> bool:
+    """v1.6.4:BatLibrary.import_bat() — 把外部 .bat 拷到用户目录并写 manifest。"""
+    _div("v1.6.4 bat drag import basic")
+    try:
+        import tempfile, json as _json
+        from pathlib import Path
+        from autofarmstation.core.bat_library import BatLibrary
+
+        with tempfile.TemporaryDirectory(prefix="afs-bat-import-") as tmp:
+            base = Path(tmp)
+            user = base / "user"
+            user.mkdir()
+            lib = BatLibrary(builtin_dir=base / "builtin", user_dir=user)
+
+            # 准备源文件(中文名 + GBK 编码,模拟 Windows 批处理)
+            src = base / "我的脚本.bat"
+            src.write_bytes("@echo off\r\nchcp 65001\r\necho 中文\r\n".encode("gbk"))
+
+            e = lib.import_bat(src)
+            assert e.builtin is False
+            assert e.category == "我的脚本"
+            assert "拖拽导入" in e.tags
+            assert e.full_path is not None and e.full_path.exists()
+
+            # 目标文件应以 utf-8 落地,内容被正确解码(中文不乱码)
+            content = e.full_path.read_text(encoding="utf-8")
+            assert "echo 中文" in content, f"GBK 中文解码失败:{content!r}"
+            # 头部多了「来源:xxx」「导入于:xxx」两行注释
+            assert "我的脚本.bat" in content
+            assert "来源" in content
+
+            # manifest 条目已写入
+            data = _json.loads((user / "manifest.json").read_text(encoding="utf-8"))
+            ids = [x["id"] for x in data["entries"]]
+            assert e.id in ids, f"manifest 缺新条目:{ids}"
+
+            # 跑一下 list() 能看到
+            assert any(x.id == e.id for x in lib.list())
+        _ok("import_bat 基本路径(中文 GBK 源 → utf-8 落地 + manifest)")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("bat_drag_import_basic", e)
+        return False
+
+
+def t_bat_drag_import_collision() -> bool:
+    """v1.6.4:同名源拖两次 → 第二份自动加 _2 后缀,不覆盖原文件。"""
+    _div("v1.6.4 bat drag import collision")
+    try:
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.bat_library import BatLibrary
+
+        with tempfile.TemporaryDirectory(prefix="afs-bat-collision-") as tmp:
+            base = Path(tmp)
+            user = base / "user"
+            user.mkdir()
+            lib = BatLibrary(builtin_dir=base / "builtin", user_dir=user)
+
+            src = base / "dupe.bat"
+            src.write_text("@echo off\necho first\n", encoding="utf-8")
+
+            e1 = lib.import_bat(src)
+            e2 = lib.import_bat(src)
+            assert e1.file_name != e2.file_name, \
+                f"应自动改名,但两次同:{e1.file_name}"
+            assert e1.file_name == "dupe.bat"
+            assert e2.file_name.startswith("dupe_") and e2.file_name.endswith(".bat"), \
+                f"第二份应有 _N 后缀,实际 {e2.file_name}"
+            assert e1.full_path != e2.full_path
+            # 两份内容都保留(第二份不一定和第一份字节相同 —— 头部时间戳会变,
+            # 所以只校验两份都在且都非空)
+            assert e1.full_path.read_text(encoding="utf-8").strip()
+            assert e2.full_path.read_text(encoding="utf-8").strip()
+        _ok("import_bat 重名自动加后缀,不覆盖")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("bat_drag_import_collision", e)
+        return False
+
+
+def t_bat_drag_import_rejects_non_bat() -> bool:
+    """v1.6.4:拖一个 .txt / .exe → ValueError,不动用户目录。"""
+    _div("v1.6.4 bat drag import rejects non-bat")
+    try:
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.bat_library import BatLibrary
+
+        with tempfile.TemporaryDirectory(prefix="afs-bat-reject-") as tmp:
+            base = Path(tmp)
+            user = base / "user"
+            user.mkdir()
+            lib = BatLibrary(builtin_dir=base / "builtin", user_dir=user)
+
+            txt = base / "README.txt"
+            txt.write_text("just text", encoding="utf-8")
+            exefile = base / "evil.exe"
+            exefile.write_bytes(b"MZ\x90\x00")
+
+            for bad in (txt, exefile):
+                try:
+                    lib.import_bat(bad)
+                except ValueError as ex:
+                    assert "只支持" in str(ex) or ".bat" in str(ex), ex
+                else:
+                    raise AssertionError(f"应拒绝 {bad},但 import_bat 成功了")
+
+            # 用户目录里没新增 .bat
+            assert list(user.glob("*.bat")) == []
+        _ok("import_bat 拒绝 .txt / .exe 等非 bat/cmd 文件")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("bat_drag_import_rejects_non_bat", e)
+        return False
+
+
+def t_bat_drag_import_rejects_missing() -> bool:
+    """v1.6.4:拖一个不存在的路径 → FileNotFoundError,不创建任何文件。"""
+    _div("v1.6.4 bat drag import rejects missing path")
+    try:
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.bat_library import BatLibrary
+
+        with tempfile.TemporaryDirectory(prefix="afs-bat-missing-") as tmp:
+            base = Path(tmp)
+            user = base / "user"
+            user.mkdir()
+            lib = BatLibrary(builtin_dir=base / "builtin", user_dir=user)
+
+            ghost = base / "never_existed.bat"
+            try:
+                lib.import_bat(ghost)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("应抛 FileNotFoundError")
+            assert list(user.glob("*.bat")) == []
+            assert not (user / "manifest.json").exists() or \
+                "entries" not in (user / "manifest.json").read_text(encoding="utf-8")
+        _ok("import_bat 不存在的路径 → FileNotFoundError,目录无变化")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("bat_drag_import_rejects_missing", e)
+        return False
+
+
 # === v1.6.1 新增的 4 项: ===
 def t_dpi_awareness() -> bool:
     """v1.6.1 启动时声明 DPI 感知(SetProcessDpiAwareness / V2 / SetProcessDPIAware 三档回退)。"""
@@ -1721,10 +1870,14 @@ def run_all() -> int:
                 t_theme_actually_applies, t_language_placeholder_disabled,
                 t_default_clicker_params_applied, t_farm_window_guard,
                 t_user_bats_persist, t_builtin_manifest_merges,
-                # v1.6.3 新增(立即更新按钮)
-                t_updater_helpers, t_updater_apply_pending_no_pending,
-                t_updater_apply_pending_cleans_missing,
-    ]
+                                # v1.6.3 新增(立即更新按钮)
+                                    t_updater_helpers, t_updater_apply_pending_no_pending,
+                                    t_updater_apply_pending_cleans_missing,
+                                    # v1.6.4 新增(bat 拖拽导入)
+                                        t_bat_drag_import_basic, t_bat_drag_import_collision,
+                                        t_bat_drag_import_rejects_non_bat,
+                                        t_bat_drag_import_rejects_missing,
+                    ]
     passed = 0
     failed = 0
     for t in tests:

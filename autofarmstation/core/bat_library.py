@@ -133,6 +133,78 @@ class BatLibrary:
             "confirm": True, "args": [],
         }, builtin=False, manifest_dir=self._user_dir)
 
+    # --- 拖拽导入 ---
+    def import_bat(self, src_path: str | Path,
+                   *, category: str = "我的脚本",
+                   title: str | None = None,
+                   desc: str | None = None) -> BatEntry:
+        """从外部路径(用户拖进来的 .bat / .cmd)导入到用户目录。
+
+        行为:
+          - 仅接受真实文件(.bat / .cmd 后缀),否则 ValueError
+          - 读源文件内容(先 utf-8,失败回退 gbk/utf-16,照顾 Windows 中文批处理)
+          - 目标文件名:沿用源 stem(去除不安全字符),后缀统一 .bat;
+            若已存在则自动加 _2 / _3 ...
+          - 写 manifest 条目(id 形如 user_<safe_title>_<hex6>),返回新条目
+
+        失败抛出 ValueError / FileNotFoundError / OSError,调用方自己捕获。
+        """
+        src = Path(src_path)
+        if not src.exists() or not src.is_file():
+            raise FileNotFoundError(f"源文件不存在:{src}")
+        suffix = src.suffix.lower()
+        if suffix not in (".bat", ".cmd"):
+            raise ValueError(f"只支持 .bat / .cmd 文件,收到:{src.name}")
+
+        # 读源文件内容(优先 utf-8,回退 gbk → utf-16)
+        raw_bytes = src.read_bytes()
+        text = _decode_bat_bytes(raw_bytes)
+
+        self._user_dir.mkdir(parents=True, exist_ok=True)
+        # 目标文件名:沿用 stem
+        target_stem = _safe_filename(src.stem) or "imported"
+        file_name = f"{target_stem}.bat"
+        bat_path = self._user_dir / file_name
+        if bat_path.exists():
+            for i in range(2, 1000):
+                cand = self._user_dir / f"{target_stem}_{i}.bat"
+                if not cand.exists():
+                    bat_path = cand
+                    file_name = bat_path.name
+                    break
+            else:
+                raise OSError(f"用户目录里 {target_stem}_N.bat 都已存在,导入失败")
+
+        # 在原内容前加一段说明,标明这是拖进来的
+        header = (
+            f"rem ============================================\n"
+            f"rem   来源:{src.name}\n"
+            f"rem   导入于:{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"rem   路径:{bat_path}\n"
+            f"rem ============================================\n"
+        )
+        bat_path.write_text(header + text, encoding="utf-8")
+
+        # 默认 title/desc
+        if not title:
+            title = src.stem
+        if desc is None:
+            desc = f"从外部拖入:{src}"
+        safe_title = _safe(title) or "imported"
+        eid = f"user_{safe_title}_{uuid.uuid4().hex[:6]}"
+        manifest = _read_or_init_manifest(self._user_dir)
+        manifest.setdefault("entries", []).append({
+            "id": eid, "title": safe_title, "desc": desc,
+            "file": file_name, "category": category, "tags": ["拖拽导入"],
+            "confirm": True, "args": [],
+        })
+        _write_manifest(self._user_dir, manifest)
+        return _materialize({
+            "id": eid, "title": safe_title, "desc": desc,
+            "file": file_name, "category": category, "tags": ["拖拽导入"],
+            "confirm": True, "args": [],
+        }, builtin=False, manifest_dir=self._user_dir)
+
     def delete(self, entry_id: str) -> bool:
         """只能删用户目录里的脚本."""
         e = self.get(entry_id)
@@ -401,6 +473,21 @@ def _safe_filename(name: str) -> str:
     name = name.strip()
     name = "".join("_" if ch in '<>:"/\\|?*\x00' else ch for ch in name)
     return name.strip(" .") or "unnamed.bat"
+
+
+def _decode_bat_bytes(raw: bytes) -> str:
+    """尝试用 utf-8 / gbk / utf-16 解码 bat 文件字节,任意一个成功就返回。
+
+    中文 Windows 上用户写的 .bat 经常是 GBK(系统默认记事本编码);
+    偶有 PowerShell 写的用 UTF-16 LE BOM。
+    """
+    for enc in ("utf-8-sig", "utf-8", "gbk", "utf-16"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    # 兜底:latin-1 必不会失败,虽然乱码但不至于丢内容
+    return raw.decode("latin-1", errors="replace")
 
 
 # 一个空 bat 模板,带中文注释提示用户怎么用

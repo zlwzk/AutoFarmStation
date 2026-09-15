@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QTreeWidget, QTreeWidgetItem,
     QLabel, QPushButton, QLineEdit, QInputDialog, QMessageBox, QGroupBox,
@@ -23,6 +23,8 @@ class BatLibraryDialog(QDialog):
         self.resize(900, 560)
         # 不强制模态:让用户能在游戏和本窗口间来回切
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        # 启用拖放:用户可以从资源管理器把 .bat / .cmd 拖进来快速添加
+        self.setAcceptDrops(True)
 
         v = QVBoxLayout(self)
 
@@ -59,6 +61,11 @@ class BatLibraryDialog(QDialog):
         top.addWidget(btn_del)
 
         v.addLayout(top)
+
+        # 拖拽提示(很轻,不抢眼)
+        hint = QLabel("📥 提示:可从文件管理器把 .bat / .cmd 拖到本窗口,快速加为脚本")
+        hint.setStyleSheet("color:#888; padding:2px 4px;")
+        v.addWidget(hint)
 
         # 主体:左树 + 右详情
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -308,6 +315,85 @@ class BatLibraryDialog(QDialog):
             return
         if not self._lib.edit(e.id):
             QMessageBox.warning(self, "打开失败", "找不到文件")
+
+
+# --- 拖放支持:把 .bat / .cmd 从文件管理器拖进来 ---
+    def dragEnterEvent(self, ev: QDragEnterEvent) -> None:  # noqa: N802 (Qt)
+        """光标进窗口时:有 .bat / .cmd 文件就接受,其它拒(光标显示「禁止」)。"""
+        if ev.mimeData().hasUrls() and any(
+            self._is_bat_url(u) for u in ev.mimeData().urls()
+        ):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev: QDragEnterEvent) -> None:  # noqa: N802 (Qt)
+        # 跟 dragEnter 一致即可(Qt 默认会调 dragMove,这里显式 accept 让光标显示正常)
+        if ev.mimeData().hasUrls() and any(
+            self._is_bat_url(u) for u in ev.mimeData().urls()
+        ):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dropEvent(self, ev: QDropEvent) -> None:  # noqa: N802 (Qt)
+        """松手时:逐个调用 import_bat(),完成后给一个汇总状态。"""
+        urls = [u for u in ev.mimeData().urls() if self._is_bat_url(u)]
+        if not urls:
+            ev.ignore()
+            return
+        ev.acceptProposedAction()
+
+        ok: list[str] = []
+        skipped: list[str] = []
+        failed: list[tuple[str, str]] = []
+        from pathlib import Path as _P
+        for u in urls:
+            src = _P(u.toLocalFile()) if u.isLocalFile() else None
+            if src is None or not src.exists():
+                skipped.append(u.fileName() or u.toString())
+                continue
+            try:
+                e = self._lib.import_bat(src)
+                ok.append(e.title)
+            except (FileNotFoundError, ValueError, OSError) as ex:
+                failed.append((src.name, str(ex)))
+
+        # 刷新树 + 选中新加的第一个
+        if ok:
+            self._refresh()
+            self._select_first_with_title(ok[0])
+        # 给个汇总反馈
+        parts: list[str] = []
+        if ok:
+            parts.append(f"已导入 {len(ok)} 个:" + "、".join(ok[:3])
+                         + (" ..." if len(ok) > 3 else ""))
+        if skipped:
+            parts.append(f"跳过 {len(skipped)} 个(路径无效)")
+        if failed:
+            detail = "\n".join(f"• {n}: {msg}" for n, msg in failed[:5])
+            parts.append(f"失败 {len(failed)} 个:\n{detail}")
+        self._status.setText("  |  ".join(parts) if parts else "(空)")
+
+    @staticmethod
+    def _is_bat_url(u) -> bool:
+        """只接受本地文件 URL,且后缀是 .bat / .cmd。"""
+        if not u.isLocalFile():
+            return False
+        name = (u.fileName() or "").lower()
+        return name.endswith(".bat") or name.endswith(".cmd")
+
+    def _select_first_with_title(self, title: str) -> None:
+        """刷新后,选中第一个 title 等于 title 的条目(用于拖拽后高亮)。"""
+        for i in range(self._tree.topLevelItemCount()):
+            grp = self._tree.topLevelItem(i)
+            for j in range(grp.childCount()):
+                ch = grp.child(j)
+                eid = ch.data(0, Qt.ItemDataRole.UserRole)
+                e = self._lib.get(eid) if eid else None
+                if e and e.title == title:
+                    self._tree.setCurrentItem(ch)
+                    return
 
 
 def _match(e: BatEntry, keyword: str) -> bool:
