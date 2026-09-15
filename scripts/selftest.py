@@ -1137,6 +1137,309 @@ def t_app_help() -> bool:
         return False
 
 
+# === v1.6.2 新增的 4 项:「修了不生效的设置」 ===
+def t_theme_actually_applies() -> bool:
+    """v1.6.2 主题设置真的生效:app._apply_palette(theme) 根据传入主题切颜色,
+    不是写死 dark。"""
+    _div("v1.6.2 theme switch")
+    try:
+        from autofarmstation.app import _apply_palette, apply_theme
+        # _apply_palette 接受 (app, theme) 两个参数;不是仅 dark 的版本
+        sig = __import__("inspect").signature(_apply_palette)
+        params = list(sig.parameters.values())
+        assert len(params) >= 2, f"_apply_palette 必须接受 (app, theme),签名={sig}"
+        assert params[-1].name == "theme", f"最后一个参数应叫 theme,实际 {params[-1].name}"
+        # 应用模块不能再写死调 _apply_dark_palette / 不读 cfg
+        src = __import__("inspect").getsource(__import__("autofarmstation.app", fromlist=["run"]))
+        assert "_apply_dark_palette" not in src, "app.py 不能再有 _apply_dark_palette 写死调用"
+        assert 'cfg.get("ui.theme"' in src or "cfg.get('ui.theme'" in src or 'ui.theme' in src, \
+            "app.py 必须从 cfg 读 ui.theme"
+        _ok("_apply_palette(theme) 接受主题参数;app.py 从 cfg 读取 ui.theme")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("theme", e)
+        return False
+
+
+def t_language_placeholder_disabled() -> bool:
+    """v1.6.2 英语占位选项必须被禁用,避免用户选了之后被记住成 en-US。"""
+    _div("v1.6.2 language placeholder disabled")
+    try:
+        from autofarmstation.ui import settings_dialog as sd
+        src = __import__("inspect").getsource(sd)
+        # 必须有禁用第二项的处理
+        assert "English" in src, "settings_dialog 应该有 English 选项"
+        assert "setEnabled(False)" in src or "model().item" in src, \
+            "English 占位项必须被 setEnabled(False) 禁用"
+        # 不能写死 en-US 作为有效值保存
+        assert 'set("ui.language", "en-US"' not in src, "不能保存 en-US(没有翻译)"
+        # 必须读 cfg.ui.language 时回退 zh-CN
+        assert "zh-CN" in src, "默认 / 回退值必须是 zh-CN"
+        _ok("English 占位被禁用;ui.language 落盘时强制 zh-CN")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("language", e)
+        return False
+
+
+def t_default_clicker_params_applied() -> bool:
+    """v1.6.2 默认连点参数真的传到 ClickerPanel:改 cfg.defaults.clicker_* 后
+    新建 ClickerPanel 的 _interval / _jitter / _mode 跟着变。"""
+    _div("v1.6.2 default clicker params")
+    try:
+        from autofarmstation.utils.config import Config
+        from autofarmstation.core.automation_hub import AutomationHub
+        from autofarmstation.ui.action_panel import ClickerPanel
+
+        cfg = Config()
+        cfg.set("defaults.clicker_interval_ms", 333)
+        cfg.set("defaults.clicker_jitter_ms", 25)
+        cfg.set("defaults.clicker_button", "right")
+        cfg.set("defaults.clicker_mode", "random")
+
+        hub = AutomationHub()
+        cp = ClickerPanel(hub=hub, defaults={
+            "interval_ms": int(cfg.get("defaults.clicker_interval_ms")),
+            "jitter_pct": int(cfg.get("defaults.clicker_jitter_ms")),
+            "button": str(cfg.get("defaults.clicker_button")),
+            "mode": str(cfg.get("defaults.clicker_mode")),
+        })
+        assert cp._interval.value() == 333, f"interval 应是 333,实际 {cp._interval.value()}"
+        assert cp._jitter.value() == 25, f"jitter 应是 25,实际 {cp._jitter.value()}"
+        # mode 索引 0=post, 1=send;random 走 send,所以应是 1
+        assert cp._mode.currentIndex() == 1, f"mode 应是 send(1),实际 {cp._mode.currentIndex()}"
+
+        # 不传 cfg / defaults 时仍是硬编码默认(向后兼容)
+        cp_default = ClickerPanel(hub=hub)
+        assert cp_default._interval.value() == 200
+        assert cp_default._jitter.value() == 10
+        _ok("ClickerPanel 读 cfg.defaults.clicker_*;不传则用硬编码默认")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("clicker_defaults", e)
+        return False
+
+
+def t_farm_window_guard() -> bool:
+    """v1.6.2 挂机时段守护:启用且不在时段 → should_block_start=True;
+    跨天时段(start > end)也能正确判断;未启用则不限制。"""
+    _div("v1.6.2 farm window guard")
+    try:
+        import datetime as _dt
+        from autofarmstation.utils.config import Config
+        from autofarmstation.core.farm_window import FarmWindowGuard
+
+        # 1) 未启用:任何时间都不阻挡
+        cfg = Config()
+        g = FarmWindowGuard(cfg)
+        assert g.should_block_start() is False, "未启用时不应阻挡"
+        assert g.in_window() is True, "未启用时 in_window 应返回 True(不限制)"
+
+        # 2) 当天内:start=08:00, end=18:00
+        cfg.set("farm_window.enabled", True)
+        cfg.set("farm_window.start", "08:00")
+        cfg.set("farm_window.end", "18:00")
+        morning = _dt.datetime(2026, 1, 1, 7, 30)  # 在时段外
+        noon = _dt.datetime(2026, 1, 1, 12, 0)     # 在时段内
+        evening = _dt.datetime(2026, 1, 1, 19, 30) # 在时段外
+        assert not g.in_window(morning)
+        assert g.in_window(noon)
+        assert not g.in_window(evening)
+        assert g.should_block_start(), "不在时段应返回 True"
+
+        # 3) 跨天:start=22:00, end=08:00
+        cfg.set("farm_window.start", "22:00")
+        cfg.set("farm_window.end", "08:00")
+        late_night = _dt.datetime(2026, 1, 1, 23, 30)  # 在时段内
+        before_dawn = _dt.datetime(2026, 1, 1, 3, 30)  # 在时段内(跨天部分)
+        daytime = _dt.datetime(2026, 1, 1, 12, 0)      # 在时段外
+        assert g.in_window(late_night)
+        assert g.in_window(before_dawn)
+        assert not g.in_window(daytime)
+
+        # 4) action 字段:默认 pause
+        assert g.action() == "pause"
+        cfg.set("farm_window.action", "stop")
+        assert g.action() == "stop"
+
+        _ok("FarmWindowGuard 当天内 / 跨天 / 启用开关 / action 字段均正确")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("farm_window", e)
+        return False
+
+
+def t_user_bats_persist() -> bool:
+    """v1.6.2:用户自加的 bat 脚本必须跨「重建 BatLibrary」持久化。
+
+    用户 bat 永远在 ``%APPDATA%\\AutoFarmStation\\bats\\``,升级软件 / 重启 / 重新
+    构造 BatLibrary 实例都不能让它丢。
+    """
+    _div("v1.6.2 user bats persist across re-init")
+    try:
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.bat_library import BatLibrary
+
+        with tempfile.TemporaryDirectory(prefix="afs-bat-persist-") as tmp:
+            builtin = Path(tmp) / "builtin"
+            user = Path(tmp) / "user"
+            builtin.mkdir(parents=True, exist_ok=True)
+            user.mkdir(parents=True, exist_ok=True)
+
+            # 内置放 1 个,用户空
+            (builtin / "hello.bat").write_text(
+                "@echo off\r\necho hello\r\n", encoding="utf-8",
+            )
+            import json as _json
+            (builtin / "manifest.json").write_text(
+                _json.dumps(
+                    {"version": 1, "entries": [
+                        {"id": "builtin_hello", "title": "你好",
+                         "file": "hello.bat", "category": "测试", "desc": ""},
+                    ]},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            lib = BatLibrary(builtin_dir=builtin, user_dir=user)
+            lib.ensure_seeded()
+
+            # 用户自加 2 个 bat
+            lib.create("我的脚本 A")
+            lib.create("我的脚本 B")
+
+            # 模拟「升级后重新构造 BatLibrary」
+            lib2 = BatLibrary(builtin_dir=builtin, user_dir=user)
+            lib2.ensure_seeded()
+            entries = lib2.list()
+            user_titles = {e.title for e in entries if not e.builtin}
+            assert "我的脚本 A" in user_titles, f"脚本 A 丢了: {user_titles}"
+            assert "我的脚本 B" in user_titles, f"脚本 B 丢了: {user_titles}"
+            assert len(entries) >= 3, f"应至少 1 内置 + 2 用户 = 3,实际 {len(entries)}"
+
+            # 用户删除某个内置 → 下次 ensure_seeded 重新拷贝(因为 .bat 丢失了)
+            (user / "hello.bat").unlink()
+            lib3 = BatLibrary(builtin_dir=builtin, user_dir=user)
+            n = lib3.ensure_seeded()
+            assert (user / "hello.bat").exists(), "内置 .bat 应在丢失后自动恢复"
+            assert n >= 1, f"应至少恢复 1 个内置 .bat,实际 {n}"
+
+            # 但用户的自定义 bat 仍然在
+            entries = lib3.list()
+            user_titles = {e.title for e in entries if not e.builtin}
+            assert "我的脚本 A" in user_titles
+            assert "我的脚本 B" in user_titles
+
+        _ok("用户 bat 跨 re-init 持久;内置 .bat 丢失后自动恢复;用户条目不受影响")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("user_bats", e)
+        return False
+
+
+def t_builtin_manifest_merges() -> bool:
+    """v1.6.2:新版本加了内置 bat 条目 → ensure_seeded 把它合进用户 manifest。
+
+    关键点:**只追加不存在的 id**,绝不覆盖用户已有的条目(用户改过的
+    title / desc / args 必须保留)。
+    """
+    _div("v1.6.2 builtin manifest merges into user manifest")
+    try:
+        import tempfile, json as _json
+        from pathlib import Path
+        from autofarmstation.core.bat_library import BatLibrary
+
+        with tempfile.TemporaryDirectory(prefix="afs-bat-merge-") as tmp:
+            builtin = Path(tmp) / "builtin"
+            user = Path(tmp) / "user"
+            builtin.mkdir(parents=True, exist_ok=True)
+            user.mkdir(parents=True, exist_ok=True)
+
+            # 内置 v1:2 条目
+            (builtin / "first.bat").write_text(
+                "@echo off\r\necho first\r\n", encoding="utf-8",
+            )
+            (builtin / "manifest.json").write_text(
+                _json.dumps(
+                    {"version": 1, "entries": [
+                        {"id": "first", "title": "第一条", "file": "first.bat",
+                         "category": "测试", "desc": ""},
+                        {"id": "second", "title": "第二条", "file": "second.bat",
+                         "category": "测试", "desc": ""},
+                    ]},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (builtin / "second.bat").write_text(
+                "@echo off\r\necho second\r\n", encoding="utf-8",
+            )
+
+            # 用户已经在用,且改过「第一条」的 title
+            (user / "first.bat").write_text(
+                "@echo off\r\necho first(用户改过)\r\n", encoding="utf-8",
+            )
+            (user / "manifest.json").write_text(
+                _json.dumps(
+                    {"version": 1, "entries": [
+                        {"id": "first", "title": "用户改名的第一条", "file": "first.bat",
+                         "category": "测试", "desc": ""},
+                        {"id": "my_custom", "title": "我的专属", "file": "custom.bat",
+                         "category": "我的", "desc": ""},
+                    ]},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            # 内置 v2 新增 third 条目(模拟软件升级)
+            (builtin / "third.bat").write_text(
+                "@echo off\r\necho third\r\n", encoding="utf-8",
+            )
+            (builtin / "manifest.json").write_text(
+                _json.dumps(
+                    {"version": 1, "entries": [
+                        {"id": "first", "title": "第一条", "file": "first.bat",
+                         "category": "测试", "desc": ""},
+                        {"id": "second", "title": "第二条", "file": "second.bat",
+                         "category": "测试", "desc": ""},
+                        {"id": "third", "title": "第三条(新)", "file": "third.bat",
+                         "category": "测试", "desc": "v1.6.2 新加"},
+                    ]},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            lib = BatLibrary(builtin_dir=builtin, user_dir=user)
+            n = lib.ensure_seeded()
+            assert n >= 1, f"应至少新增 1 个内置条目,实际 {n}"
+
+            # 用户 manifest 现在应包含:用户改名的 first + my_custom + 新并入的 second/third
+            user_data = _json.loads(
+                (user / "manifest.json").read_text(encoding="utf-8"),
+            )
+            ids = {e["id"] for e in user_data["entries"]}
+            assert ids == {"first", "second", "third", "my_custom"}, f"id 集合不对:{ids}"
+            # 用户改过的 title 必须保留
+            first_e = next(e for e in user_data["entries"] if e["id"] == "first")
+            assert first_e["title"] == "用户改名的第一条", \
+                f"用户改过的 title 被覆盖: {first_e['title']}"
+
+            # 用户目录里现在有 first/second/third 三个 .bat
+            assert (user / "first.bat").exists()
+            assert (user / "second.bat").exists()
+            assert (user / "third.bat").exists()
+
+        _ok("内置新条目合并进用户 manifest,用户已有条目不被覆盖")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("builtin_merges", e)
+        return False
+
+
 # === v1.6.1 新增的 4 项: ===
 def t_dpi_awareness() -> bool:
     """v1.6.1 启动时声明 DPI 感知(SetProcessDpiAwareness / V2 / SetProcessDPIAware 三档回退)。"""
@@ -1255,9 +1558,13 @@ def run_all() -> int:
         t_update_settings, t_audio, t_game_launcher,
         t_io_smoke, t_gui_smoke, t_app_help,
         # v1.6.1 新增
-        t_dpi_awareness, t_virtual_screen,
-        t_hidden_windows_and_pid, t_focus_with_margins_and_auto_click,
-    ]
+            t_dpi_awareness, t_virtual_screen,
+            t_hidden_windows_and_pid, t_focus_with_margins_and_auto_click,
+            # v1.6.2 新增
+                t_theme_actually_applies, t_language_placeholder_disabled,
+                t_default_clicker_params_applied, t_farm_window_guard,
+                t_user_bats_persist, t_builtin_manifest_merges,
+            ]
     passed = 0
     failed = 0
     for t in tests:

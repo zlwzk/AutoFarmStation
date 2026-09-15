@@ -93,9 +93,18 @@ class SettingsDialog(QDialog):
         uf.addRow("主题:", self._theme)
 
         self._language = QComboBox()
-        self._language.addItems(["zh-CN 简体中文", "en-US English(占位)"])
-        idx = 0 if self._cfg.get("ui.language", "zh-CN") == "zh-CN" else 1
-        self._language.setCurrentIndex(idx)
+        # v1.6.2:目前只交付 zh-CN;English 还是占位 —— 留选项但禁用,
+        # 避免选了之后设置被记住成 en-US 然后软件界面没翻译、看着怪。
+        self._language.addItem("zh-CN 简体中文(已交付)", "zh-CN")
+        self._language.addItem("en-US English(规划中,不可选)", "en-US")
+        self._language.model().item(1).setEnabled(False)
+        cur = str(self._cfg.get("ui.language", "zh-CN"))
+        if cur not in ("zh-CN", "en-US"):
+            cur = "zh-CN"
+        if cur == "en-US":
+            self._language.setCurrentIndex(1)
+        else:
+            self._language.setCurrentIndex(0)
         uf.addRow("语言:", self._language)
 
         self._confirm_exit = QCheckBox("退出前确认")
@@ -712,7 +721,9 @@ class SettingsDialog(QDialog):
 
         note = QLabel(
             "换机 / 重装 / 想把调好的一套配置发给朋友时用得上。\n"
-            "备份里不含日志(体积大且带着环境信息);导入前会自动把当前数据备份到 backups\\。"
+            "备份里不含日志(体积大且带着环境信息);导入前会自动把当前数据备份到 backups\\。\n"
+            "—— 所有数据(包括 Bat 脚本库)都保存在 %APPDATA%\\AutoFarmStation\\,"
+            "升级软件不会被覆盖。"
         )
         note.setStyleSheet("color:#888;")
         note.setWordWrap(True)
@@ -937,6 +948,22 @@ class SettingsDialog(QDialog):
         )
         self._cfg.set("settings.log_level", self._log_level.currentText())
         self._cfg.save()
+        # v1.6.2:主题 / Steam 叠加层 — 在「确认」时立刻生效,而不是要求用户手动点按钮
+        try:
+            from PySide6.QtWidgets import QApplication
+            from ..app import apply_theme as _apply_theme_fn
+            _apply_theme_fn(
+                QApplication.instance(),
+                "dark" if self._theme.currentIndex() == 0 else "light",
+            )
+        except Exception:
+            pass
+        try:
+            old_overlay = bool(self._cfg.get("ui.disable_steam_overlay", False))
+            if old_overlay != self._disable_overlay.isChecked():
+                self._on_apply_overlay()
+        except Exception:
+            pass
         # 让 main_window 立即按新频率重建定时器
         if self.parent() is not None and hasattr(self.parent(), "_update_timer"):
             parent = self.parent()

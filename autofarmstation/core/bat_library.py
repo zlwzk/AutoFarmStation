@@ -230,7 +230,13 @@ class BatLibrary:
         return self._builtin_dir
 
     def ensure_seeded(self) -> int:
-        """首次启动时把内置 manifest 拷到用户目录(用户可改).已存在则跳过."""
+        """首次启动时把内置 manifest 拷到用户目录(用户可改).已存在则跳过.
+
+        v1.6.2:除了拷贝缺失的 ``.bat`` 文件,还把内置 ``manifest*.json`` 里
+        **新增的条目**(按 id)合并进用户的 ``manifest.json`` —— 这样新版本
+        加了内置脚本后老用户也能看到,但用户自己改过的条目、用户自加的条目
+        都不会被覆盖(只追加不存在的 id)。
+        """
         if not self._builtin_dir.exists():
             return 0
         self._user_dir.mkdir(parents=True, exist_ok=True)
@@ -248,7 +254,71 @@ class BatLibrary:
                 n += 1
             except OSError as ex:
                 _log.warning("拷贝 %s 失败: %s", src, ex)
+        # v1.6.2:合并新版本里内置的新条目到用户 manifest
+        n += self._merge_builtin_manifest_into_user()
         return n
+
+    def _merge_builtin_manifest_into_user(self) -> int:
+        """内置 ``manifest*.json`` 里有、用户 manifest 里没有的条目 → 追加进去.
+
+        不动用户已有条目(用户改的 title / desc / args 都保留)。
+        """
+        if not self._builtin_dir.exists():
+            return 0
+        # 用户 manifest(只动 manifest.json,不碰 manifest-xxx.json 之类的备份)
+        user_mf = self._user_dir / "manifest.json"
+        try:
+            if user_mf.exists():
+                user_data = json.loads(user_mf.read_text(encoding="utf-8") or "{}")
+            else:
+                user_data = {"version": 1, "entries": []}
+        except (OSError, json.JSONDecodeError):
+            user_data = {"version": 1, "entries": []}
+        if not isinstance(user_data.get("entries"), list):
+            user_data["entries"] = []
+        existing_ids = {
+            str(e.get("id") or "")
+            for e in user_data["entries"]
+            if isinstance(e, dict)
+        }
+
+        added = 0
+        for mf in sorted(self._builtin_dir.glob("manifest*.json")):
+            try:
+                if mf.stat().st_size > _MAX_MANIFEST_BYTES:
+                    continue
+                data = json.loads(mf.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for raw in data.get("entries") or []:
+                if not isinstance(raw, dict):
+                    continue
+                eid = str(raw.get("id") or "")
+                if not eid or eid in existing_ids:
+                    continue
+                user_data["entries"].append(dict(raw))
+                existing_ids.add(eid)
+                added += 1
+                # 文件本身也得拷到用户目录
+                src_file = self._builtin_dir / str(raw.get("file") or "")
+                if raw.get("file") and src_file.exists():
+                    dst_file = self._user_dir / src_file.name
+                    if not dst_file.exists():
+                        try:
+                            shutil.copy2(src_file, dst_file)
+                        except OSError:
+                            pass
+        if added:
+            try:
+                _write_manifest(self._user_dir, user_data)
+                _log.info("内置脚本库更新:新增 %d 个条目到用户 manifest", added)
+            except OSError as ex:
+                _log.warning("写用户 manifest 失败: %s", ex)
+        return added
+
+    def user_data_dir(self) -> Path:
+        """返回整个用户数据目录(%APPDATA%\\AutoFarmStation),便于 UI 提供入口."""
+        return self._user_dir.parent
 
     # --- 内部 ---
     def _load_dir(self, d: Path, *, builtin: bool) -> list[BatEntry]:

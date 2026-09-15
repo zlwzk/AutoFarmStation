@@ -118,6 +118,15 @@ class MainWindow(QMainWindow):
         self._restart_hist: dict[int, list[float]] = {}
         # v1.6.1:「选择窗口」对话框是否列出隐藏 / 无标题窗口
         self._include_hidden: bool = False
+        # v1.6.2:挂机时段守护(时段外禁止启动;定时轮询进出)
+        from ..core.farm_window import FarmWindowGuard
+        self._farm_guard = FarmWindowGuard(self._cfg)
+        self._farm_was_in_window: bool = self._farm_guard.in_window()
+        self._farm_paused: set[int] = set()  # 退出时段时被停的 hwnd(action=pause 才用)
+        self._farm_timer = QTimer(self)
+        self._farm_timer.setInterval(30 * 1000)
+        self._farm_timer.timeout.connect(self._check_farm_window)
+        self._farm_timer.start()
         self._bat_lib = BatLibrary()
         # 多窗口自动化中枢:每窗口独立配置 + 多窗口同步执行
         self._hub = AutomationHub(stats=self._stats, logger=self._log)
@@ -158,6 +167,12 @@ class MainWindow(QMainWindow):
         # UI
         self.setWindowTitle(f"{__app_name_cn__} v{__version__}")
         self.resize(1400, 880)
+        # v1.6.2:启动时最小化设置要被真正读一次。
+        # resize 之后再 show + setWindowState 才能稳定生效,所以延迟到 showEvent。
+        self._start_minimized_requested = bool(
+            self._cfg.get("ui.start_minimized", False),
+        )
+        self._start_minimized_applied = False
         self._build_menu()
         self._build_toolbar()
         self._build_body()
@@ -201,6 +216,17 @@ class MainWindow(QMainWindow):
 
         # 退出时保存
         self._saved = False
+
+    # --- 显示:启动时最小化(只在第一次 show 触发一次) ---
+    def showEvent(self, ev) -> None:  # noqa: D401
+        super().showEvent(ev)
+        if self._start_minimized_requested and not self._start_minimized_applied:
+            self._start_minimized_applied = True
+            try:
+                self.setWindowState(self.windowState() | Qt.WindowState.WindowMinimized)
+                self.showMinimized()
+            except Exception:
+                pass
 
     # --- 关闭 ---
     def closeEvent(self, ev) -> None:
@@ -684,8 +710,11 @@ class MainWindow(QMainWindow):
             hub=self._hub,
         )
         right = ActionPanel(
-            self._pm, self._sched, self._stats, self._presets, hub=self._hub,
+            self._pm, self._sched, self._stats, self._presets, hub=self._hub, cfg=self._cfg,
         )
+
+        # v1.6.2:挂机时段守护 — 把「是否允许启动」检查注入到连点器
+        right._clicker_panel._start_blocked_cb = self._farm_block_reason  # type: ignore[attr-defined]
 
         # 预览网格信号 → 主窗口
         left.selection_changed.connect(self._on_sync_selection_changed)
@@ -1113,8 +1142,76 @@ class MainWindow(QMainWindow):
         self._statusBar().showMessage("设置已生效", 2500)  # type: ignore[union-attr]
 
     # --- 热键 ---
+    # --- 挂机时段守护 ---
+    def _farm_block_reason(self) -> str | None:
+        """时段外:返回提示文案;时段内或未启用:返回 None."""
+        if not self._farm_guard.enabled:
+            return None
+        if self._farm_guard.in_window():
+            return None
+        s = self._cfg.get("farm_window.start", "22:00")
+        e = self._cfg.get("farm_window.end", "08:00")
+        act = self._farm_guard.action()
+        msg = f"当前不在挂机时段({s} ~ {e}),不允许启动。"
+        if act == "pause":
+            msg += " 回到时段后可手动或自动恢复。"
+        return msg
+
+    def _check_farm_window(self) -> None:
+        """每 30 秒查一次:在时段 → 出时段 → 在时段 的状态翻转."""
+        cur = self._farm_guard.in_window()
+        if cur == self._farm_was_in_window:
+            return
+        self._farm_was_in_window = cur
+        if not cur:
+            # 退出时段:停下当前所有正在跑的(并记下来供进入时恢复)
+            try:
+                running = self._hub.running_hwnds() if hasattr(self._hub, "running_hwnds") else []
+            except Exception:
+                running = []
+            if running:
+                self._farm_paused.update(int(h) for h in running)
+                try:
+                    self._hub.stop_all() if hasattr(self._hub, "stop_all") else self._hub.stop_many(running)
+                except Exception:
+                    pass
+                if self._farm_guard.action() == "pause":
+                    self._log.info(
+                        "挂机时段已退出:暂停 %d 个窗口的自动化(%s → %s)",
+                        len(running),
+                        self._cfg.get("farm_window.start", "22:00"),
+                        self._cfg.get("farm_window.end", "08:00"),
+                    )
+                    self._statusBar().showMessage(  # type: ignore[union-attr]
+                        f"挂机时段外:已暂停 {len(running)} 个窗口", 4000,
+                    )
+                else:
+                    self._log.info(
+                        "挂机时段已退出:停止 %d 个窗口的自动化(action=stop)", len(running),
+                    )
+                    self._statusBar().showMessage(  # type: ignore[union-attr]
+                        f"挂机时段外:已停止 {len(running)} 个窗口", 4000,
+                    )
+        else:
+            # 回到时段:如果之前是 pause,清空暂停列表(让用户决定要不要重启,
+            # 不自动重启避免「不明窗口突然开始动」的惊吓)
+            if self._farm_paused:
+                self._log.info(
+                    "回到挂机时段:之前暂停的 %d 个窗口可手动重新启动",
+                    len(self._farm_paused),
+                )
+                self._statusBar().showMessage(  # type: ignore[union-attr]
+                    f"回到挂机时段:{len(self._farm_paused)} 个之前暂停的窗口待启动", 4000,
+                )
+            self._farm_paused.clear()
+
     def _on_hotkey_start_all(self) -> None:
         """启动全部:优先启动「有勾选则勾选,否则全部追踪窗口」的已配置项."""
+        # v1.6.2:挂机时段守护 — 时段外拒绝启动
+        reason = self._farm_block_reason()
+        if reason:
+            self._statusBar().showMessage(reason, 3500)  # type: ignore[union-attr]
+            return
         try:
             grid_targets = self._left.selected_hwnds() or self._left.all_hwnds()
             if not grid_targets:

@@ -33,10 +33,22 @@ class BatLibraryDialog(QDialog):
         self._search.textChanged.connect(self._refresh)
         top.addWidget(self._search, stretch=1)
 
-        btn_user_dir = QPushButton("📂 打开用户目录")
-        btn_user_dir.setToolTip(f"在文件管理器中打开:\n{self._lib.user_dir()}")
+        btn_user_dir = QPushButton("📂 用户脚本目录")
+        btn_user_dir.setToolTip(
+            f"你的脚本(包括内置副本 + 自己加的)全部保存在:\n"
+            f"{self._lib.user_dir()}\n\n"
+            f"升级软件时不会被覆盖。",
+        )
         btn_user_dir.clicked.connect(self._lib.open_user_dir)
         top.addWidget(btn_user_dir)
+
+        btn_data_dir = QPushButton("🗂 数据目录")
+        btn_data_dir.setToolTip(
+            f"打开整个用户数据目录(配置 / 预设 / 宏 / 日志 / 统计 ...):\n"
+            f"{self._lib.user_data_dir()}",
+        )
+        btn_data_dir.clicked.connect(self._on_open_data_dir)
+        top.addWidget(btn_data_dir)
 
         btn_new = QPushButton("➕ 新建脚本")
         btn_new.clicked.connect(self._on_new)
@@ -109,10 +121,12 @@ class BatLibraryDialog(QDialog):
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
 
-        # 初次启动把内置拷到用户目录
+        # 初次启动把内置拷到用户目录 + 新版本合并内置新增条目
         n = self._lib.ensure_seeded()
         if n:
-            self._status.setText(f"首次启动,已把 {n} 个内置脚本拷贝到用户目录,可自由修改")
+            self._status.setText(
+                f"已把 {n} 个内置脚本(首次 / 新版本)同步到用户目录,可自由修改",
+            )
 
         self._refresh()
         self._center_on_parent()
@@ -126,6 +140,21 @@ class BatLibraryDialog(QDialog):
                 self.parent().y() + 40,
             )
         ))
+
+    def _on_open_data_dir(self) -> None:
+        """打开整个 %APPDATA%\\AutoFarmStation 文件夹(包含 bat / 配置 / 日志 ...)."""
+        d = self._lib.user_data_dir()
+        try:
+            import os as _os
+            import subprocess as _sp
+            import sys as _sys
+            d.mkdir(parents=True, exist_ok=True)
+            if _sys.platform == "win32":
+                _os.startfile(str(d))  # type: ignore[attr-defined]
+            else:
+                _sp.Popen(["xdg-open", str(d)])
+        except OSError as ex:
+            QMessageBox.warning(self, "打开失败", str(ex))
 
     # --- 列表 / 选中 ---
     def _refresh(self) -> None:

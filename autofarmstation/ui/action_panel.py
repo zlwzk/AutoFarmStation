@@ -41,12 +41,27 @@ class ClickerPanel(QWidget):
     sync_start_requested = Signal()
 
     def __init__(self, hub: AutomationHub | None = None,
-                 parent: QWidget | None = None) -> None:
+                 parent: QWidget | None = None,
+                 *,
+                 defaults: dict[str, object] | None = None) -> None:
         super().__init__(parent)
         self._hub = hub
         self._clicker: AutoClicker | None = None
         self._target_hwnd = 0
         self._stats = None  # 由 main 注入
+        # v1.6.2:启动前回调(挂机时段守护会用到);返回 None=放行,返回 str=拒绝并显示
+        self._start_blocked_cb = None  # type: ignore[assignment]
+        # v1.6.2:从设置 → 默认连点参数 取值,未传就 fallback 到硬编码默认
+        d = defaults or {}
+        try:
+            init_interval = max(10, min(60000, int(d.get("interval_ms", 200))))
+        except Exception:
+            init_interval = 200
+        try:
+            init_jitter = max(0, min(100, int(d.get("jitter_pct", 10))))
+        except Exception:
+            init_jitter = 10
+        init_mode_idx = 0 if str(d.get("mode", "post")).lower().startswith("post") else 1
 
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 8, 8, 8)
@@ -62,9 +77,9 @@ class ClickerPanel(QWidget):
         # 间隔设置
         interval_box = QGroupBox("点击间隔")
         f = QFormLayout(interval_box)
-        self._interval = NumberField(minimum=10, maximum=60000, step=10, suffix=" ms", value=200)
+        self._interval = NumberField(minimum=10, maximum=60000, step=10, suffix=" ms", value=init_interval)
         f.addRow("基础间隔:", self._interval)
-        self._jitter = NumberField(minimum=0, maximum=100, step=5, suffix=" %", value=10)
+        self._jitter = NumberField(minimum=0, maximum=100, step=5, suffix=" %", value=init_jitter)
         f.addRow("随机抖动:", self._jitter)
         self._total = NumberField(minimum=0, maximum=999999, step=10, value=0)
         f.addRow("总次数(0=无限):", self._total)
@@ -73,6 +88,7 @@ class ClickerPanel(QWidget):
         f.addRow("", self._loop)
         self._mode = QComboBox()
         self._mode.addItems(["post 消息(安全)", "send 真实输入(需前台)"])
+        self._mode.setCurrentIndex(init_mode_idx)
         f.addRow("发送方式:", self._mode)
         v.addWidget(interval_box)
 
@@ -185,6 +201,15 @@ class ClickerPanel(QWidget):
         if not self._target_hwnd:
             QMessageBox.warning(self, "连点器", "请先在左侧选择目标窗口。")
             return
+        # v1.6.2:挂机时段守护 — 时段外不允许启动,给明确提示
+        if self._start_blocked_cb is not None:
+            try:
+                reason = self._start_blocked_cb()
+            except Exception:
+                reason = None
+            if reason:
+                QMessageBox.warning(self, "连点器", reason)
+                return
         cfg = self.build_config()
         if cfg is None:
             QMessageBox.warning(self, "连点器", "请至少添加一个点击点位。")
@@ -1076,15 +1101,32 @@ class ActionPanel(QWidget):
         presets: PresetLibrary,
         hub: AutomationHub | None = None,
         parent: QWidget | None = None,
+        *,
+        cfg: "Config | None" = None,
     ) -> None:
         super().__init__(parent)
         self._pm = pm
         self._sched = sched
         self._stats = stats
         self._presets = presets
+        self._cfg = cfg
         self._hub = hub or AutomationHub(stats=stats)
         self._target_hwnd = 0
         self._sync_targets: list[int] = []
+        # v1.6.2:读 cfg.defaults.clicker_* 给面板里的连点器初始化,
+        # 这样设置 → 默认连点参数才有真效果。
+        # 兼容旧调用方:不传 cfg 也不报错,落到硬编码默认值(行为与 v1.6.1 一致)。
+        self._defaults: dict[str, object] = {}
+        if cfg is not None:
+            try:
+                self._defaults = {
+                    "interval_ms": int(cfg.get("defaults.clicker_interval_ms", 200)),
+                    "jitter_pct": int(cfg.get("defaults.clicker_jitter_ms", 30)),
+                    "button": str(cfg.get("defaults.clicker_button", "left")),
+                    "mode": str(cfg.get("defaults.clicker_mode", "fixed")),
+                }
+            except Exception:
+                self._defaults = {}
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -1108,7 +1150,7 @@ class ActionPanel(QWidget):
         self._tabs = QTabWidget()
         v.addWidget(self._tabs, stretch=1)
 
-        self._clicker_panel = ClickerPanel(self._hub)
+        self._clicker_panel = ClickerPanel(self._hub, defaults=self._defaults)
         self._key_panel = KeyMacroPanel(self._hub)
         self._rec_panel = RecorderPanel()
         self._ctrl_panel = WindowControlPanel()
