@@ -33,6 +33,9 @@ class PreviewGrid(QWidget):
     sync_start_requested = Signal(list)     # 请求对勾选窗口同步启动
     sync_stop_requested = Signal(list)      # 请求对勾选窗口同步停止
     sync_broadcast_requested = Signal(list) # 请求把右侧当前配置广播到勾选窗口
+    stop_process_requested = Signal(int)    # hwnd → 结束该游戏进程
+    resume_process_requested = Signal(int)  # hwnd → 重新唤醒该游戏
+    volume_requested = Signal(int)          # hwnd → 打开单窗口音量面板
 
     def __init__(
         self,
@@ -40,6 +43,8 @@ class PreviewGrid(QWidget):
         *,
         fps: float = 1.0,
         columns: int = 0,  # 0=自适应
+        card_size: tuple[int, int] = (240, 190),
+        show_volume: bool = True,
         hub: AutomationHub | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -48,6 +53,8 @@ class PreviewGrid(QWidget):
         self._hub = hub
         self._fps = fps
         self._columns = columns
+        self._card_size = (int(card_size[0]), int(card_size[1]))
+        self._show_volume = bool(show_volume)
         self._items: dict[int, PreviewWidget] = {}
 
         outer = QVBoxLayout(self)
@@ -148,6 +155,29 @@ class PreviewGrid(QWidget):
         self._columns = max(0, cols)
         self._relayout()
 
+    def set_card_size(self, width: int, height: int) -> None:
+        """设置面板里「卡片大小」改动后调用."""
+        self._card_size = (max(160, int(width)), max(120, int(height)))
+        for w in self._items.values():
+            w.set_card_size(*self._card_size)
+        self._relayout()
+
+    def card_size(self) -> tuple[int, int]:
+        return self._card_size
+
+    def set_volume_visible(self, on: bool) -> None:
+        self._show_volume = bool(on)
+        for w in self._items.values():
+            w.set_volume_button_visible(self._show_volume)
+
+    def refresh_cards(self) -> None:
+        """设置改动后让所有卡片立刻按新配置刷新."""
+        for w in self._items.values():
+            w.refresh_now()
+
+    def card(self, hwnd: int) -> PreviewWidget | None:
+        return self._items.get(int(hwnd))
+
     def set_autoclicker_state(self, hwnd: int, running: bool) -> None:
         w = self._items.get(int(hwnd))
         if w:
@@ -211,8 +241,17 @@ class PreviewGrid(QWidget):
         # 新增(phase 错峰:多开时各窗口截图时刻错开,避免同一瞬间抢 GDI)
         for idx, it in enumerate(items):
             if it.hwnd not in self._items:
-                w = PreviewWidget(it.hwnd, fps=self._fps, phase=idx * 0.13)
+                w = PreviewWidget(
+                    it.hwnd,
+                    fps=self._fps,
+                    phase=idx * 0.13,
+                    card_size=self._card_size,
+                    show_volume=self._show_volume,
+                )
                 w.selection_changed.connect(self._on_card_selection_changed)
+                w.stop_process.connect(self.stop_process_requested.emit)
+                w.resume_process.connect(self.resume_process_requested.emit)
+                w.volume_requested.connect(self.volume_requested.emit)
                 self._items[it.hwnd] = w
         # 空提示
         self._empty_label.setVisible(not self._items)
@@ -229,9 +268,11 @@ class PreviewGrid(QWidget):
             return
         cols = self._columns
         if cols <= 0:
+            # 按当前卡片宽度自适应列数(卡片越大,一行放得越少)
+            cell = max(180, self._card_size[0] + 16)
             try:
-                vw = max(280, self._scroll.viewport().width() - 24)
-                cols = max(1, vw // 280)
+                vw = max(cell, self._scroll.viewport().width() - 24)
+                cols = max(1, vw // cell)
             except Exception:
                 cols = 2
             cols = min(max(1, cols), 6)

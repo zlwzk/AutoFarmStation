@@ -98,6 +98,11 @@ def user_bat_dir() -> Path:
     return p
 
 
+def schedule_path() -> Path:
+    """定时任务列表路径(与主配置分开存,避免和窗口列表一起被覆盖)."""
+    return user_data_dir() / "schedules.json"
+
+
 def bundled_bat_dir() -> Path:
     """内置 bat 库:PyInstaller 时指向 _MEIPASS/bat,源码运行时指向仓库根/bat."""
     return resource_dir() / "bat"

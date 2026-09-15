@@ -7,7 +7,7 @@ from .key_macro import KeyMacro, KeyMacroConfig, KeyStep
 from .macro_recorder import MacroRecorder, MacroPlayer, MacroEvent, MacroEventType, MacroScript
 from .preview_capture import PreviewCapture
 from .process_manager import ProcessManager, TrackedProcess
-from .scheduler import Scheduler, ScheduledTask, TaskFreq
+from .scheduler import Scheduler, ScheduledTask, TaskFreq, ACTION_LABELS, action_label
 from .monitor import ProcessMonitor, MonitorEvent, MonitorStatus
 from .automation_hub import AutomationHub, BundleResult
 from .steam_status import (
@@ -31,6 +31,19 @@ from .steam_overlay import (
     describe as steam_overlay_describe,
     set_overlay as steam_overlay_set,
     restore_backup as steam_overlay_restore,
+)
+from . import audio
+from .game_launcher import (
+    LaunchInfo,
+    detect_launch_info,
+    launch as launch_game,
+    launch_async as launch_game_async,
+    kill_process,
+    is_process_alive,
+    ensure_steam_running,
+    find_appid_by_exe,
+    steam_libraries,
+    parse_vdf,
 )
 
 __all__ = [
@@ -58,6 +71,8 @@ __all__ = [
     "Scheduler",
     "ScheduledTask",
     "TaskFreq",
+    "ACTION_LABELS",
+    "action_label",
     "ProcessMonitor",
     "MonitorEvent",
     "MonitorStatus",
@@ -79,4 +94,8 @@ __all__ = [
     "Session",
     "BatLibrary", "BatEntry", "BatArg",
     "steam_overlay_describe", "steam_overlay_set", "steam_overlay_restore",
+    "audio",
+    "LaunchInfo", "detect_launch_info", "launch_game", "launch_game_async",
+    "kill_process", "is_process_alive", "ensure_steam_running",
+    "find_appid_by_exe", "steam_libraries", "parse_vdf",
 ]

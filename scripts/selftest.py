@@ -645,18 +645,189 @@ def t_process_manager() -> bool:
 def t_scheduler() -> bool:
     _div("scheduler.py")
     try:
-        from autofarmstation.core.scheduler import Scheduler, ScheduledTask, TaskFreq
-        s = Scheduler()
-        fired = []
-        s.register_handler("noop", lambda t: fired.append(t.name))
-        s.add(ScheduledTask(name="t1", action="noop", freq=TaskFreq.ONCE))
-        assert len(s.list()) == 1
-        s.remove("t1")
-        assert len(s.list()) == 0
-        _ok("scheduler")
+        import datetime as _dt
+        from autofarmstation.core.scheduler import (
+            Scheduler, ScheduledTask, TaskFreq, action_label, format_interval,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            sp = Path(td) / "schedules.json"
+            s = Scheduler(path=sp, autosave=True)
+            fired = []
+            s.register_handler("noop", lambda t: fired.append(t.name))
+            s.register_handler("start_all", lambda t: fired.append(t.name))
+
+            # 基本增删
+            s.add(ScheduledTask(name="t1", action="noop", freq=TaskFreq.ONCE))
+            assert len(s.list()) == 1
+            assert s.get("t1") is not None
+            s.remove("t1")
+            assert len(s.list()) == 0
+
+            # 重名自动加后缀
+            s.add(ScheduledTask(name="dup", action="noop", freq=TaskFreq.INTERVAL,
+                                interval_sec=60))
+            n2 = s.add(ScheduledTask(name="dup", action="noop", freq=TaskFreq.INTERVAL,
+                                     interval_sec=60))
+            assert n2 != "dup", n2
+
+            # 四种频率的展示 + 下次触发时间
+            now = time.time()
+            once = ScheduledTask(name="o", freq=TaskFreq.ONCE,
+                                 run_at="2099-01-01T08:00")
+            s.add(once)
+            assert s.get("o").next_run > now
+            assert "2099-01-01" in s.get("o").schedule_text()
+
+            daily = ScheduledTask(name="d", freq=TaskFreq.DAILY, hour=9, minute=30)
+            s.add(daily)
+            nxt = s.get("d").next_run
+            d = _dt.datetime.fromtimestamp(nxt)
+            assert (d.hour, d.minute) == (9, 30), (d.hour, d.minute)
+            assert nxt > now
+
+            weekly = ScheduledTask(name="w", freq=TaskFreq.WEEKLY, weekday=2,
+                                   hour=8, minute=0)
+            s.add(weekly)
+            wd = _dt.datetime.fromtimestamp(s.get("w").next_run)
+            assert wd.weekday() == 2, wd.weekday()
+            assert "周三" in s.get("w").schedule_text()
+
+            itv = ScheduledTask(name="i", freq=TaskFreq.INTERVAL, interval_sec=7200)
+            s.add(itv)
+            assert abs(s.get("i").next_run - (now + 7200)) < 5
+
+            assert format_interval(3600) == "1 小时"
+            assert format_interval(120) == "2 分钟"
+            assert format_interval(45) == "45 秒"
+            assert action_label("launch_games")
+
+            # 持久化:重开一个实例能读回来
+            s.save()
+            s2 = Scheduler(path=sp, autosave=False)
+            s2.register_handler("start_all", lambda t: fired.append(t.name))
+            names = {t.name for t in s2.list()}
+            assert {"dup", "o", "d", "w", "i"} <= names, names
+            assert s2.get("o").freq is TaskFreq.ONCE
+            assert s2.get("w").weekday == 2
+
+            # 启用/停用 + 立即执行
+            assert s2.set_enabled("d", False) is True
+            assert s2.next_run_text(s2.get("d")) == "已暂停"
+            assert s2.run_now("d") is True
+            assert fired, "run_now 应该真的调用 handler"
+            assert s2.get("d").run_count >= 1
+
+            # 已过时间的一次性任务不会再触发
+            past = ScheduledTask(name="past", freq=TaskFreq.ONCE,
+                                 run_at="2000-01-01T00:00")
+            s2.add(past)
+            assert s2.compute_next(s2.get("past")) == 0.0
+
+            # 损坏文件不炸
+            sp.write_text("{ not json", encoding="utf-8")
+            Scheduler(path=sp, autosave=False)
+
+        _ok("scheduler: 增删/重名/四频率/下次触发/持久化/启停/立即执行/损坏恢复")
         return True
     except Exception as e:  # noqa: BLE001
         _fail("scheduler", e)
+        return False
+
+
+def t_audio() -> bool:
+    _div("audio.py(音量)")
+    try:
+        from autofarmstation.core import audio
+
+        # 缺 pycaw 时整体降级,不抛异常
+        if not audio.available():
+            _ok("audio: pycaw 不可用 → 优雅降级")
+            return True
+        mv = audio.get_master_volume()
+        assert mv is None or 0.0 <= mv <= 1.0, mv
+        assert isinstance(audio.get_master_mute(), (bool, type(None)))
+        desc = audio.describe()
+        assert isinstance(desc, str) and desc
+        # 只读探测,不改系统音量
+        sessions = audio.list_sessions()
+        assert isinstance(sessions, list)
+        for s in sessions:
+            assert "pid" in s and "volume" in s and "muted" in s
+        # 不存在的 pid → 找不到会话,但不抛异常
+        assert audio.find_session(0) is None
+        assert audio.get_session_volume(999999999) is None
+        assert audio.set_session_volume(999999999, 0.5) is False
+        _ok(f"audio: {desc} · 会话 {len(sessions)} 个")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("audio", e)
+        return False
+
+
+def t_game_launcher() -> bool:
+    _div("game_launcher.py(启动/结束进程)")
+    try:
+        from autofarmstation.core import game_launcher as gl
+
+        # VDF 解析(libraryfolders.vdf / appmanifest 的格式)
+        sample = """
+"libraryfolders"
+{
+\t"0"
+\t{
+\t\t"path"\t\t"C:\\\\Program Files (x86)\\\\Steam"
+\t\t"label"\t\t""
+\t\t"apps"
+\t\t{
+\t\t\t"897330"\t\t"123456"
+\t\t}
+\t}
+\t"1"
+\t{
+\t\t"path"\t\t"D:\\\\Games\\\\SteamLibrary"
+\t}
+}
+"""
+        data = gl.parse_vdf(sample)
+        folders = data["libraryfolders"]
+        assert folders["0"]["path"].replace("\\\\", "\\").endswith("Steam")
+        assert folders["1"]["path"].endswith("SteamLibrary")
+        assert folders["0"]["apps"]["897330"] == "123456"
+
+        # LaunchInfo 往返
+        li = gl.LaunchInfo(exe=r"C:\game\a.exe", args=["-x", "1"],
+                           cwd=r"C:\game", name="a.exe", title="A",
+                           steam_appid=897330, source="steam")
+        assert li.usable
+        li2 = gl.LaunchInfo.from_dict(li.to_dict())
+        assert li2.steam_appid == 897330 and li2.args == ["-x", "1"]
+        assert "897330" in li2.describe()
+        assert not gl.LaunchInfo().usable
+
+        # 进程状态
+        assert gl.is_process_alive(os.getpid()) is True
+        assert gl.is_process_alive(0) is False
+        assert gl.is_process_alive(999999999) is False
+        # 结束一个不存在的进程 → 视为已经不在
+        ok, msg = gl.kill_process(999999999)
+        assert ok is True, msg
+        # 缺启动信息 → 明确失败而不是崩
+        ok, msg = gl.launch(None)
+        assert ok is False and msg
+
+        # Steam 库扫描(本机没装 Steam 时返回空表,不报错)
+        libs = gl.steam_libraries()
+        assert isinstance(libs, list)
+        # 随便一个不存在的 exe → 反查不到 appid
+        assert gl.find_appid_by_exe(r"C:\definitely\not\here.exe") == 0
+        # 有 exe 的文件放进去能被识别为可启动
+        ok, msg = gl.launch(gl.LaunchInfo(exe=r"C:\definitely\not\here.exe"))
+        assert ok is False and "exe" in msg.lower() or "不存在" in msg
+        _ok(f"game_launcher: vdf 解析 / LaunchInfo / 进程状态 / Steam 库 {len(libs)} 个")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("game_launcher", e)
         return False
 
 
@@ -975,7 +1146,7 @@ def run_all() -> int:
         t_macro_recorder, t_process_manager, t_scheduler, t_monitor,
         t_statistics, t_presets, t_hub, t_steam_status, t_session,
         t_bat_library, t_steam_overlay,
-        t_update_settings,
+        t_update_settings, t_audio, t_game_launcher,
         t_io_smoke, t_gui_smoke, t_app_help,
     ]
     passed = 0

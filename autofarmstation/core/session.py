@@ -81,10 +81,24 @@ class Session:
 
     # ---------- 写入 ----------
     def save(self, pm: "ProcessManager", hub: "AutomationHub") -> None:
-        from .process_manager import TrackedProcess  # 避免循环引用
+        from .game_launcher import detect_launch_info
+
         items: list[dict] = []
         cfg_map = hub.export_configs()
         for tp in pm.all():
+            # 记录「怎么把它重新拉起来」(exe / 命令行 / Steam appid),
+            # 供下次启动时自动唤醒未运行的游戏。
+            launch: dict = {}
+            if tp.pid:
+                try:
+                    info = detect_launch_info(int(tp.pid), title=tp.title or "")
+                except Exception:  # noqa: BLE001
+                    info = None
+                if info is not None and info.usable:
+                    launch = info.to_dict()
+            if not launch and tp.exe:
+                launch = {"exe": tp.exe, "args": [], "cwd": "", "name": tp.name or "",
+                          "title": tp.title or "", "steam_appid": 0, "source": "exe"}
             items.append(
                 {
                     "id": f"{tp.exe}|{tp.title}",
@@ -94,6 +108,7 @@ class Session:
                     "title": tp.title or "",
                     "config": cfg_map.get(str(tp.hwnd), {}) or {},
                     "added_at": float(tp.added_at or 0.0),
+                    "launch": launch,
                 }
             )
         payload = {
@@ -185,3 +200,23 @@ class Session:
             out.append((s, w))
             used.add(int(w.hwnd))
         return out
+
+    @staticmethod
+    def missed_items(
+        saved_items: list[dict],
+        pairs: list[tuple[dict, wf.WindowInfo]],
+    ) -> list[dict]:
+        """哪些 saved 条目在当前桌面上没匹配到(即游戏没开,可以尝试唤醒)."""
+        hit = {id(s) for _s, _w in pairs}
+        return [s for s in saved_items if id(s) not in hit and isinstance(s, dict)]
+
+    @staticmethod
+    def launch_info_of(item: dict):
+        """从 saved 条目里取出启动信息(LaunchInfo);没有则返回 None."""
+        from .game_launcher import LaunchInfo
+
+        raw = (item or {}).get("launch") or {}
+        if not isinstance(raw, dict):
+            return None
+        info = LaunchInfo.from_dict(raw)
+        return info if info.usable else None

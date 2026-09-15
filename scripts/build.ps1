@@ -68,6 +68,8 @@ $pyiArgs = @(
     "--version-file", "build\version_info.txt",
     "--collect-all", "mss",
     "--collect-all", "pynput",
+    "--collect-all", "pycaw",
+    "--collect-all", "comtypes",
     "--collect-submodules", "pynput.keyboard",
     "--collect-submodules", "pynput.mouse",
     "--hidden-import", "PySide6.QtCore",

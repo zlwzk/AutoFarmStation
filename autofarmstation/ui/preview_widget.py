@@ -31,6 +31,9 @@ class PreviewWidget(QFrame):
     closed = Signal(int)  # hwnd(请求从追踪列表移除)
     autoclick_toggle = Signal(int)  # hwnd
     selection_changed = Signal(int, bool)  # hwnd, 是否选中
+    stop_process = Signal(int)  # hwnd → 结束该游戏进程
+    resume_process = Signal(int)  # hwnd → 重新唤醒该游戏
+    volume_requested = Signal(int)  # hwnd → 打开单窗口音量面板
 
     def __init__(
         self,
@@ -38,6 +41,8 @@ class PreviewWidget(QFrame):
         *,
         fps: float = 1.0,
         phase: float = 0.0,
+        card_size: tuple[int, int] | None = None,
+        show_volume: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -48,13 +53,20 @@ class PreviewWidget(QFrame):
             "#PreviewCard { border: 2px solid #3c3c3c; background:#222; }"
             "#PreviewCard:hover { border: 2px solid #4a9eff; }"
         )
-        self.setMinimumSize(220, 180)
+        cw, ch = card_size or (240, 190)
+        self.setMinimumSize(int(cw), int(ch))
         self._capture = PreviewCapture(self.hwnd, fps=fps, phase=phase)
         self._capture.on_frame = self._on_frame
         self._autoclicker_running = False
         self._fps = fps
         self._status_extra = ""
         self._embedded = False
+        self._show_volume = bool(show_volume)
+        self._proc_alive = True
+        self._last_pid = 0
+        _info = wf.get_window_info(self.hwnd)
+        if _info is not None:
+            self._last_pid = _info.pid
 
         v = QVBoxLayout(self)
         v.setContentsMargins(4, 4, 4, 4)
@@ -108,15 +120,43 @@ class PreviewWidget(QFrame):
         self._image_lab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         v.addWidget(self._image_lab, stretch=1)
 
-        # 底部状态栏
+        # 底部状态栏:状态文字 + 音量 / 停止进程 / 恢复进程 / 连点
         status_bar = QHBoxLayout()
+        status_bar.setSpacing(3)
         self._status_lab = QLabel("未运行")
         self._status_lab.setStyleSheet("color:#aaa; font-size:11px;")
+        # Ignored:状态文字不参与最小宽度计算,避免把卡片撑宽
+        self._status_lab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._status_lab.setMinimumWidth(0)
         status_bar.addWidget(self._status_lab, stretch=1)
+
+        self._btn_volume = QPushButton("♪")
+        self._btn_volume.setFixedSize(24, 22)
+        self._btn_volume.setToolTip("调节该窗口(游戏进程)的音量,不影响系统整体音量")
+        self._btn_volume.clicked.connect(lambda: self.volume_requested.emit(self.hwnd))
+        self._btn_volume.setVisible(self._show_volume)
+        status_bar.addWidget(self._btn_volume)
+
+        self._btn_stop = QPushButton("■")
+        self._btn_stop.setFixedSize(24, 22)
+        self._btn_stop.setStyleSheet("QPushButton { color:#ff9090; }")
+        self._btn_stop.setToolTip("结束该游戏进程(连同子进程)")
+        self._btn_stop.clicked.connect(lambda: self.stop_process.emit(self.hwnd))
+        status_bar.addWidget(self._btn_stop)
+
+        self._btn_resume = QPushButton("▶")
+        self._btn_resume.setFixedSize(24, 22)
+        self._btn_resume.setStyleSheet("QPushButton { color:#8fd18f; }")
+        self._btn_resume.setToolTip(
+            "重新唤醒该游戏进程。\n"
+            "Steam 游戏会先唤起 Steam 客户端,再通过 steam:// 拉起游戏。"
+        )
+        self._btn_resume.clicked.connect(lambda: self.resume_process.emit(self.hwnd))
+        status_bar.addWidget(self._btn_resume)
 
         self._btn_autoclick = QPushButton("连点")
         self._btn_autoclick.setCheckable(True)
-        self._btn_autoclick.setFixedWidth(56)
+        self._btn_autoclick.setFixedWidth(44)
         self._btn_autoclick.toggled.connect(self._on_autoclick_toggle)
         status_bar.addWidget(self._btn_autoclick)
         v.addLayout(status_bar)
@@ -138,6 +178,26 @@ class PreviewWidget(QFrame):
     def set_fps(self, fps: float) -> None:
         self._capture.set_fps(fps)
         self._fps = fps
+
+    def set_card_size(self, width: int, height: int) -> None:
+        """由设置面板驱动:卡片最小尺寸."""
+        self.setMinimumSize(max(160, int(width)), max(120, int(height)))
+        self.updateGeometry()
+
+    def set_volume_button_visible(self, on: bool) -> None:
+        self._show_volume = bool(on)
+        self._btn_volume.setVisible(self._show_volume)
+
+    def pid(self) -> int:
+        """当前 pid(窗口失效时回退到最近一次记录的值)."""
+        info = wf.get_window_info(self.hwnd)
+        if info is not None and info.pid:
+            self._last_pid = info.pid
+        return self._last_pid
+
+    def refresh_now(self) -> None:
+        """外部(如设置变更后)立刻刷新一次状态."""
+        self._refresh_status()
 
     def is_selected(self) -> bool:
         return self._chk.isChecked()
@@ -266,10 +326,16 @@ class PreviewWidget(QFrame):
         if info is None:
             self._title_lab.setText("[已失效]")
             self._title_lab.setStyleSheet("color:#888;")
-            self._status_lab.setText(styled_message("窗口已失效", level="warn"))
+            alive = self._is_proc_alive()
+            self._set_status_text(
+                "进程未运行(可点 ▶ 唤醒)" if not alive
+                else styled_message("窗口已失效", level="warn")
+            )
             self._image_lab.setText("(窗口已失效)")
             self._image_lab.setPixmap(QPixmap())
+            self._sync_proc_buttons(alive=False)
             return
+        self._last_pid = info.pid
         title = info.title
         if len(title) > 36:
             title = title[:33] + "..."
@@ -285,7 +351,33 @@ class PreviewWidget(QFrame):
             msg += f" · {self._fps:.1f}fps"
         if self._status_extra:
             msg = f"● {self._status_extra} · " + msg
-        self._status_lab.setText(msg)
+        self._set_status_text(msg)
+        self._sync_proc_buttons(alive=True)
+
+    def _is_proc_alive(self) -> bool:
+        from ..core.game_launcher import is_process_alive
+
+        if not self._last_pid:
+            return False
+        return is_process_alive(self._last_pid)
+
+    def _sync_proc_buttons(self, *, alive: bool) -> None:
+        """按进程存活状态点亮/灰掉「停止」与「恢复」."""
+        self._proc_alive = bool(alive)
+        self._btn_stop.setEnabled(alive)
+        self._btn_resume.setEnabled(not alive)
+
+    def _set_status_text(self, text: str) -> None:
+        """状态栏文字(超长省略,完整内容放 tooltip)."""
+        try:
+            fm = self._status_lab.fontMetrics()
+            avail = max(30, self.width() - 150)
+            self._status_lab.setText(
+                fm.elidedText(text, Qt.TextElideMode.ElideRight, avail)
+            )
+        except Exception:
+            self._status_lab.setText(text)
+        self._status_lab.setToolTip(text)
 
     def _on_image_click(self, ev) -> None:
         if self._embedded:
@@ -294,23 +386,31 @@ class PreviewWidget(QFrame):
             self._do_focus()
 
     def _on_image_dblclick(self, ev) -> None:
-        if self._embedded:
-            return  # 嵌入时最大化会破坏卡片布局
-        if ev.button() == Qt.MouseButton.LeftButton:
-            info = wf.get_window_info(self.hwnd)
-            if info is None:
-                return
-            if info.is_minimized:
-                wf.show_window(self.hwnd, wf.SW_RESTORE)
-            else:
-                wf.show_window(self.hwnd, wf.SW_SHOWMAXIMIZED)
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        self._do_focus(force_fit=True)
 
     def _on_focus_clicked(self) -> None:
         self._do_focus()
 
-    def _do_focus(self) -> None:
-        if not self._embedded:
-            wf.set_foreground(self.hwnd)
+    def _do_focus(self, *, force_fit: bool = False) -> None:
+        """聚焦:还原最小化 → 铺满所在显示器工作区 → 提到前台.
+
+        目的:让**整个游戏界面完整可见**(不会被任务栏 / 屏幕边缘裁掉,
+        也不会因为窗口比屏幕大而被切掉一部分)。
+        """
+        if self._embedded:
+            self._release_embed()  # 嵌在卡片里时聚焦无意义,先弹回桌面
+        fit = True
+        if not force_fit:
+            try:
+                from ..utils.config import instance as _cfg_instance
+
+                fit = bool(_cfg_instance().get("ui.focus_fit_screen", True))
+            except Exception:  # noqa: BLE001
+                fit = True
+        if wf.get_window_info(self.hwnd) is not None:
+            wf.focus_window(self.hwnd, fit=fit)
         self.focused.emit(self.hwnd)
 
     def _on_autoclick_toggle(self, checked: bool) -> None:

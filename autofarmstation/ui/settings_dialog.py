@@ -1,7 +1,8 @@
 """设置对话框.
 
-分五大组:
-  界面 · 预览 · 默认连点参数 · Steam 状态联动与叠加层 · 更新与日志
+分组:
+  界面 · 预览与窗口尺寸 · 默认连点参数 · 音量 ·
+  游戏进程 · Steam 状态联动与叠加层 · 更新与日志 · 数据位置
 """
 
 from __future__ import annotations
@@ -13,9 +14,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QCheckBox, QComboBox, QLineEdit, QDialogButtonBox, QPushButton, QLabel,
-    QMessageBox, QDoubleSpinBox, QSpinBox,
+    QMessageBox, QDoubleSpinBox, QSpinBox, QSlider, QScrollArea, QWidget,
 )
 
+from ..core import audio
 from ..utils.config import Config
 from ..utils.paths import steam_config_path
 from ..core.steam_overlay import (
@@ -35,24 +37,36 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self._cfg = cfg
         self.setWindowTitle("设置")
-        self.resize(620, 720)
-        self.setMinimumWidth(560)
+        self.resize(700, 820)
+        self.setMinimumWidth(620)
 
-        v = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(4, 4, 4, 4)
 
         self._build_ui_group(v)
         self._build_preview_group(v)
         self._build_defaults_group(v)
+        self._build_audio_group(v)
+        self._build_game_group(v)
         self._build_steam_group(v)
         self._build_update_group(v)
         self._build_paths_group(v)
+        v.addStretch()
+
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, stretch=1)
 
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
-        v.addWidget(bb)
+        outer.addWidget(bb)
 
         self._steam = SteamStatusController(cfg)
         self._refresh_steam_info()
@@ -108,6 +122,167 @@ class SettingsDialog(QDialog):
         else:
             self._preview_cols.setCurrentText("自适应")
         uf.addRow("默认布局列数:", self._preview_cols)
+
+        # --- 窗口(卡片)尺寸:用户自行调节 ---
+        size_row = QHBoxLayout()
+        self._card_w = QSpinBox()
+        self._card_w.setRange(160, 800)
+        self._card_w.setSingleStep(10)
+        self._card_w.setSuffix(" px")
+        self._card_w.setValue(int(self._cfg.get("ui.card_min_width", 240)))
+        size_row.addWidget(self._card_w)
+        size_row.addWidget(QLabel("×"))
+        self._card_h = QSpinBox()
+        self._card_h.setRange(120, 600)
+        self._card_h.setSingleStep(10)
+        self._card_h.setSuffix(" px")
+        self._card_h.setValue(int(self._cfg.get("ui.card_min_height", 190)))
+        size_row.addWidget(self._card_h)
+        size_row.addStretch()
+        uf.addRow("卡片大小(宽 × 高):", size_row)
+
+        size_note = QLabel(
+            "每张游戏窗口预览卡片的最小尺寸。数值越大,一行能放的窗口越少,"
+            "但画面和按钮都更清楚。点确定后立刻生效。"
+        )
+        size_note.setStyleSheet("color:#888;")
+        size_note.setWordWrap(True)
+        uf.addRow(size_note)
+
+        self._focus_fit = QCheckBox("点「聚焦」时把游戏窗口铺满所在显示器工作区")
+        self._focus_fit.setChecked(self._cfg.get("ui.focus_fit_screen", True))
+        uf.addRow("", self._focus_fit)
+        fit_note = QLabel(
+            "开启后聚焦(或双击预览画面)会让游戏窗口完整铺满屏幕可用区域,"
+            "确保整个界面都看得见 —— 不会被任务栏、屏幕边缘切掉一部分。\n"
+            "关闭则只把窗口提到最前面,不改尺寸。"
+        )
+        fit_note.setStyleSheet("color:#888;")
+        fit_note.setWordWrap(True)
+        uf.addRow(fit_note)
+        parent_layout.addWidget(box)
+
+    def _build_audio_group(self, parent_layout: QVBoxLayout) -> None:
+        """音量:整体音量 + 单窗口音量."""
+        box = QGroupBox("音量")
+        af = QFormLayout(box)
+
+        if not audio.available():
+            warn = QLabel(
+                "音量功能不可用:当前环境缺少 pycaw 组件(打包版已内置)。\n"
+                "源码运行时执行:pip install pycaw"
+            )
+            warn.setStyleSheet("color:#e08080;")
+            warn.setWordWrap(True)
+            af.addRow(warn)
+            parent_layout.addWidget(box)
+            return
+
+        # 整体音量
+        row = QHBoxLayout()
+        self._master_vol = QSlider(Qt.Orientation.Horizontal)
+        self._master_vol.setRange(0, 100)
+        mv = audio.get_master_volume()
+        self._master_vol.setValue(int(round((mv if mv is not None else 1.0) * 100)))
+        self._master_vol.valueChanged.connect(self._on_master_volume_changed)
+        row.addWidget(self._master_vol, stretch=1)
+        self._master_lab = QLabel(f"{self._master_vol.value()}%")
+        self._master_lab.setFixedWidth(48)
+        row.addWidget(self._master_lab)
+        af.addRow("整体音量:", row)
+
+        self._master_mute = QCheckBox("静音")
+        self._master_mute.setChecked(bool(audio.get_master_mute()))
+        self._master_mute.toggled.connect(lambda on: audio.set_master_mute(on))
+        af.addRow("", self._master_mute)
+
+        self._apply_master_on_start = QCheckBox("启动本软件时把整体音量设成上面的值")
+        self._apply_master_on_start.setChecked(self._cfg.get("audio.apply_master_on_start", False))
+        af.addRow("", self._apply_master_on_start)
+
+        row_all = QHBoxLayout()
+        btn_apply_all = QPushButton("把该音量应用到所有追踪窗口")
+        btn_apply_all.setToolTip("按窗口设置,不动系统整体音量")
+        btn_apply_all.clicked.connect(self._on_apply_volume_to_all)
+        row_all.addWidget(btn_apply_all)
+        row_all.addStretch()
+        af.addRow("", row_all)
+
+        sep = QLabel("— — — — — — — — — — — — — — — — — — —")
+        sep.setStyleSheet("color:#666;")
+        af.addRow(sep)
+
+        self._show_volume_on_card = QCheckBox("在每张窗口卡片上显示 ♪ 音量按钮")
+        self._show_volume_on_card.setChecked(self._cfg.get("audio.show_volume_on_card", True))
+        af.addRow("", self._show_volume_on_card)
+
+        row_def = QHBoxLayout()
+        self._def_session_vol = QSlider(Qt.Orientation.Horizontal)
+        self._def_session_vol.setRange(0, 100)
+        dv = int(self._cfg.get("audio.default_session_volume", -1))
+        self._def_session_vol.setValue(dv if dv >= 0 else 100)
+        self._def_session_vol.valueChanged.connect(
+            lambda v: self._def_session_lab.setText(f"{v}%")
+        )
+        row_def.addWidget(self._def_session_vol, stretch=1)
+        self._def_session_lab = QLabel(f"{self._def_session_vol.value()}%")
+        self._def_session_lab.setFixedWidth(48)
+        row_def.addWidget(self._def_session_lab)
+        af.addRow("新窗口默认音量:", row_def)
+
+        self._apply_session_on_add = QCheckBox("新添加窗口时自动套用上面的音量")
+        self._apply_session_on_add.setChecked(self._cfg.get("audio.apply_session_on_add", False))
+        af.addRow("", self._apply_session_on_add)
+
+        note = QLabel(
+            "说明:整体音量 = 任务栏音量条(影响所有程序);\n"
+            "单窗口音量 = Windows「音量合成器」里那一栏(只影响该游戏)。\n"
+            "进程还没发出声音时读不到它的会话音量,此时拖动滑块会在它出声后仍生效。"
+        )
+        note.setStyleSheet("color:#888;")
+        note.setWordWrap(True)
+        af.addRow(note)
+        parent_layout.addWidget(box)
+
+    def _build_game_group(self, parent_layout: QVBoxLayout) -> None:
+        """游戏进程的唤醒 / 结束策略."""
+        box = QGroupBox("游戏进程")
+        gf = QFormLayout(box)
+
+        self._auto_wake = QCheckBox("恢复上次会话时,游戏没打开就自动唤醒")
+        self._auto_wake.setChecked(self._cfg.get("launch.auto_wake_on_restore", True))
+        gf.addRow("", self._auto_wake)
+
+        wake_note = QLabel(
+            "Steam 游戏会先唤起 Steam 客户端,等它启动完成后再通过 "
+            "steam://rungameid/<AppID> 拉起游戏;非 Steam 程序直接运行原来的 exe。"
+        )
+        wake_note.setStyleSheet("color:#888;")
+        wake_note.setWordWrap(True)
+        gf.addRow(wake_note)
+
+        self._close_games = QCheckBox("关闭本软件时,同时结束被追踪的游戏进程")
+        self._close_games.setChecked(self._cfg.get("launch.close_games_on_exit", True))
+        gf.addRow("", self._close_games)
+
+        warn = QLabel(
+            "⚠ 打开后,退出软件会一并结束这些游戏(含未保存进度),请谨慎使用。\n"
+            "只对「本软件当前追踪中的窗口」生效,不会去动其它程序。"
+        )
+        warn.setStyleSheet("color:#e0a080;")
+        warn.setWordWrap(True)
+        gf.addRow(warn)
+
+        self._kill_tree = QCheckBox("结束进程时连同子进程")
+        self._kill_tree.setChecked(self._cfg.get("launch.kill_tree", True))
+        gf.addRow("", self._kill_tree)
+
+        self._steam_timeout = QSpinBox()
+        self._steam_timeout.setRange(10, 600)
+        self._steam_timeout.setSuffix(" 秒")
+        self._steam_timeout.setValue(int(self._cfg.get("launch.steam_timeout_sec", 90)))
+        gf.addRow("等待 Steam 启动超时:", self._steam_timeout)
+
         parent_layout.addWidget(box)
 
     def _build_defaults_group(self, parent_layout: QVBoxLayout) -> None:
@@ -379,6 +554,34 @@ class SettingsDialog(QDialog):
         parent_layout.addWidget(box)
 
     # ===== 行为 =====
+    def _tracked_pids(self) -> list[int]:
+        """从主窗口拿「当前追踪的所有窗口」的 pid(用于批量设音量)."""
+        parent = self.parent()
+        for attr in ("_pm", "pm", "_process_manager"):
+            pm = getattr(parent, attr, None)
+            if pm is not None and hasattr(pm, "all"):
+                try:
+                    return [int(tp.pid) for tp in pm.all() if getattr(tp, "pid", 0)]
+                except Exception:  # noqa: BLE001
+                    return []
+        return []
+
+    def _on_master_volume_changed(self, val: int) -> None:
+        self._master_lab.setText(f"{val}%")
+        audio.set_master_volume(val / 100.0)
+
+    def _on_apply_volume_to_all(self) -> None:
+        pids = self._tracked_pids()
+        if not pids:
+            QMessageBox.information(self, "音量", "当前没有追踪中的窗口。")
+            return
+        n = audio.set_volume_for_pids(pids, self._master_vol.value() / 100.0)
+        QMessageBox.information(
+            self, "音量",
+            f"已对 {n}/{len(pids)} 个窗口设置音量 {self._master_vol.value()}%。\n"
+            "没生效的窗口是因为它此刻还没有音频会话(没在发声)。",
+        )
+
     def _refresh_steam_info(self) -> None:
         try:
             self._steam_info.setText(self._steam.describe())
@@ -488,6 +691,23 @@ class SettingsDialog(QDialog):
         self._cfg.set("steam.farm_state", self._steam_state.currentData() or STATE_ONLINE)
         self._cfg.set("steam.restore_previous", self._steam_restore.isChecked())
         self._cfg.set("steam.verify", self._steam_verify.isChecked())
+        # 卡片尺寸 + 聚焦行为
+        self._cfg.set("ui.card_min_width", self._card_w.value())
+        self._cfg.set("ui.card_min_height", self._card_h.value())
+        self._cfg.set("ui.focus_fit_screen", self._focus_fit.isChecked())
+        # 游戏进程策略
+        self._cfg.set("launch.auto_wake_on_restore", self._auto_wake.isChecked())
+        self._cfg.set("launch.close_games_on_exit", self._close_games.isChecked())
+        self._cfg.set("launch.kill_tree", self._kill_tree.isChecked())
+        self._cfg.set("launch.steam_timeout_sec", self._steam_timeout.value())
+        # 音量
+        self._cfg.set("audio.apply_master_on_start", self._apply_master_on_start.isChecked())
+        if audio.available():
+            self._cfg.set("audio.master_volume", self._master_vol.value() / 100.0)
+            self._cfg.set("audio.master_mute", self._master_mute.isChecked())
+            self._cfg.set("audio.show_volume_on_card", self._show_volume_on_card.isChecked())
+            self._cfg.set("audio.default_session_volume", self._def_session_vol.value() / 100.0)
+            self._cfg.set("audio.apply_session_on_add", self._apply_session_on_add.isChecked())
         self._cfg.set("settings.check_updates", self._check_updates.isChecked())
         self._cfg.set(
             "settings.update_check_interval_hours",
@@ -504,4 +724,11 @@ class SettingsDialog(QDialog):
             parent._update_check_interval_hours = int(
                 self._cfg.get("settings.update_check_interval_hours", 1)
             )
+        # 让主窗口把「卡片尺寸 / 音量按钮 / 聚焦行为」等立即应用到现有卡片
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "apply_settings_changes"):
+            try:
+                parent.apply_settings_changes()
+            except Exception:  # noqa: BLE001
+                _log.warning("应用设置变更失败", exc_info=True)
         self.accept()

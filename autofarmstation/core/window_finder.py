@@ -107,6 +107,41 @@ _user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, 
 _user32.SendMessageW.restype = wintypes.LPARAM
 
 
+# --- 显示器工作区 / 前置窗口 ---
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+_user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+_user32.MonitorFromWindow.restype = wintypes.HANDLE
+_user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+_user32.GetMonitorInfoW.restype = wintypes.BOOL
+_user32.BringWindowToTop.argtypes = [wintypes.HWND]
+_user32.BringWindowToTop.restype = wintypes.BOOL
+_user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+_user32.AttachThreadInput.restype = wintypes.BOOL
+_user32.IsZoomed.argtypes = [wintypes.HWND]
+_user32.IsZoomed.restype = wintypes.BOOL
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.IsIconic.restype = wintypes.BOOL
+_user32.SystemParametersInfoW.argtypes = [
+    wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT,
+]
+_user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+_kernel32.GetCurrentThreadId.argtypes = []
+_kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+MONITOR_DEFAULTTONEAREST = 2
+SPI_GETWORKAREA = 0x0030
+
+
 # === 公开 API ===
 def _is_window(hwnd: int) -> bool:
     return bool(hwnd) and bool(_user32.IsWindow(hwnd))
@@ -327,3 +362,99 @@ def post_key(hwnd: int, vk: int, *, down: bool = True) -> bool:
     """发送按键消息(虚拟键码)."""
     msg = WM_KEYDOWN if down else WM_KEYUP
     return bool(_user32.PostMessageW(hwnd, msg, vk, 0))
+
+
+# === 显示器工作区 / 聚焦 ===
+def work_area(hwnd: int = 0) -> tuple[int, int, int, int] | None:
+    """窗口所在显示器的工作区(已排除任务栏):(left, top, right, bottom).
+
+    hwnd=0 时取主显示器工作区。
+    """
+    if hwnd:
+        mon = _user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if mon:
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if _user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                r = mi.rcWork
+                return (r.left, r.top, r.right, r.bottom)
+    rect = wintypes.RECT(0, 0, 0, 0)
+    if _user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+        return (rect.left, rect.top, rect.right, rect.bottom)
+    return None
+
+
+def is_minimized(hwnd: int) -> bool:
+    return bool(_user32.IsIconic(hwnd))
+
+
+def is_maximized(hwnd: int) -> bool:
+    return bool(_user32.IsZoomed(hwnd))
+
+
+def force_foreground(hwnd: int) -> bool:
+    """把窗口提到前台的可靠版本.
+
+    ``SetForegroundWindow`` 在前台锁定时会静默失败,这里退化为
+    ``AttachThreadInput`` 到当前前台线程后再试一次。
+    """
+    if not _is_window(hwnd):
+        return False
+    _user32.BringWindowToTop(hwnd)
+    if _user32.SetForegroundWindow(hwnd):
+        return True
+    fg = _user32.GetForegroundWindow()
+    if not fg:
+        return False
+    tid_fg = _user32.GetWindowThreadProcessId(fg, None)
+    tid_me = _kernel32.GetCurrentThreadId()
+    if not tid_fg or tid_fg == tid_me:
+        return False
+    if not _user32.AttachThreadInput(tid_me, tid_fg, True):
+        return False
+    try:
+        _user32.BringWindowToTop(hwnd)
+        return bool(_user32.SetForegroundWindow(hwnd))
+    finally:
+        _user32.AttachThreadInput(tid_me, tid_fg, False)
+
+
+def fit_to_work_area(hwnd: int, *, margin: int = 0) -> bool:
+    """把窗口调整成所在显示器工作区大小,保证整个界面完整可见.
+
+    已经是最大化状态时保持最大化(游戏全屏更完整)。
+    """
+    wa = work_area(hwnd)
+    if wa is None:
+        return False
+    left, top, right, bottom = wa
+    left += margin
+    top += margin
+    right -= margin
+    bottom -= margin
+    w = max(200, right - left)
+    h = max(150, bottom - top)
+    if is_maximized(hwnd):
+        return True
+    return move_window(hwnd, left, top, w, h)
+
+
+def focus_window(hwnd: int, *, fit: bool = True, margin: int = 0) -> bool:
+    """聚焦窗口:最小化则还原 → 可选铺满工作区 → 提到前台.
+
+    返回是否成功提到前台。
+    """
+    if not _is_window(hwnd):
+        return False
+    if is_minimized(hwnd):
+        show_window(hwnd, SW_RESTORE)
+    if fit:
+        fit_to_work_area(hwnd, margin=margin)
+    return force_foreground(hwnd)
+
+
+def client_rect_on_screen(hwnd: int) -> tuple[int, int, int, int]:
+    """客户区在屏幕坐标系的外接矩形 (left, top, right, bottom)."""
+    x, y = client_origin(hwnd)
+    w, h = client_size(hwnd)
+    return (x, y, x + w, y + h)

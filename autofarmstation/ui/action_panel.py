@@ -881,77 +881,118 @@ class StatsPanel(QWidget):
 
 # === 定时任务面板 ===
 class SchedulerPanel(QWidget):
-    def __init__(self, sched: Scheduler, parent: QWidget | None = None) -> None:
+    """概览 + 一键进「定时任务管理器」(新增/编辑/删除都在管理器里做)."""
+
+    def __init__(self, sched: Scheduler, pm=None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._sched = sched
+        self._pm = pm
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 8, 8, 8)
+
         self._list = QListWidget()
-        v.addWidget(self._list)
+        self._list.itemDoubleClicked.connect(lambda *_: self._on_manage())
+        v.addWidget(self._list, stretch=1)
 
         b = QHBoxLayout()
-        self._btn_add = QPushButton("+ 新建任务")
-        self._btn_add.clicked.connect(self._on_add)
+        self._btn_new = QPushButton("＋ 新建")
+        self._btn_new.clicked.connect(self._on_manage)
+        self._btn_manage = QPushButton("管理...")
+        self._btn_manage.setToolTip("打开定时任务管理器(新增 / 编辑 / 删除 / 立即执行)")
+        self._btn_manage.clicked.connect(self._on_manage)
+        self._btn_toggle = QPushButton("启用/停用")
+        self._btn_toggle.clicked.connect(self._on_toggle)
+        self._btn_run = QPushButton("立即执行")
+        self._btn_run.clicked.connect(self._on_run)
         self._btn_del = QPushButton("删除")
         self._btn_del.clicked.connect(self._on_del)
-        b.addWidget(self._btn_add); b.addWidget(self._btn_del)
+        for w in (self._btn_new, self._btn_manage, self._btn_toggle, self._btn_run, self._btn_del):
+            b.addWidget(w)
         v.addLayout(b)
 
-        self._info = QLabel("调度任务说明:\n"
-                            "• start_all = 启动所有连点器/键盘宏\n"
-                            "• stop_all  = 停止所有\n"
-                            "• 任务存于配置,不会随会话结束而丢失。")
+        self._info = QLabel(
+            "定时任务会在后台按计划执行,支持:\n"
+            "• 启动/停止全部 · 启动或结束游戏(Steam 游戏先唤起 Steam)\n"
+            "• 开始/停止连点 · 启动键盘宏 · 调音量 · 退出软件\n"
+            "• 频率:一次性 / 间隔 / 每天 / 每周\n"
+            "任务保存在 %APPDATA%\\AutoFarmStation\\schedules.json,重启软件依然有效。"
+        )
         self._info.setStyleSheet("color:#aaa; font-size:11px;")
+        self._info.setWordWrap(True)
         v.addWidget(self._info)
-        v.addStretch()
         self._refresh()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(5000)
 
+    # --- 列表 ---
     def _refresh(self) -> None:
+        from ..core.scheduler import action_label
+
+        cur = self._selected_name()
         self._list.clear()
         for t in self._sched.list():
-            enabled = "✓" if t.enabled else "✗"
-            self._list.addItem(
-                f"{enabled} {t.name} · {t.freq.value} · {t.hour:02d}:{t.minute:02d} · {t.action} · 已执行 {t.run_count} 次"
+            mark = "✓" if t.enabled else "✗"
+            item = QListWidgetItem(
+                f"{mark} {t.name} · {t.schedule_text()} · {action_label(t.action)}"
+                f" · {self._sched.next_run_text(t)} · 已执行 {t.run_count} 次"
             )
+            item.setData(Qt.ItemDataRole.UserRole, t.name)
+            self._list.addItem(item)
+        if cur:
+            self._select(cur)
 
-    def _on_add(self) -> None:
-        name, ok = QInputDialog.getText(self, "新建任务", "任务名:")
-        if not ok or not name:
-            return
-        action, ok = QInputDialog.getItem(self, "动作", "选择动作:", [
-            "start_all", "stop_all", "shutdown_app"
-        ], 0, False)
-        if not ok or not action:
-            return
-        freq, ok = QInputDialog.getItem(self, "频率", "选择频率:", [
-            "once", "daily", "interval"
-        ], 1, False)
-        if not ok:
-            return
-        hour, ok = QInputDialog.getInt(self, "小时", "小时(0-23):", 9, 0, 23)
-        if not ok:
-            return
-        minute, ok = QInputDialog.getInt(self, "分钟", "分钟(0-59):", 0, 0, 59)
-        if not ok:
-            return
-        t = ScheduledTask(
-            name=name, action=action,
-            freq=TaskFreq(freq),
-            hour=hour, minute=minute,
-        )
-        self._sched.add(t)
+    def _selected_name(self) -> str:
+        it = self._list.currentItem()
+        return str(it.data(Qt.ItemDataRole.UserRole)) if it is not None else ""
+
+    def _select(self, name: str) -> None:
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if str(it.data(Qt.ItemDataRole.UserRole)) == name:
+                self._list.setCurrentItem(it)
+                return
+
+    def _targets(self) -> list[tuple[int, str]]:
+        if self._pm is None:
+            return []
+        try:
+            return [(int(tp.hwnd), tp.title or tp.name or str(tp.hwnd)) for tp in self._pm.all()]
+        except Exception:  # noqa: BLE001
+            return []
+
+    # --- 操作 ---
+    def _on_manage(self) -> None:
+        from .schedule_dialog import ScheduleDialog
+
+        ScheduleDialog(self._sched, self._targets(), self).exec()
         self._refresh()
 
-    def _on_del(self) -> None:
-        it = self._list.currentItem()
-        if not it:
+    def _on_toggle(self) -> None:
+        name = self._selected_name()
+        t = self._sched.get(name) if name else None
+        if t is None:
             return
-        # 简化:按名字删
-        name = it.text().split(" ", 2)[1] if " " in it.text() else ""
-        for t in self._sched.list():
-            if t.name == name:
-                self._sched.remove(t.name)
-                break
+        self._sched.set_enabled(name, not t.enabled)
+        self._refresh()
+        self._select(name)
+
+    def _on_run(self) -> None:
+        name = self._selected_name()
+        if not name:
+            return
+        self._sched.run_now(name)
+        self._refresh()
+        self._select(name)
+
+    def _on_del(self) -> None:
+        name = self._selected_name()
+        if not name:
+            return
+        if QMessageBox.question(self, "删除", f"确认删除定时任务「{name}」?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._sched.remove(name)
         self._refresh()
 
 
@@ -1009,7 +1050,7 @@ class ActionPanel(QWidget):
         self._rec_panel = RecorderPanel()
         self._ctrl_panel = WindowControlPanel()
         self._preset_panel = PresetPanel(presets)
-        self._sched_panel = SchedulerPanel(sched)
+        self._sched_panel = SchedulerPanel(sched, pm)
         self._stats_panel = StatsPanel(stats)
 
         self._clicker_panel.set_stats(stats)

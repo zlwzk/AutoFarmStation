@@ -27,6 +27,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "start_minimized": False,
         "confirm_exit": True,
         "restore_session_ask": True,  # 启动时弹框问是否恢复上次的窗口
+        # 卡片尺寸(用户可在设置里自行调节)
+        "card_min_width": 240,
+        "card_min_height": 190,
+        # 聚焦时把游戏窗口铺满所在显示器工作区,保证整个界面完整可见
+        "focus_fit_screen": True,
         # Steam 叠加层:勾选后写 %APPDATA%\Steam\steam.cfg 关闭 Shift+Tab
         # 实际生效需要重启 Steam 客户端(配置会被 store 进程读取)
         "disable_steam_overlay": False,
@@ -55,6 +60,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "skipped_version": "",  # 用户点过「稍后」跳过的版本,不再提示
         "auto_start_windows": False,
         "log_level": "INFO",
+    },
+    # 游戏进程的启动/结束策略
+    "launch": {
+        "auto_wake_on_restore": True,  # 恢复会话时,游戏没开就自动唤醒
+        "steam_timeout_sec": 90,  # 等待 Steam 客户端起来的秒数
+        "close_games_on_exit": True,  # 关闭本软件时一并结束被追踪的游戏
+        "kill_tree": True,  # 结束进程时连同子进程(Steam 启动的游戏通常有 launcher 父进程)
+    },
+    # 音量(取值范围 0.0~1.0;-1 表示「不接管」,保持系统原样)
+    "audio": {
+        "master_volume": -1,
+        "master_mute": False,
+        "apply_master_on_start": False,  # 启动时把整体音量设成上面这个值
+        "default_session_volume": -1,  # 新加入窗口时默认设的单窗口音量
+        "apply_session_on_add": False,
+        "show_volume_on_card": True,  # 卡片上显示音量按钮
     },
     # Steam 状态联动:挂机时自动切换 Steam 在线状态,停止后还原
     "steam": {

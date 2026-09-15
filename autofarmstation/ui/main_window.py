@@ -22,7 +22,11 @@ from ..core import (
     PresetLibrary, Preset, AutomationHub, SteamStatusController,
     Session,
 )
+from ..core import audio
 from ..core import window_finder as wf
+from ..core.game_launcher import (
+    LaunchInfo, detect_launch_info, is_process_alive, kill_process, launch_async,
+)
 from ..utils import config as cfg_mod
 from ..utils.logger import get
 from ..utils.update_checker import check as check_update, UpdateInfo
@@ -31,6 +35,8 @@ from .action_panel import ActionPanel
 from .process_selector_dialog import ProcessSelectorDialog
 from .widgets import styled_message
 from .bat_library_dialog import BatLibraryDialog
+from .schedule_dialog import ScheduleDialog
+from .volume_dialog import MasterVolumeDialog, SessionVolumeDialog
 from ..core.bat_library import BatLibrary
 
 
@@ -116,8 +122,20 @@ class MainWindow(QMainWindow):
         # 调度 handlers
         self._sched.register_handler("start_all", lambda t: self._on_hotkey_start_all())
         self._sched.register_handler("stop_all", lambda t: self._on_hotkey_stop_all())
+        self._sched.register_handler("launch_games", lambda t: self._launch_games_scheduled(t))
+        self._sched.register_handler("kill_games", lambda t: self._kill_games_scheduled(t))
+        self._sched.register_handler("start_clicker", lambda t: self._clicker_scheduled(t, True))
+        self._sched.register_handler("stop_clicker", lambda t: self._clicker_scheduled(t, False))
+        self._sched.register_handler("play_macro", lambda t: self._play_macro_scheduled(t))
+        self._sched.register_handler("volume_low", lambda t: self._master_volume_set(0.2))
+        self._sched.register_handler("volume_mute", lambda t: audio.set_master_mute(True))
+        self._sched.register_handler("volume_restore", lambda t: self._master_volume_set(1.0))
+        self._sched.register_handler("shutdown_app", lambda t: self.close())
         self._sched.start()
         self._monitor.start()
+
+        # 唤醒缓存:hwnd → 启动信息(exe / Steam appid),用于「恢复进程」
+        self._launch_cache: dict[int, LaunchInfo] = {}
 
         # UI
         self.setWindowTitle(f"{__app_name_cn__} v{__version__}")
@@ -140,13 +158,31 @@ class MainWindow(QMainWindow):
         self._update_timer.start(interval_h * 3600 * 1000)
         QTimer.singleShot(3000, self._periodic_update_check)
 
+        # 启动时套用保存的整体音量(可选)
+        if self._cfg.get("audio.apply_master_on_start", False) and audio.available():
+            try:
+                mv = float(self._cfg.get("audio.master_volume", -1))
+                if mv >= 0:
+                    audio.set_master_volume(mv)
+                    audio.set_master_mute(bool(self._cfg.get("audio.master_mute", False)))
+            except (TypeError, ValueError):
+                pass
+
         # 退出时保存
         self._saved = False
 
     # --- 关闭 ---
     def closeEvent(self, ev) -> None:
+        close_games = bool(self._cfg.get("launch.close_games_on_exit", True))
+        pids = self._tracked_pids()
         if self._cfg.get("ui.confirm_exit", True):
-            r = QMessageBox.question(self, "退出", "确认退出 多开挂机大师?所有运行中的连点器/键盘宏会停止。")
+            msg = "确认退出 多开挂机大师?所有运行中的连点器/键盘宏会停止。"
+            if close_games and pids:
+                msg += (
+                    f"\n\n⚠ 按当前设置(设置 → 游戏进程),还会一并结束 "
+                    f"{len(pids)} 个被追踪的游戏进程。"
+                )
+            r = QMessageBox.question(self, "退出", msg)
             if r != QMessageBox.StandardButton.Yes:
                 ev.ignore()
                 return
@@ -167,7 +203,195 @@ class MainWindow(QMainWindow):
             window_host.release_all()
         except Exception:
             pass
+        # 关闭被追踪的游戏进程(可在设置里关掉)
+        if close_games and pids:
+            n = self._kill_pids(pids, reason="退出软件")
+            self._log.info("退出时结束了 %d/%d 个游戏进程", n, len(pids))
         super().closeEvent(ev)
+
+    # --- 进程结束 / 唤醒 ---
+    def _tracked_pids(self) -> list[int]:
+        out: list[int] = []
+        for tp in self._pm.all():
+            pid = int(getattr(tp, "pid", 0) or 0)
+            if pid and is_process_alive(pid):
+                out.append(pid)
+        return out
+
+    def _kill_pids(self, pids, *, reason: str = "") -> int:
+        tree = bool(self._cfg.get("launch.kill_tree", True))
+        n = 0
+        for pid in list(pids):
+            try:
+                ok, _msg = kill_process(int(pid), tree=tree)
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("结束进程 %s 失败: %s", pid, e)
+                continue
+            if ok:
+                n += 1
+        if reason:
+            self._log.info("已结束 %d/%d 个进程(%s)", n, len(list(pids)), reason)
+        return n
+
+    def _remember_launch(self, hwnd: int, pid: int = 0, title: str = "") -> None:
+        """记下「怎么把该窗口的游戏重新拉起来」(供恢复进程用)."""
+        if not pid:
+            info = wf.get_window_info(hwnd)
+            if info is None:
+                return
+            pid, title = int(info.pid or 0), title or info.title or ""
+        if not pid:
+            return
+        try:
+            li = detect_launch_info(pid, title=title)
+        except Exception as e:  # noqa: BLE001
+            self._log.debug("探测启动信息失败(%s): %s", pid, e)
+            return
+        if li is not None and li.usable:
+            self._launch_cache[int(hwnd)] = li
+
+    def _on_card_stop_process(self, hwnd: int) -> None:
+        """卡片「■ 停止进程」."""
+        info = wf.get_window_info(hwnd)
+        pid = int(info.pid) if info else 0
+        if not pid:
+            QMessageBox.information(self, "停止进程", "窗口已失效,拿不到进程号。")
+            return
+        title = info.title if info else str(hwnd)
+        r = QMessageBox.question(
+            self, "停止进程",
+            f"确认结束该游戏进程?\n\n{title}\nPID {pid}\n\n"
+            "未保存的游戏进度会丢失。",
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._remember_launch(hwnd, pid, title)
+        tree = bool(self._cfg.get("launch.kill_tree", True))
+        ok, msg = kill_process(pid, tree=tree)
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"[{pid}] {'已结束进程' if ok else msg}", 5000,
+        )
+        if not ok:
+            QMessageBox.warning(self, "停止进程", msg)
+
+    def _on_card_resume_process(self, hwnd: int, *, silent: bool = False) -> None:
+        """卡片「▶ 恢复进程」:游戏没开 → 自动唤醒(Steam 游戏先开 Steam)."""
+        li = self._launch_cache.get(int(hwnd))
+        if li is None or not li.usable:
+            # 退而求其次:从上次会话快照里找
+            try:
+                data = self._session.load() or {}
+                for item in (data.get("items") or []):
+                    info = Session.launch_info_of(item)
+                    if info is not None:
+                        li = info
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        if li is None or not li.usable:
+            if silent:
+                return
+            QMessageBox.information(
+                self, "恢复进程",
+                "没有该窗口的启动信息,无法自动唤醒。\n\n"
+                "下次在游戏运行时用「添加窗口」加一次,软件就会记住怎么启动它。",
+            )
+            return
+
+        timeout = float(self._cfg.get("launch.steam_timeout_sec", 90))
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"正在唤醒 {li.describe()} ..."
+            + ("(Steam 游戏,会先启动 Steam 客户端)" if li.steam_appid else ""),
+            0,
+        )
+
+        def _done(ok: bool, msg: str) -> None:
+            QTimer.singleShot(0, lambda: self._after_resume(hwnd, li, ok, msg, silent))
+
+        launch_async(li, steam_timeout=timeout, on_done=_done)
+
+    def _after_resume(
+        self, hwnd: int, li: LaunchInfo, ok: bool, msg: str, silent: bool = False,
+    ) -> None:
+        self._statusBar().showMessage(
+            f"[{hwnd}] {msg}", 6000,  # type: ignore[union-attr]
+        )
+        if not ok:
+            if not silent:
+                QMessageBox.warning(self, "唤醒失败", msg)
+            return
+        # 游戏起来后窗口 hwnd 会变,轮询等它出现再自动接回追踪列表
+        self._watch_for_launched(int(hwnd), li, 0)
+
+    def _pids_by_name(self, li: LaunchInfo) -> set[int]:
+        """按 exe 名找出所有同名的运行中进程(判断游戏是否已经起来了)."""
+        names = {str(li.name).lower()} if li.name else set()
+        if not names:
+            return set()
+        try:
+            import psutil  # type: ignore
+        except Exception:  # noqa: BLE001
+            return set()
+        pids: set[int] = set()
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if str((proc.info or {}).get("name") or "").lower() in names:
+                    pids.add(int(proc.pid))
+            except Exception:  # noqa: BLE001
+                continue
+        return pids
+
+    def _find_launched_window(self, li: LaunchInfo):
+        pids = self._pids_by_name(li)
+        if not pids:
+            return None
+        try:
+            for win in wf.list_visible_windows():
+                if win.pid in pids and __app_name_cn__ not in (win.title or ""):
+                    return win
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _watch_for_launched(self, old_hwnd: int, li: LaunchInfo, tries: int) -> None:
+        if tries >= 90:  # 最多等 ~3 分钟
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                "游戏启动较慢,窗口出现后请用「添加窗口」加回来(会自动套用原配置)", 8000,
+            )
+            return
+        win = self._find_launched_window(li)
+        if win is not None:
+            self._rebind_window(old_hwnd, win)
+            return
+        QTimer.singleShot(2000, lambda: self._watch_for_launched(old_hwnd, li, tries + 1))
+
+    def _rebind_window(self, old_hwnd: int, win) -> None:
+        """游戏重启后窗口句柄变了:把配置搬到新句柄上."""
+        try:
+            all_cfg = self._hub.export_configs() or {}
+        except Exception:  # noqa: BLE001
+            all_cfg = {}
+        old_cfg = all_cfg.get(str(int(old_hwnd))) or {}
+        try:
+            self._hub.forget(int(old_hwnd))
+            self._pm.remove(int(old_hwnd))
+        except Exception:  # noqa: BLE001
+            pass
+        tp = self._pm.add_by_hwnd(win.hwnd)
+        if tp is None:
+            return
+        if old_cfg:
+            try:
+                self._hub.import_configs({str(int(win.hwnd)): old_cfg})
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("迁移配置失败: %s", e)
+        self._launch_cache.pop(int(old_hwnd), None)
+        self._remember_launch(win.hwnd, tp.pid, tp.title)
+        self._save_state()
+        self._refresh_status()
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"已唤醒并接回:{win.title[:40]}", 6000,
+        )
 
     # --- 菜单 / 工具栏 / 主体 / 状态栏 ---
     def _build_menu(self) -> None:
@@ -213,6 +437,13 @@ class MainWindow(QMainWindow):
         a_bat.setShortcut("Ctrl+B")
         a_bat.triggered.connect(self._on_open_bat_library)
         menu_tool.addAction(a_bat)
+        a_sched = QAction("定时任务...", self)
+        a_sched.setShortcut("Ctrl+T")
+        a_sched.triggered.connect(self._on_open_schedule)
+        menu_tool.addAction(a_sched)
+        a_vol = QAction("整体音量...", self)
+        a_vol.triggered.connect(self._on_open_master_volume)
+        menu_tool.addAction(a_vol)
         menu_tool.addSeparator()
         a_steam = QAction("还原 Steam 在线状态", self)
         a_steam.triggered.connect(self._on_restore_steam)
@@ -279,6 +510,11 @@ class MainWindow(QMainWindow):
             self._pm,
             fps=float(self._cfg.get("ui.preview_fps", 1)),
             columns=int(self._cfg.get("ui.preview_columns", 0)),
+            card_size=(
+                int(self._cfg.get("ui.card_min_width", 240)),
+                int(self._cfg.get("ui.card_min_height", 190)),
+            ),
+            show_volume=bool(self._cfg.get("audio.show_volume_on_card", True)),
             hub=self._hub,
         )
         right = ActionPanel(
@@ -290,6 +526,10 @@ class MainWindow(QMainWindow):
         left.sync_start_requested.connect(right.sync_start)
         left.sync_stop_requested.connect(right.sync_stop)
         left.sync_broadcast_requested.connect(right.broadcast_current_config)
+        # 卡片上的 停止进程 / 恢复进程 / 音量
+        left.stop_process_requested.connect(self._on_card_stop_process)
+        left.resume_process_requested.connect(self._on_card_resume_process)
+        left.volume_requested.connect(self._on_card_volume)
 
         # 每张卡片的信号(卡片会随进程增删动态创建,所以在 _sync 后补连)
         def wire():
@@ -361,6 +601,9 @@ class MainWindow(QMainWindow):
                     )
                     if auto_preset:
                         self._log.info("为 %s 自动匹配预设:%s", tp.title, auto_preset.name)
+                    # 记住怎么重新启动它 + 套用「新窗口默认音量」
+                    self._remember_launch(int(tp.hwnd), int(tp.pid), tp.title)
+                    self._apply_default_session_volume(int(tp.hwnd))
             self._save_state()
             self._statusBar().showMessage(
                 f"已添加 {len(sels)} 个窗口", 3000,  # type: ignore[union-attr]
@@ -424,6 +667,158 @@ class MainWindow(QMainWindow):
             self._statusBar().showMessage(f"[{hwnd}] 连点器已启动", 2500)  # type: ignore[union-attr]
         else:
             self._statusBar().showMessage(f"[{hwnd}] 连点器启动失败", 3000)  # type: ignore[union-attr]
+
+    # --- 音量 ---
+    def _on_card_volume(self, hwnd: int) -> None:
+        """卡片「♪」:调该窗口(游戏进程)的会话音量."""
+        card = self._left.card(hwnd)
+        pid = card.pid() if card is not None else 0
+        if not pid:
+            info = wf.get_window_info(hwnd)
+            pid = int(info.pid) if info and info.pid else 0
+        if not pid:
+            QMessageBox.information(self, "窗口音量", "窗口已失效,拿不到进程号。")
+            return
+        info = wf.get_window_info(hwnd)
+        title = (info.title if info else "") or str(hwnd)
+        SessionVolumeDialog(int(pid), title, self).exec()
+
+    def _on_open_master_volume(self) -> None:
+        if not audio.available():
+            QMessageBox.information(
+                self, "整体音量",
+                "音量功能不可用:当前环境缺少 pycaw 组件。\n"
+                "源码运行请执行:pip install pycaw",
+            )
+            return
+        dlg = MasterVolumeDialog(self)
+        dlg.set_pids_provider(self._tracked_pids)
+        dlg.exec()
+
+    def _master_volume_set(self, v: float) -> None:
+        if not audio.available():
+            return
+        audio.set_master_volume(float(v))
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"整体音量已设为 {int(round(float(v) * 100))}%", 3000,
+        )
+
+    def _apply_default_session_volume(self, hwnd: int) -> None:
+        """新窗口加入时套用「新窗口默认音量」(默认关闭)."""
+        if not audio.available():
+            return
+        if not self._cfg.get("audio.apply_session_on_add", False):
+            return
+        try:
+            v = float(self._cfg.get("audio.default_session_volume", -1))
+        except (TypeError, ValueError):
+            return
+        if v < 0:
+            return
+        info = wf.get_window_info(hwnd)
+        if info is not None and info.pid:
+            if audio.set_session_volume(int(info.pid), v):
+                self._log.debug("已对 [%s] 套用默认音量 %d%%", hwnd, int(v * 100))
+
+    # --- 定时任务 ---
+    def _on_open_schedule(self) -> None:
+        targets = [
+            (int(tp.hwnd), tp.title or tp.name or str(tp.hwnd))
+            for tp in self._pm.all()
+        ]
+        ScheduleDialog(self._sched, targets, self).exec()
+
+    def _launch_games_scheduled(self, task) -> None:
+        hwnd = int(getattr(task, "target_hwnd", 0) or 0)
+        hwnds = [hwnd] if hwnd else [int(tp.hwnd) for tp in self._pm.all()]
+        n = 0
+        for h in hwnds:
+            li = self._launch_cache.get(h)
+            if li is None:
+                info = wf.get_window_info(h)
+                if info is not None:
+                    self._remember_launch(h, info.pid, info.title)
+                    li = self._launch_cache.get(h)
+            if li is None or not li.usable:
+                continue
+            if self._find_launched_window(li) is not None:
+                continue  # 已经在跑了
+            self._on_card_resume_process(h, silent=True)  # 复用唤醒流程(异步)
+            n += 1
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"定时任务:正在唤醒 {n} 个游戏", 4000,
+        )
+
+    def _kill_games_scheduled(self, task) -> None:
+        hwnd = int(getattr(task, "target_hwnd", 0) or 0)
+        if hwnd:
+            info = wf.get_window_info(hwnd)
+            pids = [int(info.pid)] if info is not None and info.pid else []
+        else:
+            pids = self._tracked_pids()
+        if not pids:
+            self._statusBar().showMessage("定时任务:没有需要结束的游戏进程", 4000)  # type: ignore[union-attr]
+            return
+        n = self._kill_pids(pids, reason="定时任务")
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"定时任务:已结束 {n}/{len(pids)} 个游戏进程", 4000,
+        )
+
+    def _clicker_scheduled(self, task, on: bool) -> None:
+        hwnd = int(getattr(task, "target_hwnd", 0) or 0)
+        if hwnd:
+            hwnds = [hwnd]
+        else:
+            hwnds = [int(h) for h in (self._left.selected_hwnds() or self._left.all_hwnds())]
+        if not hwnds:
+            self._statusBar().showMessage("定时任务:没有可操作的窗口", 4000)  # type: ignore[union-attr]
+            return
+        if on:
+            res = self._hub.start_many(hwnds, clicker=True, key_macro=False)
+            self._statusBar().showMessage(f"定时任务:{res.message}", 4000)  # type: ignore[union-attr]
+        else:
+            try:
+                res = self._hub.stop_many(hwnds)
+                msg = res.message
+            except Exception:  # noqa: BLE001
+                for h in hwnds:
+                    self._hub.stop(h)
+                msg = f"已停止 {len(hwnds)} 个窗口"
+            self._statusBar().showMessage(f"定时任务:{msg}", 4000)  # type: ignore[union-attr]
+
+    def _play_macro_scheduled(self, task) -> None:
+        hwnd = int(getattr(task, "target_hwnd", 0) or 0)
+        if not hwnd:
+            hwnds = self._left.selected_hwnds() or self._left.all_hwnds()
+            if not hwnds:
+                self._statusBar().showMessage("定时任务:没有可操作的窗口", 4000)  # type: ignore[union-attr]
+                return
+            hwnd = int(hwnds[0])
+        if self._hub.start_key_macro(hwnd):
+            self._statusBar().showMessage(f"定时任务:已启动键盘宏 [{hwnd}]", 4000)  # type: ignore[union-attr]
+        else:
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                f"定时任务:键盘宏启动失败 [{hwnd}](该窗口可能还没配置按键)", 5000,
+            )
+
+    # --- 设置变更即时生效 ---
+    def apply_settings_changes(self) -> None:
+        """设置对话框点确定后,把卡片尺寸 / 音量按钮 / 刷新率立刻应用."""
+        try:
+            self._left.set_card_size(
+                int(self._cfg.get("ui.card_min_width", 240)),
+                int(self._cfg.get("ui.card_min_height", 190)),
+            )
+            self._left.set_volume_visible(
+                bool(self._cfg.get("audio.show_volume_on_card", True))
+            )
+            if hasattr(self._left, "set_fps"):
+                self._left.set_fps(float(self._cfg.get("ui.preview_fps", 1)))  # type: ignore[attr-defined]
+            self._left.set_columns(int(self._cfg.get("ui.preview_columns", 0)))
+            self._left.refresh_cards()
+        except Exception as e:  # noqa: BLE001
+            self._log.debug("应用卡片设置失败: %s", e)
+        self._statusBar().showMessage("设置已生效", 2500)  # type: ignore[union-attr]
 
     # --- 热键 ---
     def _on_hotkey_start_all(self) -> None:
@@ -505,6 +900,13 @@ class MainWindow(QMainWindow):
 
     # --- 持久化 ---
     def _save_state(self) -> None:
+        # 刷新「怎么把游戏重新拉起来」的缓存(供退出关闭 / 下次唤醒使用)
+        for tp in self._pm.all():
+            if tp.pid and int(tp.hwnd) not in self._launch_cache:
+                try:
+                    self._remember_launch(int(tp.hwnd), int(tp.pid), tp.title)
+                except Exception:  # noqa: BLE001
+                    continue
         # 保存 tracked_processes 到 config
         self._cfg.set("tracked_processes", self._pm.export_list())
         # 保存每窗口的自动化配置(点位/按键序列),下次启动可恢复
@@ -584,6 +986,8 @@ class MainWindow(QMainWindow):
         clicked = box.clickedButton()
         if clicked is yes:
             self._do_restore_session(pairs)
+            if missed and self._cfg.get("launch.auto_wake_on_restore", True):
+                self._wake_missed(saved_items, pairs)
         elif clicked is never:
             self._cfg.set("ui.restore_session_ask", False)
             self._cfg.save()
@@ -601,6 +1005,8 @@ class MainWindow(QMainWindow):
             if tp is None:
                 continue
             added += 1
+            self._remember_launch(int(w.hwnd), int(w.pid), w.title)
+            self._apply_default_session_volume(int(w.hwnd))
             cfg = (s.get("config") or {}) if isinstance(s, dict) else {}
             if cfg:
                 new_configs[str(int(w.hwnd))] = cfg
@@ -614,6 +1020,54 @@ class MainWindow(QMainWindow):
         self._statusBar().showMessage(  # type: ignore[union-attr]
             f"已恢复 {added} 个窗口(套用上次配置)", 4000,
         )
+
+    def _wake_missed(
+        self,
+        saved_items: list[dict],
+        pairs: list[tuple[dict, wf.WindowInfo]],
+    ) -> None:
+        """上次有、现在没起来的游戏:按记录的启动信息自动唤醒.
+
+        Steam 游戏会先唤起 Steam 客户端,再走 steam://rungameid。
+        """
+        missed = Session.missed_items(saved_items, pairs)
+        if not missed:
+            return
+        infos = [
+            li for li in (Session.launch_info_of(s) for s in missed)
+            if li is not None and li.usable
+        ]
+        # 已经在跑的(可能窗口还没建好)不要重复启动
+        todo = [li for li in infos if not self._pids_by_name(li)]
+        if not todo:
+            return
+        steam_n = sum(1 for li in todo if li.steam_appid)
+        self._log.info(
+            "恢复会话:唤醒 %d 个未启动的游戏(其中 Steam 游戏 %d 个)", len(todo), steam_n,
+        )
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"正在唤醒 {len(todo)} 个未启动的游戏"
+            + (f"(其中 {steam_n} 个 Steam 游戏会先启动 Steam 客户端)" if steam_n else ""),
+            8000,
+        )
+        timeout = float(self._cfg.get("launch.steam_timeout_sec", 90))
+        for li in todo:
+            launch_async(
+                li,
+                steam_timeout=timeout,
+                on_done=lambda ok, msg, _li=li: QTimer.singleShot(
+                    0, lambda: self._after_wake(_li, ok, msg)
+                ),
+            )
+
+    def _after_wake(self, li: LaunchInfo, ok: bool, msg: str) -> None:
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"[{li.describe()}] {msg}", 6000,
+        )
+        if ok:
+            self._log.info("已唤醒 %s:%s", li.describe(), msg)
+        else:
+            self._log.warning("唤醒 %s 失败:%s", li.describe(), msg)
 
     # --- Steam 状态 ---
     def _on_restore_steam(self) -> None:
