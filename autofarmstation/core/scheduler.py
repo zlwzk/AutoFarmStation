@@ -5,7 +5,10 @@
 - ``once``     一次性,指定日期时间(``run_at``),跑完自动禁用
 - ``interval`` 每隔 N 秒/分钟/小时
 - ``daily``    每天 HH:MM
-- ``weekly``   每周几的 HH:MM
+- ``weekly``   每周几的 HH:MM(``weekdays`` 可多选,例如周一三五)
+
+每个任务还可以设 ``delay_sec``(延时执行):到点后再等 N 秒才真正动手。
+配合两条任务就能串出流程,比如「22:00 启动全部 → 22:00:30 开始连点」。
 
 任务列表持久化到 ``%APPDATA%\\AutoFarmStation\\schedules.json``,
 关掉软件再打开依然在。
@@ -45,9 +48,9 @@ ACTION_LABELS: dict[str, str] = {
     "start_clicker": "开始连点(默认全部勾选窗口)",
     "stop_clicker": "停止连点",
     "play_macro": "启动键盘宏(指定窗口)",
-    "volume_low": "音量降到 20%",
-    "volume_mute": "静音整体音量",
-    "volume_restore": "音量恢复到 100%",
+    "volume_low": "音量降到 20%(仅已加入窗口)",
+    "volume_mute": "静音(仅已加入窗口,不动系统音量)",
+    "volume_restore": "还原音量(回到静音前的值)",
     "shutdown_app": "退出本软件",
 }
 
@@ -66,7 +69,9 @@ class ScheduledTask:
     interval_sec: int = 3600  # INTERVAL 模式
     hour: int = 9  # DAILY/WEEKLY 模式
     minute: int = 0
-    weekday: int = -1  # 0=周一..6=周日;-1=不限(WEEKLY)
+    weekday: int = -1  # 0=周一..6=周日;-1=不限(老字段,单选用)
+    weekdays: list[int] = field(default_factory=list)  # 多选;空 = 用 weekday
+    delay_sec: int = 0  # 到点后再等 N 秒才执行(串流程用)
     action: str = "start_all"
     target_hwnd: int = 0  # 0 = 全部
     macro_name: str = ""  # play_macro 用
@@ -86,6 +91,8 @@ class ScheduledTask:
             "hour": int(self.hour),
             "minute": int(self.minute),
             "weekday": int(self.weekday),
+            "weekdays": [int(x) for x in self.weekdays],
+            "delay_sec": int(self.delay_sec),
             "action": self.action,
             "target_hwnd": int(self.target_hwnd),
             "macro_name": self.macro_name,
@@ -103,6 +110,16 @@ class ScheduledTask:
             freq = TaskFreq(str(d.get("freq") or "once"))
         except ValueError:
             freq = TaskFreq.ONCE
+        raw_days = d.get("weekdays")
+        days: list[int] = []
+        if isinstance(raw_days, list):
+            for x in raw_days:
+                try:
+                    v = int(x)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= v <= 6 and v not in days:
+                    days.append(v)
         return cls(
             name=str(d.get("name") or ""),
             freq=freq,
@@ -111,6 +128,8 @@ class ScheduledTask:
             hour=int(d.get("hour") or 0),
             minute=int(d.get("minute") or 0),
             weekday=int(d.get("weekday") if d.get("weekday") is not None else -1),
+            weekdays=days,
+            delay_sec=max(0, int(d.get("delay_sec") or 0)),
             action=str(d.get("action") or ""),
             target_hwnd=int(d.get("target_hwnd") or 0),
             macro_name=str(d.get("macro_name") or ""),
@@ -122,19 +141,41 @@ class ScheduledTask:
         )
 
     # --- 展示 ---
+    def weekdays_text(self) -> str:
+        """周几的显示文案(多选时用「周一/周三/周五」)."""
+        days = self.effective_weekdays()
+        if not days:
+            return ""
+        if len(days) == 7:
+            return "每天"
+        return "/".join(WEEKDAY_NAMES[d] for d in sorted(days))
+
+    def effective_weekdays(self) -> list[int]:
+        """实际生效的星期集合(多选优先,否则退回单选的 weekday)."""
+        if self.weekdays:
+            return sorted({d for d in self.weekdays if 0 <= d <= 6})
+        if 0 <= self.weekday <= 6:
+            return [self.weekday]
+        return []
+
     def schedule_text(self) -> str:
         if self.freq is TaskFreq.ONCE:
             raw = self.run_at or ""
             if "T" in raw:
                 d, t = raw.split("T", 1)
-                return f"一次性 {d} {t[:5]}"
-            return f"一次性 {raw}"
-        if self.freq is TaskFreq.INTERVAL:
-            return f"每 {format_interval(self.interval_sec)}"
-        wd = WEEKDAY_NAMES[self.weekday] if 0 <= self.weekday <= 6 else ""
-        if self.freq is TaskFreq.WEEKLY:
-            return f"{wd or '每周'} {self.hour:02d}:{self.minute:02d}"
-        return f"每天 {self.hour:02d}:{self.minute:02d}"
+                txt = f"一次性 {d} {t[:5]}"
+            else:
+                txt = f"一次性 {raw}"
+        elif self.freq is TaskFreq.INTERVAL:
+            txt = f"每 {format_interval(self.interval_sec)}"
+        elif self.freq is TaskFreq.WEEKLY:
+            wd = self.weekdays_text() or "每周"
+            txt = f"{wd} {self.hour:02d}:{self.minute:02d}"
+        else:
+            txt = f"每天 {self.hour:02d}:{self.minute:02d}"
+        if int(self.delay_sec) > 0:
+            txt += f"(延时 {format_interval(self.delay_sec)})"
+        return txt
 
 
 def format_interval(sec: int) -> str:
@@ -311,14 +352,15 @@ class Scheduler:
         if task.freq is TaskFreq.DAILY:
             return _next_daily(now, 0, task.hour, task.minute)
         if task.freq is TaskFreq.WEEKLY:
-            base = _next_daily(now, 0, task.hour, task.minute)
-            if not (0 <= task.weekday <= 6):
-                return base
-            cur = _dt.datetime.fromtimestamp(base)
-            delta = (task.weekday - cur.weekday()) % 7
-            if delta == 0 and cur.weekday() != task.weekday:
-                delta = 7
-            return base + delta * 86400
+            days = task.effective_weekdays()
+            if not days:
+                return _next_daily(now, 0, task.hour, task.minute)
+            best = 0.0
+            for d in days:
+                cand = _next_weekly(now, d, task.hour, task.minute)
+                if cand and (best == 0.0 or cand < best):
+                    best = cand
+            return best
         return 0.0
 
     def next_run_text(self, task: ScheduledTask) -> str:
@@ -353,7 +395,18 @@ class Scheduler:
                     dirty = True
                     continue
                 if now >= t.next_run:
-                    self._invoke(t)
+                    if int(t.delay_sec) > 0:
+                        # 延时执行:到点后再等 delay_sec 秒才真正动手。
+                        # 用两条任务就能串出流程,例如
+                        # 「22:00 启动全部」+「22:00 延时 30s 开始连点」。
+                        self._log.info("定时任务延时 %d 秒执行: %s",
+                                       int(t.delay_sec), sanitize(t.name))
+                        timer = threading.Timer(
+                            float(t.delay_sec), self._invoke_safe, args=(t,))
+                        timer.daemon = True
+                        timer.start()
+                    else:
+                        self._invoke(t)
                     if t.freq is TaskFreq.ONCE:
                         t.enabled = False
                         t.next_run = 0.0
@@ -363,6 +416,13 @@ class Scheduler:
             if dirty and self._autosave:
                 self.save()
             self._stop.wait(timeout=1.0)
+
+    def _invoke_safe(self, t: ScheduledTask) -> None:
+        """延时线程的入口:自己吞掉异常,免得线程把堆栈打到控制台."""
+        try:
+            self._invoke(t)
+        except Exception as e:  # noqa: BLE001
+            self._log.exception("延时任务执行失败(%s): %s", sanitize(t.name), e)
 
     def _invoke(self, t: ScheduledTask) -> None:
         cb = self._handlers.get(t.action)
@@ -389,6 +449,20 @@ def _parse_run_at(raw: str) -> float | None:
         except ValueError:
             continue
     return None
+
+
+def _next_weekly(now: float, weekday: int, hour: int, minute: int) -> float:
+    """下一个「周 weekday 的 HH:MM」的时间戳(weekday: 0=周一)."""
+    target = _dt.datetime.fromtimestamp(now).replace(
+        hour=max(0, min(23, int(hour))),
+        minute=max(0, min(59, int(minute))),
+        second=0,
+        microsecond=0,
+    )
+    target += _dt.timedelta(days=(int(weekday) - target.weekday()) % 7)
+    if target.timestamp() <= now:
+        target += _dt.timedelta(days=7)
+    return target.timestamp()
 
 
 def _next_daily(now: float, day_offset: int, hour: int, minute: int) -> float:

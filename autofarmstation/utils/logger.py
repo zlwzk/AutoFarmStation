@@ -62,7 +62,7 @@ def setup(level: int = logging.INFO) -> logging.Logger:
     logger.addHandler(sh)
 
     # 文件(自动轮转)
-    log_path: Path = user_log_dir() / _LOG_FILE
+    log_path: Path = log_file_path()
     try:
         fh = logging.handlers.RotatingFileHandler(
             log_path,
@@ -86,3 +86,8 @@ def get() -> logging.Logger:
     if not _INITIALIZED:
         setup()
     return logging.getLogger(_LOGGER_NAME)
+
+
+def log_file_path() -> Path:
+    """当前日志文件路径(界面里查看日志 / 打开目录用)."""
+    return user_log_dir() / _LOG_FILE

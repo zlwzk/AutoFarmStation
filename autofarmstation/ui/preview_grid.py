@@ -45,6 +45,7 @@ class PreviewGrid(QWidget):
         columns: int = 0,  # 0=自适应
         card_size: tuple[int, int] = (240, 190),
         show_volume: bool = True,
+        show_resource: bool = True,
         hub: AutomationHub | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -55,6 +56,7 @@ class PreviewGrid(QWidget):
         self._columns = columns
         self._card_size = (int(card_size[0]), int(card_size[1]))
         self._show_volume = bool(show_volume)
+        self._show_resource = bool(show_resource)
         self._items: dict[int, PreviewWidget] = {}
 
         outer = QVBoxLayout(self)
@@ -170,6 +172,12 @@ class PreviewGrid(QWidget):
         for w in self._items.values():
             w.set_volume_button_visible(self._show_volume)
 
+    def set_resource_visible(self, on: bool) -> None:
+        """设置面板里「在卡片上显示 CPU / 内存」改动后调用."""
+        self._show_resource = bool(on)
+        for w in self._items.values():
+            w.set_resource_visible(self._show_resource)
+
     def refresh_cards(self) -> None:
         """设置改动后让所有卡片立刻按新配置刷新."""
         for w in self._items.values():
@@ -219,12 +227,40 @@ class PreviewGrid(QWidget):
             b.setEnabled(has)
 
     def _refresh_statuses(self) -> None:
-        if self._hub is None:
-            return
+        cpu_t, mem_t = self._resource_thresholds()
         for h, w in self._items.items():
-            txt = self._hub.status_text(h)
-            w.set_status_extra(txt)
-            w.set_autoclicker_state(self._hub.is_clicker_running(h))
+            if self._hub is not None:
+                w.set_status_extra(self._hub.status_text(h))
+                w.set_autoclicker_state(self._hub.is_clicker_running(h))
+            item = self._pm.get(h)
+            if item is None or not item.alive:
+                w.set_resource_text("")
+                continue
+            hot = ((cpu_t > 0 and item.cpu >= cpu_t)
+                   or (mem_t > 0 and item.mem_mb >= mem_t))
+            w.set_resource_text(self._fmt_resource(item), hot)
+
+    @staticmethod
+    def _fmt_resource(item: TrackedProcess) -> str:
+        mem = float(item.mem_mb or 0.0)
+        mem_txt = f"{mem / 1024:.1f}G" if mem >= 1024 else f"{mem:.0f}M"
+        return f"{float(item.cpu or 0.0):.0f}% · {mem_txt}"
+
+    @staticmethod
+    def _resource_thresholds() -> tuple[float, float]:
+        """读告警阈值;功能关掉时返回 (0, 0) 表示「只显示不标红」."""
+        try:
+            from ..utils.config import instance as _cfg_instance
+
+            cfg = _cfg_instance()
+            if not cfg.get("monitor.resource_alert_enabled", True):
+                return (0.0, 0.0)
+            return (
+                float(cfg.get("monitor.cpu_alert_pct", 90)),
+                float(cfg.get("monitor.mem_alert_mb", 4096)),
+            )
+        except Exception:  # noqa: BLE001
+            return (0.0, 0.0)
 
     def _sync(self) -> None:
         items = self._pm.all()
@@ -247,12 +283,17 @@ class PreviewGrid(QWidget):
                     phase=idx * 0.13,
                     card_size=self._card_size,
                     show_volume=self._show_volume,
+                    show_resource=self._show_resource,
+                    pm=self._pm,
                 )
                 w.selection_changed.connect(self._on_card_selection_changed)
                 w.stop_process.connect(self.stop_process_requested.emit)
                 w.resume_process.connect(self.resume_process_requested.emit)
                 w.volume_requested.connect(self.volume_requested.emit)
                 self._items[it.hwnd] = w
+            else:
+                # 已存在的卡片:别名 / 强调色可能在别处改过,顺手刷新
+                self._items[it.hwnd].refresh_alias()
         # 空提示
         self._empty_label.setVisible(not self._items)
         self._relayout()

@@ -164,14 +164,10 @@ class ClickerPanel(QWidget):
     # --- 配置构建(供单窗口 / 同步两用) ---
     def build_config(self) -> AutoClickerConfig | None:
         """从界面读取当前配置;无有效点位时返回 None."""
-        pts: list[ClickPoint] = []
-        for i in range(self._points_list.count()):
-            item = self._points_list.item(i)
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(data, ClickPoint):
-                pts.append(data)
+        pts = self._points()
         if not pts:
             return None
+        cw, ch = wf.client_size(self._target_hwnd) if self._target_hwnd else (0, 0)
         return AutoClickerConfig(
             hwnd=self._target_hwnd,
             points=pts,
@@ -180,6 +176,8 @@ class ClickerPanel(QWidget):
             total_clicks=int(self._total.value()),
             loop=self._loop.isChecked(),
             mode="send" if self._mode.currentIndex() == 1 else "post",
+            client_w=int(cw) if cw > 0 else 0,
+            client_h=int(ch) if ch > 0 else 0,
         )
 
     # --- 启停 ---
@@ -278,6 +276,11 @@ class ClickerPanel(QWidget):
         dlg = CapturePointDialog(self._target_hwnd, self)
         if dlg.exec() and dlg.captured:
             cp = ClickPoint(x=dlg.captured[0], y=dlg.captured[1], button=MouseButton.LEFT)
+            cw, ch = wf.client_size(self._target_hwnd)
+            if not cp.set_ratio(cw, ch):
+                self._status.setText(styled_message(
+                    "读不到窗口客户区尺寸,该点位只能按像素记录"
+                    "(窗口缩放后可能打偏)", level="warn"))
             self._add_point(cp)
 
     def _on_add_center(self) -> None:
@@ -286,7 +289,45 @@ class ClickerPanel(QWidget):
             return
         cw, ch = wf.client_size(self._target_hwnd)
         if cw > 0 and ch > 0:
-            self._add_point(ClickPoint(x=cw // 2, y=ch // 2))
+            cp = ClickPoint(x=cw // 2, y=ch // 2)
+            cp.set_ratio(cw, ch)
+            self._add_point(cp)
+
+    def _points(self) -> list[ClickPoint]:
+        out: list[ClickPoint] = []
+        for i in range(self._points_list.count()):
+            data = self._points_list.item(i).data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, ClickPoint):
+                out.append(data)
+        return out
+
+    def _on_rebase_points(self) -> None:
+        """把「当前窗口尺寸下的像素坐标」记成比例坐标.
+
+        老版本存下的点位只有像素(没有比例),窗口一被聚焦铺满就会打偏。
+        操作方式:先把窗口摆成当初选点时的样子(尺寸一致),再点这个按钮,
+        之后窗口再怎么缩放都能打中同一个位置。
+        """
+        if not self._target_hwnd:
+            QMessageBox.warning(self, "重算比例", "请先选择目标窗口。")
+            return
+        pts = self._points()
+        if not pts:
+            QMessageBox.information(self, "重算比例", "还没有点位。")
+            return
+        cw, ch = wf.client_size(self._target_hwnd)
+        if cw <= 0 or ch <= 0:
+            QMessageBox.warning(self, "重算比例", "读不到窗口客户区尺寸,无法计算。")
+            return
+        for p in pts:
+            p.set_ratio(cw, ch)
+        self._reload_points()
+        QMessageBox.information(
+            self, "重算比例",
+            f"已按当前窗口客户区 {cw} × {ch} 重算 {len(pts)} 个点位的比例坐标。\n\n"
+            "以后窗口被聚焦铺满、手动缩放、甚至挪到别的显示器,"
+            "都会按比例换算成新的像素位置,不会再打偏。",
+        )
 
     def _on_del_point(self) -> None:
         for it in self._points_list.selectedItems():
@@ -295,8 +336,21 @@ class ClickerPanel(QWidget):
     def _on_clear_points(self) -> None:
         self._points_list.clear()
 
+    def _reload_points(self) -> None:
+        pts = self._points()
+        self._points_list.clear()
+        for cp in pts:
+            self._add_point(cp)
+
     def _add_point(self, cp: ClickPoint) -> None:
-        item = QListWidgetItem(f"({cp.x}, {cp.y}) · {cp.button.value}{' · 双击' if cp.double else ''}")
+        btn = "左键" if cp.button == MouseButton.LEFT else cp.button.value
+        item = QListWidgetItem(
+            f"({cp.x}, {cp.y}) · {btn}{' · 双击' if cp.double else ''} · {cp.space_text()}"
+        )
+        if not cp.has_ratio():
+            item.setToolTip("没有比例信息:窗口尺寸一变就可能打偏,可用「重算比例」修复")
+        else:
+            item.setToolTip("已记比例坐标:窗口缩放 / 铺满后依然打中同一位置")
         item.setData(Qt.ItemDataRole.UserRole, cp)
         self._points_list.addItem(item)
 
@@ -640,8 +694,17 @@ class RecorderPanel(QWidget):
             self._btn_rec.setStyleSheet("")
             if script:
                 self._script = script
+                # 记下录制时目标窗口的客户区尺寸:回放时按「当前尺寸/基准尺寸」
+                # 等比缩放,这样窗口被聚焦铺满或手动缩放后宏依然打在同一个位置。
+                if self._target_hwnd:
+                    cw, ch = wf.client_size(self._target_hwnd)
+                    if cw > 0 and ch > 0:
+                        script.base_w, script.base_h = int(cw), int(ch)
+                base_txt = (f" · 基准 {script.base_w}×{script.base_h}"
+                            if script.base_w and script.base_h else " · 无基准尺寸")
                 self._rec_status.setText(
-                    f"已录制: {script.name} · {len(script.events)} 事件 · {script.duration_ms}ms"
+                    f"已录制: {script.name} · {len(script.events)} 事件 · "
+                    f"{script.duration_ms}ms{base_txt}"
                 )
                 self._events_list.clear()
                 for e in script.events[:200]:

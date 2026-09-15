@@ -52,6 +52,11 @@ class MacroScript:
     duration_ms: int = 0
     events: list[MacroEvent] = field(default_factory=list)
     loop: bool = False
+    # 录制时目标窗口的客户区尺寸。回放时按「当前尺寸 / 基准尺寸」等比缩放
+    # 鼠标偏移量,这样窗口被聚焦铺满或手动缩放后,宏依然打在同一个位置。
+    # 0 表示没有基准(按原样播放,和旧版本行为一致)。
+    base_w: int = 0
+    base_h: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -67,6 +72,8 @@ class MacroScript:
             duration_ms=d.get("duration_ms", 0),
             events=evs,
             loop=d.get("loop", False),
+            base_w=int(d.get("base_w", 0) or 0),
+            base_h=int(d.get("base_h", 0) or 0),
         )
 
 
@@ -315,6 +322,7 @@ class MacroPlayer:
     def _run(self) -> None:
         from . import window_finder as wf
         # 录制时的初始屏幕位置 → 当前 hwnd 客户区偏移
+        sx, sy = 1.0, 1.0
         if self.target_mode == "window":
             base_event = next(
                 (e for e in self.script.events
@@ -324,8 +332,23 @@ class MacroPlayer:
             ox, oy = wf.client_origin(self.hwnd) if self.hwnd else (0, 0)
             base_x, base_y = (base_event.x, base_event.y) if base_event else (0, 0)
             dx, dy = ox - base_x, oy - base_y
+            # 录的时候窗口是多大,现在又是多大 —— 等比缩放偏移量,
+            # 否则窗口一被聚焦铺满,宏就整体打偏。
+            bw, bh = int(self.script.base_w or 0), int(self.script.base_h or 0)
+            if bw > 0 and bh > 0 and self.hwnd:
+                cw, ch = wf.client_size(self.hwnd)
+                if cw > 0 and ch > 0:
+                    sx, sy = cw / float(bw), ch / float(bh)
         else:
             dx, dy = 0, 0
+            base_x = base_y = 0
+
+        def _map(ex: int, ey: int) -> tuple[int, int]:
+            """把录制坐标映射到当前窗口的客户区."""
+            if self.target_mode == "window":
+                return (int(round(dx + (ex - base_x) * sx)),
+                        int(round(dy + (ey - base_y) * sy)))
+            return (ex, ey)
 
         try:
             while not self._stop.is_set():
@@ -343,11 +366,13 @@ class MacroPlayer:
                     self._sleep_until(when)
                     try:
                         if ev.type == MacroEventType.MOUSE_MOVE.value:
-                            self._sender.move((self.hwnd, ev.x + dx, ev.y + dy))
+                            mx, my = _map(ev.x, ev.y)
+                            self._sender.move((self.hwnd, mx, my))
                         elif ev.type == MacroEventType.MOUSE_CLICK.value:
                             from .input_sender import MouseButton
                             btn = MouseButton(ev.button or "left")
-                            self._sender.click((self.hwnd, ev.x + dx, ev.y + dy), btn)
+                            mx, my = _map(ev.x, ev.y)
+                            self._sender.click((self.hwnd, mx, my), btn)
                         elif ev.type == MacroEventType.MOUSE_SCROLL.value:
                             self._sender.scroll(ev.scroll, hwnd=self.hwnd)
                         elif ev.type == MacroEventType.KEY_DOWN.value:

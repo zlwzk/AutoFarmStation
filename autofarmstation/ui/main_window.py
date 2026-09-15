@@ -36,7 +36,7 @@ from .process_selector_dialog import ProcessSelectorDialog
 from .widgets import styled_message
 from .bat_library_dialog import BatLibraryDialog
 from .schedule_dialog import ScheduleDialog
-from .volume_dialog import MasterVolumeDialog, SessionVolumeDialog
+from .volume_dialog import GroupVolumeDialog, SessionVolumeDialog
 from ..core.bat_library import BatLibrary
 
 
@@ -104,7 +104,18 @@ class MainWindow(QMainWindow):
         self._stats.on_session_start()
         self._presets = PresetLibrary(logger=self._log)
         self._sched = Scheduler(logger=self._log)
-        self._monitor = ProcessMonitor(self._pm, logger=self._log)
+        self._monitor = ProcessMonitor(
+            self._pm,
+            logger=self._log,
+            resource_alert=bool(self._cfg.get("monitor.resource_alert_enabled", True)),
+            cpu_alert_pct=float(self._cfg.get("monitor.cpu_alert_pct", 90)),
+            mem_alert_mb=float(self._cfg.get("monitor.mem_alert_mb", 4096)),
+        )
+        # 监控事件(掉线/占用超阈值)必须有监听者才有意义 ——
+        # 这里挂上去,顺便让「自动重启」真正生效。
+        self._monitor.on_event(self._on_monitor_event)
+        # 自动重启节流:hwnd → 最近几次重启的时间戳
+        self._restart_hist: dict[int, list[float]] = {}
         self._bat_lib = BatLibrary()
         # 多窗口自动化中枢:每窗口独立配置 + 多窗口同步执行
         self._hub = AutomationHub(stats=self._stats, logger=self._log)
@@ -127,15 +138,20 @@ class MainWindow(QMainWindow):
         self._sched.register_handler("start_clicker", lambda t: self._clicker_scheduled(t, True))
         self._sched.register_handler("stop_clicker", lambda t: self._clicker_scheduled(t, False))
         self._sched.register_handler("play_macro", lambda t: self._play_macro_scheduled(t))
-        self._sched.register_handler("volume_low", lambda t: self._master_volume_set(0.2))
-        self._sched.register_handler("volume_mute", lambda t: audio.set_master_mute(True))
-        self._sched.register_handler("volume_restore", lambda t: self._master_volume_set(1.0))
+        # 音量动作只作用于「已加入本软件的窗口」,绝不碰系统总音量 ——
+        # 定时「静音」不该顺手把用户的 QQ / 视频也静掉。
+        self._sched.register_handler("volume_low", lambda t: self._group_volume_set(0.2))
+        self._sched.register_handler("volume_mute", lambda t: self._group_mute_set(True))
+        self._sched.register_handler("volume_restore", lambda t: self._group_volume_restore())
         self._sched.register_handler("shutdown_app", lambda t: self.close())
         self._sched.start()
         self._monitor.start()
 
         # 唤醒缓存:hwnd → 启动信息(exe / Steam appid),用于「恢复进程」
         self._launch_cache: dict[int, LaunchInfo] = {}
+        # 音量快照:pid → (音量, 静音)。定时任务「静音/降音量」前先记一份,
+        # 「恢复音量」时还原成各自操作前的值,而不是一刀切 100%。
+        self._volume_backup: dict[int, tuple[float, bool]] = {}
 
         # UI
         self.setWindowTitle(f"{__app_name_cn__} v{__version__}")
@@ -158,15 +174,28 @@ class MainWindow(QMainWindow):
         self._update_timer.start(interval_h * 3600 * 1000)
         QTimer.singleShot(3000, self._periodic_update_check)
 
-        # 启动时套用保存的整体音量(可选)
-        if self._cfg.get("audio.apply_master_on_start", False) and audio.available():
-            try:
-                mv = float(self._cfg.get("audio.master_volume", -1))
-                if mv >= 0:
-                    audio.set_master_volume(mv)
-                    audio.set_master_mute(bool(self._cfg.get("audio.master_mute", False)))
-            except (TypeError, ValueError):
-                pass
+        # 启动时套用保存的音量设置(可选)
+        if audio.available():
+            # 1) 已加入窗口的音量 —— 安全,默认就对
+            if self._cfg.get("audio.apply_group_on_start", False):
+                try:
+                    gv = float(self._cfg.get("audio.group_volume", -1))
+                except (TypeError, ValueError):
+                    gv = -1.0
+                pids = self._tracked_pids()
+                if gv >= 0 and pids:
+                    n = audio.set_volume_for_pids(pids, gv)
+                    audio.set_mute_for_pids(pids, bool(self._cfg.get("audio.group_mute", False)))
+                    self._log.info("启动套用窗口音量 %d%%:%d/%d 个", int(gv * 100), n, len(pids))
+            # 2) 系统总音量 —— 必须显式打开才动,免得影响其它程序
+            if self._cfg.get("audio.control_system_master", False):
+                try:
+                    mv = float(self._cfg.get("audio.system_master_volume", -1))
+                    if mv >= 0:
+                        audio.set_master_volume(mv)
+                    audio.set_master_mute(bool(self._cfg.get("audio.system_master_mute", False)))
+                except (TypeError, ValueError):
+                    pass
 
         # 退出时保存
         self._saved = False
@@ -372,14 +401,22 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             all_cfg = {}
         old_cfg = all_cfg.get(str(int(old_hwnd))) or {}
+        # 别名 / 强调色也跟着搬过去,不然自动重启后辛苦起的名就没了
+        old_item = self._pm.get(int(old_hwnd))
+        old_alias = (old_item.alias if old_item else "") or ""
+        old_color = (old_item.color if old_item else "") or ""
+        old_kinds = self._running_kinds(int(old_hwnd))
         try:
             self._hub.forget(int(old_hwnd))
             self._pm.remove(int(old_hwnd))
         except Exception:  # noqa: BLE001
             pass
+        self._restart_hist.pop(int(old_hwnd), None)
         tp = self._pm.add_by_hwnd(win.hwnd)
         if tp is None:
             return
+        if old_alias or old_color:
+            self._pm.set_alias(int(win.hwnd), old_alias, old_color)
         if old_cfg:
             try:
                 self._hub.import_configs({str(int(win.hwnd)): old_cfg})
@@ -387,11 +424,114 @@ class MainWindow(QMainWindow):
                 self._log.warning("迁移配置失败: %s", e)
         self._launch_cache.pop(int(old_hwnd), None)
         self._remember_launch(win.hwnd, tp.pid, tp.title)
+        # 掉线前正在跑的连点器 / 键盘宏接着跑,不用手动再开一遍
+        restarted = self._restore_running_kinds(int(win.hwnd), old_kinds)
         self._save_state()
         self._refresh_status()
+        note = f"(已自动接回{'、'.join(restarted)})" if restarted else ""
         self._statusBar().showMessage(  # type: ignore[union-attr]
-            f"已唤醒并接回:{win.title[:40]}", 6000,
+            f"已唤醒并接回:{win.title[:40]}{note}", 6000,
         )
+        self._notify(f"已自动接回游戏窗口:{win.title[:40]}")
+
+    # --- 监控事件 ---
+    def _running_kinds(self, hwnd: int) -> tuple[bool, bool]:
+        """该窗口此刻是否在跑 (连点器, 键盘宏)."""
+        try:
+            return (
+                bool(self._hub.is_clicker_running(int(hwnd))),
+                bool(self._hub.is_key_macro_running(int(hwnd))),
+            )
+        except Exception:  # noqa: BLE001
+            return (False, False)
+
+    def _restore_running_kinds(self, hwnd: int, kinds: tuple[bool, bool]) -> list[str]:
+        """把之前在这个窗口上跑着的自动化重新拉起来,返回恢复了的名字."""
+        clicker, key_macro = kinds
+        done: list[str] = []
+        if clicker:
+            try:
+                self._hub.start_clicker(int(hwnd))
+                done.append("连点")
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("自动恢复连点失败: %s", e)
+                done.append("连点失败")
+        if key_macro:
+            try:
+                self._hub.start_key_macro(int(hwnd))
+                done.append("键盘宏")
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("自动恢复键盘宏失败: %s", e)
+                done.append("键盘宏失败")
+        return done
+
+    def _on_monitor_event(self, ev: MonitorEvent) -> None:
+        """监控线程发来的事件(可能在非 UI 线程,统一切回主线程处理)."""
+        try:
+            QTimer.singleShot(0, lambda: self._handle_monitor_event(ev))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handle_monitor_event(self, ev: MonitorEvent) -> None:
+        item = self._pm.get(int(ev.hwnd))
+        who = item.display_name() if item is not None else f"PID {ev.pid}"
+
+        if ev.status is MonitorStatus.RESOURCE:
+            self._statusBar().showMessage(f"⚠ {ev.message}", 8000)  # type: ignore[union-attr]
+            self._notify(ev.message)
+            self._log.warning("%s", ev.message)
+            return
+
+        if ev.status is MonitorStatus.MISSING:
+            self._log.info("窗口失效:%s(%s)", who, ev.message)
+            if self._cfg.get("launch.auto_restart", False):
+                self._maybe_auto_restart(int(ev.hwnd), who)
+            else:
+                self._statusBar().showMessage(  # type: ignore[union-attr]
+                    f"{who} 已退出(设置 → 游戏进程里可开启自动重启)", 6000,
+                )
+            return
+
+        if ev.status is MonitorStatus.ERROR:
+            self._log.warning("监控异常 %s:%s", who, ev.message)
+            self._statusBar().showMessage(f"⚠ {ev.message}", 6000)  # type: ignore[union-attr]
+            return
+
+        if ev.status is MonitorStatus.MINIMIZED:
+            self._log.debug("%s 被最小化:%s", who, ev.message)
+            return
+
+        self._log.debug("监控事件 %s:%s(%s)", ev.status, who, ev.message)
+
+    def _maybe_auto_restart(self, hwnd: int, who: str) -> None:
+        """窗口掉了 → 按记下的启动信息自动拉起来(有次数上限,防死循环)."""
+        limit = max(1, int(self._cfg.get("launch.auto_restart_max", 3)))
+        window = max(60.0, float(self._cfg.get("launch.auto_restart_window_sec", 600)))
+        now = time.time()
+        hist = [t for t in self._restart_hist.get(hwnd, []) if now - t < window]
+        if len(hist) >= limit:
+            self._log.warning("%s 在 %d 秒内已自动重启 %d 次,放弃", who, int(window), len(hist))
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                f"{who} 频繁掉线,已自动重启 {len(hist)} 次,停止重试(请看日志排查)", 10000,
+            )
+            self._notify(f"{who} 频繁掉线,已停止自动重启")
+            return
+        li = self._launch_cache.get(int(hwnd))
+        if li is None or not li.usable:
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                f"{who} 已退出,但没有它的启动信息,无法自动重启", 6000,
+            )
+            return
+        hist.append(now)
+        self._restart_hist[hwnd] = hist
+        self._log.info("自动重启 %s(第 %d/%d 次):%s", who, len(hist), limit, li.describe())
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"{who} 掉线,正在自动重启(第 {len(hist)}/{limit} 次)"
+            + ("(Steam 游戏会先启动 Steam)" if li.steam_appid else ""),
+            8000,
+        )
+        self._notify(f"{who} 掉线,正在自动重启")
+        self._on_card_resume_process(int(hwnd), silent=True)
 
     # --- 菜单 / 工具栏 / 主体 / 状态栏 ---
     def _build_menu(self) -> None:
@@ -441,8 +581,9 @@ class MainWindow(QMainWindow):
         a_sched.setShortcut("Ctrl+T")
         a_sched.triggered.connect(self._on_open_schedule)
         menu_tool.addAction(a_sched)
-        a_vol = QAction("整体音量...", self)
-        a_vol.triggered.connect(self._on_open_master_volume)
+        a_vol = QAction("全部窗口音量...", self)
+        a_vol.setToolTip("只调已加入本软件的窗口,不影响其它程序")
+        a_vol.triggered.connect(self._on_open_group_volume)
         menu_tool.addAction(a_vol)
         menu_tool.addSeparator()
         a_steam = QAction("还原 Steam 在线状态", self)
@@ -451,12 +592,21 @@ class MainWindow(QMainWindow):
         a_update = QAction("检查更新", self)
         a_update.triggered.connect(lambda: self._do_update_check(show_dialog=True))
         menu_tool.addAction(a_update)
-        a_log = QAction("打开日志目录", self)
-        a_log.triggered.connect(self._on_open_log_dir)
+        a_log = QAction("查看日志...", self)
+        a_log.setToolTip("在界面里直接看日志,可过滤 / 复制 / 导出")
+        a_log.triggered.connect(self._on_view_log)
         menu_tool.addAction(a_log)
-        a_log_file = QAction("查看日志文件", self)
-        a_log_file.triggered.connect(self._on_open_log_file)
-        menu_tool.addAction(a_log_file)
+        a_log_dir = QAction("打开日志目录", self)
+        a_log_dir.triggered.connect(self._on_open_log_dir)
+        menu_tool.addAction(a_log_dir)
+        menu_tool.addSeparator()
+        a_backup = QAction("导出配置备份...", self)
+        a_backup.setToolTip("设置 / 窗口列表 / 预设 / 宏 / 定时任务打包成 zip")
+        a_backup.triggered.connect(self._on_export_backup)
+        menu_tool.addAction(a_backup)
+        a_restore = QAction("导入配置备份...", self)
+        a_restore.triggered.connect(self._on_import_backup)
+        menu_tool.addAction(a_restore)
 
         # 帮助
         menu_help = mb.addMenu("帮助(&H)")
@@ -572,6 +722,21 @@ class MainWindow(QMainWindow):
                 f"已选择 {n} 个窗口 · 可用「同步启动」让它们执行同一套操作", 3000)
         self._refresh_status()
 
+    def _statusBar(self) -> QStatusBar:
+        """返回状态栏(不存在则创建).
+
+        历史遗留:主窗口里有几十处 ``self._statusBar().showMessage(...)``
+        把状态栏当快捷方法用,但 ``QMainWindow`` 只有 ``statusBar()``,
+        这个方法从未被定义过 —— 于是每一条状态栏提示都在抛
+        ``AttributeError``,表现为「点了按钮什么都没提示」。这里补上实现,
+        顺便兜底状态栏尚未建立的情况。
+        """
+        sb = self.statusBar()
+        if sb is None:
+            sb = QStatusBar()
+            self.setStatusBar(sb)
+        return sb
+
     def _build_statusbar(self) -> None:
         sb = QStatusBar()
         self._status_label = QLabel(f"{__app_name_cn__} v{__version__} · 就绪")
@@ -683,24 +848,63 @@ class MainWindow(QMainWindow):
         title = (info.title if info else "") or str(hwnd)
         SessionVolumeDialog(int(pid), title, self).exec()
 
-    def _on_open_master_volume(self) -> None:
+    def _on_open_group_volume(self) -> None:
         if not audio.available():
             QMessageBox.information(
-                self, "整体音量",
+                self, "全部窗口音量",
                 "音量功能不可用:当前环境缺少 pycaw 组件。\n"
                 "源码运行请执行:pip install pycaw",
             )
             return
-        dlg = MasterVolumeDialog(self)
-        dlg.set_pids_provider(self._tracked_pids)
+        dlg = GroupVolumeDialog(self._tracked_pids, self._cfg, self)
         dlg.exec()
+        try:
+            self._cfg.save()
+        except Exception:  # noqa: BLE001
+            pass
+        self._left.refresh_cards()
 
-    def _master_volume_set(self, v: float) -> None:
+    def _group_volume_set(self, v: float) -> int:
+        """把所有「已加入窗口」的会话音量设为 v(不动系统总音量)."""
+        if not audio.available():
+            return 0
+        pids = self._tracked_pids()
+        n = audio.set_volume_for_pids(pids, float(v))
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"已加入窗口音量 → {int(round(float(v) * 100))}%({n}/{len(pids)} 个窗口)", 4000,
+        )
+        return n
+
+    def _group_mute_set(self, on: bool, *, snapshot: bool = True) -> int:
+        """把所有「已加入窗口」静音 / 取消静音(不影响其它程序)."""
+        if not audio.available():
+            return 0
+        pids = self._tracked_pids()
+        if on and snapshot and not self._volume_backup:
+            self._volume_backup = audio.snapshot_for_pids(pids)
+        n = audio.set_mute_for_pids(pids, bool(on))
+        tail = "(没生效的是此刻没在发声的窗口)" if n < len(pids) else ""
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"已{'静音' if on else '取消静音'} {n}/{len(pids)} 个窗口{tail}", 4000,
+        )
+        return n
+
+    def _group_volume_restore(self) -> None:
+        """还原「静音 / 降音量」之前的音量;没有快照就退回取消静音 + 100%."""
         if not audio.available():
             return
-        audio.set_master_volume(float(v))
+        if self._volume_backup:
+            n = audio.restore_for_pids(self._volume_backup)
+            self._volume_backup = {}
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                f"已还原 {n} 个窗口到操作前的音量", 4000,
+            )
+            return
+        pids = self._tracked_pids()
+        n = audio.set_mute_for_pids(pids, False)
+        audio.set_volume_for_pids(pids, 1.0)
         self._statusBar().showMessage(  # type: ignore[union-attr]
-            f"整体音量已设为 {int(round(float(v) * 100))}%", 3000,
+            f"已取消静音并恢复 100%({n}/{len(pids)} 个窗口)", 4000,
         )
 
     def _apply_default_session_volume(self, hwnd: int) -> None:
@@ -1111,25 +1315,62 @@ class MainWindow(QMainWindow):
             f"反馈前会自动脱敏:用户名、游戏目录、机器名均不会上传。",
         )
 
-    def _on_open_log_dir(self) -> None:
-        import os
-        path = os.environ.get("APPDATA", "") + "\\" + __app_name__ + "\\logs"
-        if not path.strip("\\"):
-            path = "%APPDATA%\\" + __app_name__ + "\\logs"
-        try:
-            os.startfile(path)  # type: ignore[attr-defined]
-        except Exception:
-            QMessageBox.information(self, "日志目录", path)
+    def _on_view_log(self) -> None:
+        """在界面里看日志(不用再去翻目录)."""
+        from .log_viewer_dialog import LogViewerDialog
+        dlg = LogViewerDialog(self)
+        dlg.exec()
 
-    def _on_open_log_file(self) -> None:
-        import os
-        path = os.environ.get("APPDATA", "") + "\\" + __app_name__ + "\\logs\\autofarmstation.log"
-        if not path.strip("\\"):
-            path = "%APPDATA%\\" + __app_name__ + "\\logs\\autofarmstation.log"
+    def _on_open_log_dir(self) -> None:
+        from ..utils.paths import user_log_dir
+        from ..utils.sanitize import user_log_dir_display
+        path = user_log_dir()
         try:
-            os.startfile(path)  # type: ignore[attr-defined]
-        except Exception:
-            QMessageBox.information(self, "日志文件", path)
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"日志目录:{user_log_dir_display()}", 4000,
+        )
+
+    def _on_export_backup(self) -> None:
+        from ..utils import backup
+        from ..utils.paths import user_data_dir
+        dest, _sel = QFileDialog.getSaveFileName(
+            self, "导出配置备份", str(user_data_dir() / backup.default_name()),
+            "备份文件 (*.zip)",
+        )
+        if not dest:
+            return
+        self._save_state()
+        ok, msg = backup.export_to(dest)
+        (QMessageBox.information if ok else QMessageBox.warning)(self, "导出配置备份", msg)
+
+    def _on_import_backup(self) -> None:
+        from ..utils import backup
+        src, _sel = QFileDialog.getOpenFileName(
+            self, "导入配置备份", "", "备份文件 (*.zip)",
+        )
+        if not src:
+            return
+        info = backup.describe(src)
+        r = QMessageBox.question(
+            self, "导入配置备份",
+            f"{info}\n\n导入会覆盖当前设置(含窗口列表、预设、宏、定时任务)。\n"
+            "当前数据会自动备份到 backups\\ 目录,可随时退回。\n\n是否继续?",
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._save_state()
+        ok, msg = backup.import_from(src)
+        if not ok:
+            QMessageBox.warning(self, "导入配置备份", msg)
+            return
+        QMessageBox.information(
+            self, "导入配置备份",
+            msg + "\n\n建议现在重开软件,确保所有页面都按新配置加载。",
+        )
 
     # --- 更新检查 ---
     def _periodic_update_check(self) -> None:

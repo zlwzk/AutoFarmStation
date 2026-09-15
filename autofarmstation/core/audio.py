@@ -1,9 +1,15 @@
 """系统音量 / 单进程音量控制(Windows Core Audio).
 
-两路需求:
-1. **整体音量** —— 直接调默认输出设备的 master volume(等价于任务栏音量条)。
-2. **单个窗口的音量** —— 调该进程的音频会话音量(等价于「音量合成器」里那一栏),
+三路需求,按「影响范围」从窄到宽:
+
+1. **单个窗口的音量** —— 调该进程的音频会话音量(等价于「音量合成器」里那一栏),
    不影响系统整体音量,也不影响其它游戏。
+2. **全部窗口的音量 / 静音**(``*_for_pids``) —— 只是对上面那一档做批量:
+   只作用在**本软件已加入的窗口**上。这是默认行为,关掉本软件挂机时
+   不会把 QQ、浏览器、视频一起静音。
+3. **系统总音量**(``master_*``) —— 默认输出设备的 master volume(等价于任务栏音量条),
+   会影响所有程序,因此**默认不接管**,只有用户显式打开
+   ``audio.control_system_master`` 时才会去动它。
 
 实现基于 pycaw(Windows Core Audio 的 Python 封装)。
 pycaw 不可用时所有函数返回 None / False,不抛异常 —— 音量功能整体降级,
@@ -238,6 +244,73 @@ def set_volume_for_pids(pids: list[int], volume: float) -> int:
         if set_session_volume(int(pid), volume):
             n += 1
     return n
+
+
+def set_mute_for_pids(pids: list[int], mute: bool) -> int:
+    """对一批 pid 静音 / 取消静音,返回成功的个数.
+
+    这是**按窗口**的静音(音量合成器里那一栏),不会动系统总音量 ——
+    所以「全部窗口静音」不会把 QQ、浏览器、视频一起静掉。
+    """
+    n = 0
+    for pid in pids:
+        if set_session_mute(int(pid), mute):
+            n += 1
+    return n
+
+
+def snapshot_for_pids(pids: list[int]) -> dict[int, tuple[float, bool]]:
+    """记录这批 pid 当前的 (音量, 是否静音),用于稍后还原.
+
+    读不到会话的 pid 会被跳过(它此刻本来就没发声,没什么可还原的)。
+    """
+    out: dict[int, tuple[float, bool]] = {}
+    for pid in pids:
+        pid = int(pid)
+        vol = get_session_volume(pid)
+        if vol is None:
+            continue
+        out[pid] = (vol, bool(get_session_mute(pid)))
+    return out
+
+
+def restore_for_pids(snapshot: dict[int, tuple[float, bool]]) -> int:
+    """把 :func:`snapshot_for_pids` 记录的音量/静音还原回去."""
+    n = 0
+    for pid, (vol, mute) in (snapshot or {}).items():
+        ok = set_session_volume(int(pid), float(vol))
+        set_session_mute(int(pid), bool(mute))
+        if ok:
+            n += 1
+    return n
+
+
+def describe_for_pids(pids: list[int]) -> str:
+    """一行描述「这批窗口当前的会话音量」,读不到的按「未发声」计数."""
+    pids = [int(p) for p in pids if p]
+    if not pids:
+        return "当前没有已加入的窗口"
+    if not available():
+        return "需要 pycaw(未安装,音量功能不可用)"
+    vols: list[float] = []
+    muted = 0
+    for pid in pids:
+        v = get_session_volume(pid)
+        if v is None:
+            continue
+        vols.append(v)
+        if get_session_mute(pid):
+            muted += 1
+    if not vols:
+        return f"{len(pids)} 个窗口当前都没有音频会话(没在发声)"
+    txt = f"{len(vols)}/{len(pids)} 个窗口有音频会话"
+    if len(set(round(v, 2) for v in vols)) == 1:
+        txt += f",音量 {int(round(vols[0] * 100))}%"
+    else:
+        txt += f",音量 {int(round(min(vols) * 100))}~{int(round(max(vols) * 100))}%"
+    if muted:
+        txt += f",其中 {muted} 个已静音"
+    return txt
 
 
 def describe() -> str:

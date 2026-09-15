@@ -30,9 +30,23 @@ class TrackedProcess:
     last_seen: float = field(default_factory=time.time)
     alive: bool = True
     tags: list[str] = field(default_factory=list)
+    alias: str = ""  # 用户给这个窗口起的别名(多开时靠它分辨)
+    color: str = ""  # 卡片强调色(十六进制,空 = 不强调)
+    # --- 运行时字段:由监控线程周期性刷新,不写进配置 ---
+    cpu: float = 0.0
+    mem_mb: float = 0.0
+
+    _RUNTIME_FIELDS = ("cpu", "mem_mb")
+
+    def display_name(self) -> str:
+        """卡片标题:别名优先,其次窗口标题,最后兜底进程名/PID."""
+        return (self.alias or self.title or self.name or f"PID {self.pid}").strip()
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        for key in self._RUNTIME_FIELDS:
+            d.pop(key, None)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "TrackedProcess":
@@ -46,6 +60,8 @@ class TrackedProcess:
             last_seen=float(d.get("last_seen", time.time())),
             alive=bool(d.get("alive", True)),
             tags=list(d.get("tags", []) or []),
+            alias=str(d.get("alias", "") or ""),
+            color=str(d.get("color", "") or ""),
         )
 
 
@@ -148,6 +164,27 @@ class ProcessManager:
         if changed_any:
             self._notify()
         return gone
+
+    # --- 资源占用(监控线程写入) ---
+    def set_resource(self, hwnd: int, cpu: float, mem_mb: float) -> None:
+        """更新某个窗口的 CPU / 内存占用.不需要触发 on_change(卡片自己会刷)."""
+        with self._lock:
+            item = self._items.get(int(hwnd))
+        if item is not None:
+            item.cpu = float(cpu)
+            item.mem_mb = float(mem_mb)
+
+    def set_alias(self, hwnd: int, alias: str, color: str | None = None) -> bool:
+        """改别名 / 强调色(别名留空则回退成窗口标题)."""
+        with self._lock:
+            item = self._items.get(int(hwnd))
+        if item is None:
+            return False
+        item.alias = str(alias or "").strip()
+        if color is not None:
+            item.color = str(color or "")
+        self._notify()
+        return True
 
     # --- 回调 ---
     def on_change(self, cb: Callable[[], None]) -> None:

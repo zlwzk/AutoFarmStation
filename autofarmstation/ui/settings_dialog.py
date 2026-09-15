@@ -1,8 +1,13 @@
 """设置对话框.
 
 分组:
-  界面 · 预览与窗口尺寸 · 默认连点参数 · 音量 ·
-  游戏进程 · Steam 状态联动与叠加层 · 更新与日志 · 数据位置
+  界面 · 预览与窗口尺寸 · 默认连点参数 · 音量 · 游戏进程 ·
+  资源监控 · 挂机时段 · Steam 状态联动与叠加层 ·
+  更新与日志 · 数据位置与备份
+
+注意「音量」组的作用范围:全部窗口音量 / 单窗口音量走的都是
+Windows「音量合成器」里那一栏,只影响已加入本软件的窗口;
+真正的系统总音量(任务栏音量条)单列在最后,**默认不接管**。
 """
 
 from __future__ import annotations
@@ -10,11 +15,13 @@ from __future__ import annotations
 import datetime
 import logging
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTime, Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QCheckBox, QComboBox, QLineEdit, QDialogButtonBox, QPushButton, QLabel,
     QMessageBox, QDoubleSpinBox, QSpinBox, QSlider, QScrollArea, QWidget,
+    QTimeEdit, QFileDialog,
 )
 
 from ..core import audio
@@ -28,6 +35,7 @@ from ..core.steam_overlay import (
 from ..core.steam_status import (
     SteamStatusController, SUPPORTED_STATES, STATE_ONLINE, state_label,
 )
+from .widgets import with_unit
 
 _log = logging.getLogger("autofarmstation.settings")
 
@@ -53,6 +61,8 @@ class SettingsDialog(QDialog):
         self._build_defaults_group(v)
         self._build_audio_group(v)
         self._build_game_group(v)
+        self._build_monitor_group(v)
+        self._build_farm_window_group(v)
         self._build_steam_group(v)
         self._build_update_group(v)
         self._build_paths_group(v)
@@ -128,16 +138,16 @@ class SettingsDialog(QDialog):
         self._card_w = QSpinBox()
         self._card_w.setRange(160, 800)
         self._card_w.setSingleStep(10)
-        self._card_w.setSuffix(" px")
         self._card_w.setValue(int(self._cfg.get("ui.card_min_width", 240)))
         size_row.addWidget(self._card_w)
+        size_row.addWidget(QLabel("px"))
         size_row.addWidget(QLabel("×"))
         self._card_h = QSpinBox()
         self._card_h.setRange(120, 600)
         self._card_h.setSingleStep(10)
-        self._card_h.setSuffix(" px")
         self._card_h.setValue(int(self._cfg.get("ui.card_min_height", 190)))
         size_row.addWidget(self._card_h)
+        size_row.addWidget(QLabel("px"))
         size_row.addStretch()
         uf.addRow("卡片大小(宽 × 高):", size_row)
 
@@ -163,7 +173,7 @@ class SettingsDialog(QDialog):
         parent_layout.addWidget(box)
 
     def _build_audio_group(self, parent_layout: QVBoxLayout) -> None:
-        """音量:整体音量 + 单窗口音量."""
+        """音量:全部已加入窗口 + 单窗口 + (可选)系统总音量."""
         box = QGroupBox("音量")
         af = QFormLayout(box)
 
@@ -178,35 +188,42 @@ class SettingsDialog(QDialog):
             parent_layout.addWidget(box)
             return
 
-        # 整体音量
+        scope = QLabel(
+            "这一组只作用于「已加入本软件的窗口」(主界面里追踪中的那些游戏),\n"
+            "不会去动 QQ、浏览器、视频等其它程序的音量。"
+        )
+        scope.setStyleSheet("color:#8ab; font-size:11px;")
+        scope.setWordWrap(True)
+        af.addRow(scope)
+
+        # --- 全部已加入窗口的音量 ---
         row = QHBoxLayout()
-        self._master_vol = QSlider(Qt.Orientation.Horizontal)
-        self._master_vol.setRange(0, 100)
-        mv = audio.get_master_volume()
-        self._master_vol.setValue(int(round((mv if mv is not None else 1.0) * 100)))
-        self._master_vol.valueChanged.connect(self._on_master_volume_changed)
-        row.addWidget(self._master_vol, stretch=1)
-        self._master_lab = QLabel(f"{self._master_vol.value()}%")
-        self._master_lab.setFixedWidth(48)
-        row.addWidget(self._master_lab)
-        af.addRow("整体音量:", row)
-
-        self._master_mute = QCheckBox("静音")
-        self._master_mute.setChecked(bool(audio.get_master_mute()))
-        self._master_mute.toggled.connect(lambda on: audio.set_master_mute(on))
-        af.addRow("", self._master_mute)
-
-        self._apply_master_on_start = QCheckBox("启动本软件时把整体音量设成上面的值")
-        self._apply_master_on_start.setChecked(self._cfg.get("audio.apply_master_on_start", False))
-        af.addRow("", self._apply_master_on_start)
+        self._group_vol = QSlider(Qt.Orientation.Horizontal)
+        self._group_vol.setRange(0, 100)
+        gv = float(self._cfg.get("audio.group_volume", -1))
+        self._group_vol.setValue(100 if gv < 0 else int(round(gv * 100)))
+        self._group_vol.valueChanged.connect(lambda v: self._group_lab.setText(f"{v}%"))
+        row.addWidget(self._group_vol, stretch=1)
+        self._group_lab = QLabel(f"{self._group_vol.value()}%")
+        self._group_lab.setFixedWidth(48)
+        row.addWidget(self._group_lab)
+        af.addRow("全部窗口音量:", row)
 
         row_all = QHBoxLayout()
-        btn_apply_all = QPushButton("把该音量应用到所有追踪窗口")
-        btn_apply_all.setToolTip("按窗口设置,不动系统整体音量")
+        btn_apply_all = QPushButton("立即应用到全部窗口")
+        btn_apply_all.setToolTip("按窗口的音频会话来设置,不动系统总音量")
         btn_apply_all.clicked.connect(self._on_apply_volume_to_all)
         row_all.addWidget(btn_apply_all)
+        self._group_mute = QCheckBox("静音全部窗口")
+        self._group_mute.setChecked(bool(self._cfg.get("audio.group_mute", False)))
+        row_all.addWidget(self._group_mute)
         row_all.addStretch()
         af.addRow("", row_all)
+
+        self._apply_group_on_start = QCheckBox("启动本软件时把上面的音量套用到已加入的窗口")
+        self._apply_group_on_start.setChecked(
+            self._cfg.get("audio.apply_group_on_start", False))
+        af.addRow("", self._apply_group_on_start)
 
         sep = QLabel("— — — — — — — — — — — — — — — — — — —")
         sep.setStyleSheet("color:#666;")
@@ -234,15 +251,50 @@ class SettingsDialog(QDialog):
         self._apply_session_on_add.setChecked(self._cfg.get("audio.apply_session_on_add", False))
         af.addRow("", self._apply_session_on_add)
 
+        sep2 = QLabel("— — — — — — — — — — — — — — — — — — —")
+        sep2.setStyleSheet("color:#666;")
+        af.addRow(sep2)
+
+        self._sys_on = QCheckBox("允许本软件调整「系统总音量」(任务栏音量条)")
+        self._sys_on.setChecked(bool(self._cfg.get("audio.control_system_master", False)))
+        self._sys_on.toggled.connect(self._on_sys_master_toggled)
+        af.addRow("", self._sys_on)
+
+        row_sys = QHBoxLayout()
+        self._sys_vol = QSlider(Qt.Orientation.Horizontal)
+        self._sys_vol.setRange(0, 100)
+        mv = audio.get_master_volume()
+        sv = float(self._cfg.get("audio.system_master_volume", -1))
+        self._sys_vol.setValue(
+            int(round((mv if mv is not None else 1.0) * 100)) if sv < 0
+            else int(round(sv * 100))
+        )
+        self._sys_vol.valueChanged.connect(lambda v: self._sys_lab.setText(f"{v}%"))
+        row_sys.addWidget(self._sys_vol, stretch=1)
+        self._sys_lab = QLabel(f"{self._sys_vol.value()}%")
+        self._sys_lab.setFixedWidth(48)
+        row_sys.addWidget(self._sys_lab)
+        af.addRow("系统总音量:", row_sys)
+        self._sys_mute = QCheckBox("系统静音")
+        self._sys_mute.setChecked(bool(self._cfg.get("audio.system_master_mute", False)))
+        af.addRow("", self._sys_mute)
+        self._on_sys_master_toggled(self._sys_on.isChecked())
+
         note = QLabel(
-            "说明:整体音量 = 任务栏音量条(影响所有程序);\n"
-            "单窗口音量 = Windows「音量合成器」里那一栏(只影响该游戏)。\n"
-            "进程还没发出声音时读不到它的会话音量,此时拖动滑块会在它出声后仍生效。"
+            "说明:全部窗口音量 / 单窗口音量走的都是 Windows「音量合成器」里那一栏,\n"
+            "只影响对应游戏;进程还没发出声音时读不到它的会话音量,\n"
+            "此时拖动滑块会在它出声后仍然生效。\n"
+            "「系统总音量」才是任务栏音量条,会影响所有程序 —— 默认不接管。"
         )
         note.setStyleSheet("color:#888;")
         note.setWordWrap(True)
         af.addRow(note)
         parent_layout.addWidget(box)
+
+    def _on_sys_master_toggled(self, on: bool) -> None:
+        """系统总音量的两个控件只有显式勾选后才可用,避免误碰。"""
+        self._sys_vol.setEnabled(on)
+        self._sys_mute.setEnabled(on)
 
     def _build_game_group(self, parent_layout: QVBoxLayout) -> None:
         """游戏进程的唤醒 / 结束策略."""
@@ -279,9 +331,8 @@ class SettingsDialog(QDialog):
 
         self._steam_timeout = QSpinBox()
         self._steam_timeout.setRange(10, 600)
-        self._steam_timeout.setSuffix(" 秒")
         self._steam_timeout.setValue(int(self._cfg.get("launch.steam_timeout_sec", 90)))
-        gf.addRow("等待 Steam 启动超时:", self._steam_timeout)
+        gf.addRow("等待 Steam 启动超时:", with_unit(self._steam_timeout, "秒"))
 
         parent_layout.addWidget(box)
 
@@ -291,15 +342,13 @@ class SettingsDialog(QDialog):
         uf = QFormLayout(box)
         self._def_interval = QSpinBox()
         self._def_interval.setRange(10, 60000)
-        self._def_interval.setSuffix(" ms")
         self._def_interval.setValue(int(self._cfg.get("defaults.clicker_interval_ms", 200)))
-        uf.addRow("点击间隔:", self._def_interval)
+        uf.addRow("点击间隔:", with_unit(self._def_interval, "ms"))
 
         self._def_jitter = QSpinBox()
         self._def_jitter.setRange(0, 5000)
-        self._def_jitter.setSuffix(" ms")
         self._def_jitter.setValue(int(self._cfg.get("defaults.clicker_jitter_ms", 30)))
-        uf.addRow("± 抖动:", self._def_jitter)
+        uf.addRow("± 抖动:", with_unit(self._def_jitter, "ms"))
 
         self._def_button = QComboBox()
         self._def_button.addItems(["left 左键", "right 右键", "middle 中键"])
@@ -332,6 +381,100 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         uf.addRow(note)
         parent_layout.addWidget(box)
+
+    def _build_monitor_group(self, parent_layout: QVBoxLayout) -> None:
+        """资源占用显示与告警."""
+        box = QGroupBox("资源监控")
+        mf = QFormLayout(box)
+
+        self._show_resource = QCheckBox("在卡片上显示该窗口的 CPU / 内存占用")
+        self._show_resource.setChecked(self._cfg.get("ui.show_resource_on_card", True))
+        mf.addRow("", self._show_resource)
+
+        self._res_alert = QCheckBox("占用超阈值时提醒(状态栏 + 卡片标红,不会自动杀掉游戏)")
+        self._res_alert.setChecked(self._cfg.get("monitor.resource_alert_enabled", True))
+        mf.addRow("", self._res_alert)
+
+        row = QHBoxLayout()
+        self._res_cpu = QDoubleSpinBox()
+        self._res_cpu.setRange(10, 100)
+        self._res_cpu.setDecimals(0)
+        self._res_cpu.setValue(float(self._cfg.get("monitor.cpu_alert_pct", 90)))
+        row.addWidget(self._res_cpu)
+        row.addWidget(QLabel("%"))
+        row.addWidget(QLabel("CPU 阈值"))
+        mf.addRow("", row)
+
+        row2 = QHBoxLayout()
+        self._res_mem = QSpinBox()
+        self._res_mem.setRange(128, 65536)
+        self._res_mem.setSingleStep(256)
+        self._res_mem.setValue(int(self._cfg.get("monitor.mem_alert_mb", 4096)))
+        row2.addWidget(self._res_mem)
+        row2.addWidget(QLabel("MB"))
+        row2.addWidget(QLabel("内存阈值"))
+        mf.addRow("", row2)
+
+        note = QLabel(
+            "多开时最怕某个窗口悄悄吃满内存把整机拖垮。这里只做「看一眼就知道」和提醒,\n"
+            "不会替你做任何处置动作 —— 要停哪个窗口由你决定。"
+        )
+        note.setStyleSheet("color:#888;")
+        note.setWordWrap(True)
+        mf.addRow(note)
+        parent_layout.addWidget(box)
+
+    def _build_farm_window_group(self, parent_layout: QVBoxLayout) -> None:
+        """挂机时段:时段外自动暂停."""
+        box = QGroupBox("挂机时段")
+        ff = QFormLayout(box)
+
+        self._fw_enabled = QCheckBox("只在指定时段内挂机(时段外自动暂停)")
+        self._fw_enabled.setChecked(self._cfg.get("farm_window.enabled", False))
+        self._fw_enabled.toggled.connect(self._on_farm_window_toggled)
+        ff.addRow("", self._fw_enabled)
+
+        row = QHBoxLayout()
+        self._fw_start = QTimeEdit()
+        self._fw_start.setDisplayFormat("HH:mm")
+        self._fw_start.setTime(self._parse_time(self._cfg.get("farm_window.start", "22:00")))
+        row.addWidget(self._fw_start)
+        row.addWidget(QLabel("→"))
+        self._fw_end = QTimeEdit()
+        self._fw_end.setDisplayFormat("HH:mm")
+        self._fw_end.setTime(self._parse_time(self._cfg.get("farm_window.end", "08:00")))
+        row.addWidget(self._fw_end)
+        row.addStretch()
+        ff.addRow("时段:", row)
+
+        self._fw_action = QComboBox()
+        self._fw_action.addItem("暂停(回到时段后自动恢复)", "pause")
+        self._fw_action.addItem("停止(回到时段也不自动恢复)", "stop")
+        idx = 0 if self._cfg.get("farm_window.action", "pause") == "pause" else 1
+        self._fw_action.setCurrentIndex(idx)
+        ff.addRow("时段外:", self._fw_action)
+
+        note = QLabel(
+            "跨零点也没问题:比如 22:00 → 08:00 就是「晚上十点到第二天早上八点」。\n"
+            "只在跨越边界的那一次动作,不会去抢你手动开的连点器。"
+        )
+        note.setStyleSheet("color:#888;")
+        note.setWordWrap(True)
+        ff.addRow(note)
+        self._on_farm_window_toggled(self._fw_enabled.isChecked())
+        parent_layout.addWidget(box)
+
+    def _on_farm_window_toggled(self, on: bool) -> None:
+        for w in (self._fw_start, self._fw_end, self._fw_action):
+            w.setEnabled(on)
+
+    @staticmethod
+    def _parse_time(text: str) -> QTime:
+        parts = str(text or "").split(":")
+        try:
+            return QTime(int(parts[0]) % 24, int(parts[1]) % 60 if len(parts) > 1 else 0)
+        except (ValueError, IndexError):
+            return QTime(22, 0)
 
     def _build_steam_group(self, parent_layout: QVBoxLayout) -> None:
         box = QGroupBox("Steam 状态联动 & 叠加层")
@@ -535,12 +678,9 @@ class SettingsDialog(QDialog):
         self._refresh_update_status()
 
     def _build_paths_group(self, parent_layout: QVBoxLayout) -> None:
-        box = QGroupBox("数据位置(只读)")
+        box = QGroupBox("数据位置与备份")
         pbf = QFormLayout(box)
-        from ..utils.paths import (
-            user_data_dir, user_log_dir, user_macro_dir, user_preset_dir,
-            user_bat_dir,
-        )
+        from ..utils.paths import user_data_dir
         from ..utils.sanitize import user_data_dir_display
         base = user_data_dir_display()
         for label, sub in (
@@ -548,10 +688,76 @@ class SettingsDialog(QDialog):
             ("日志:", "\\logs\\"),
             ("宏:", "\\macros\\"),
             ("预设:", "\\presets\\"),
+            ("定时任务:", "\\schedules.json"),
             ("Bat 脚本库:", "\\bats\\"),
         ):
             pbf.addRow(label, QLabel(base + sub))
+
+        row = QHBoxLayout()
+        btn_export = QPushButton("导出备份...")
+        btn_export.setToolTip("把设置 / 窗口列表 / 预设 / 宏 / 定时任务打包成一个 zip")
+        btn_export.clicked.connect(self._on_export_backup)
+        row.addWidget(btn_export)
+        btn_import = QPushButton("导入备份...")
+        btn_import.setToolTip("从备份 zip 恢复(导入前会自动备份当前数据)")
+        btn_import.clicked.connect(self._on_import_backup)
+        row.addWidget(btn_import)
+        btn_open = QPushButton("打开数据目录")
+        btn_open.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(user_data_dir())))
+        )
+        row.addWidget(btn_open)
+        row.addStretch()
+        pbf.addRow("备份:", row)
+
+        note = QLabel(
+            "换机 / 重装 / 想把调好的一套配置发给朋友时用得上。\n"
+            "备份里不含日志(体积大且带着环境信息);导入前会自动把当前数据备份到 backups\\。"
+        )
+        note.setStyleSheet("color:#888;")
+        note.setWordWrap(True)
+        pbf.addRow(note)
         parent_layout.addWidget(box)
+
+    def _on_export_backup(self) -> None:
+        from ..utils import backup
+        from ..utils.paths import user_data_dir
+        dest, _sel = QFileDialog.getSaveFileName(
+            self, "导出备份", str(user_data_dir() / backup.default_name()),
+            "备份文件 (*.zip)",
+        )
+        if not dest:
+            return
+        # 导出前确保当前设置已落盘,否则备份的是旧配置
+        self._cfg.save()
+        ok, msg = backup.export_to(dest)
+        (QMessageBox.information if ok else QMessageBox.warning)(self, "导出备份", msg)
+
+    def _on_import_backup(self) -> None:
+        from ..utils import backup
+        src, _sel = QFileDialog.getOpenFileName(
+            self, "导入备份", "", "备份文件 (*.zip)",
+        )
+        if not src:
+            return
+        info = backup.describe(src)
+        r = QMessageBox.question(
+            self, "导入备份",
+            f"{info}\n\n"
+            "导入会用备份里的设置覆盖当前设置(含窗口列表、预设、宏、定时任务)。\n"
+            "当前数据会自动备份到 backups\\ 目录,可随时退回。\n\n是否继续?",
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._cfg.save()
+        ok, msg = backup.import_from(src)
+        if not ok:
+            QMessageBox.warning(self, "导入备份", msg)
+            return
+        QMessageBox.information(
+            self, "导入备份",
+            msg + "\n\n建议现在重开软件,确保所有页面都按新配置加载。",
+        )
 
     # ===== 行为 =====
     def _tracked_pids(self) -> list[int]:
@@ -566,21 +772,20 @@ class SettingsDialog(QDialog):
                     return []
         return []
 
-    def _on_master_volume_changed(self, val: int) -> None:
-        self._master_lab.setText(f"{val}%")
-        audio.set_master_volume(val / 100.0)
-
     def _on_apply_volume_to_all(self) -> None:
         pids = self._tracked_pids()
         if not pids:
-            QMessageBox.information(self, "音量", "当前没有追踪中的窗口。")
+            QMessageBox.information(self, "音量", "当前还没有已加入的窗口。")
             return
-        n = audio.set_volume_for_pids(pids, self._master_vol.value() / 100.0)
-        QMessageBox.information(
-            self, "音量",
-            f"已对 {n}/{len(pids)} 个窗口设置音量 {self._master_vol.value()}%。\n"
-            "没生效的窗口是因为它此刻还没有音频会话(没在发声)。",
-        )
+        v = self._group_vol.value() / 100.0
+        n = audio.set_volume_for_pids(pids, v)
+        msg = f"已对 {n}/{len(pids)} 个窗口设置音量 {self._group_vol.value()}%。"
+        if self._group_mute.isChecked():
+            m = audio.set_mute_for_pids(pids, True)
+            msg += f"\n其中 {m} 个已静音。"
+        msg += ("\n\n没生效的窗口是因为它此刻还没有音频会话(没在发声),"
+                "出声后依然会生效。")
+        QMessageBox.information(self, "音量", msg)
 
     def _refresh_steam_info(self) -> None:
         try:
@@ -701,13 +906,30 @@ class SettingsDialog(QDialog):
         self._cfg.set("launch.kill_tree", self._kill_tree.isChecked())
         self._cfg.set("launch.steam_timeout_sec", self._steam_timeout.value())
         # 音量
-        self._cfg.set("audio.apply_master_on_start", self._apply_master_on_start.isChecked())
         if audio.available():
-            self._cfg.set("audio.master_volume", self._master_vol.value() / 100.0)
-            self._cfg.set("audio.master_mute", self._master_mute.isChecked())
+            self._cfg.set("audio.apply_group_on_start", self._apply_group_on_start.isChecked())
+            self._cfg.set("audio.group_volume", self._group_vol.value() / 100.0)
+            self._cfg.set("audio.group_mute", self._group_mute.isChecked())
             self._cfg.set("audio.show_volume_on_card", self._show_volume_on_card.isChecked())
             self._cfg.set("audio.default_session_volume", self._def_session_vol.value() / 100.0)
             self._cfg.set("audio.apply_session_on_add", self._apply_session_on_add.isChecked())
+            self._cfg.set("audio.control_system_master", self._sys_on.isChecked())
+            self._cfg.set("audio.system_master_volume", self._sys_vol.value() / 100.0)
+            self._cfg.set("audio.system_master_mute", self._sys_mute.isChecked())
+            # 只有用户主动打开开关时才真的去改系统总音量
+            if self._sys_on.isChecked():
+                audio.set_master_volume(self._sys_vol.value() / 100.0)
+                audio.set_master_mute(self._sys_mute.isChecked())
+        # 资源监控
+        self._cfg.set("ui.show_resource_on_card", self._show_resource.isChecked())
+        self._cfg.set("monitor.resource_alert_enabled", self._res_alert.isChecked())
+        self._cfg.set("monitor.cpu_alert_pct", float(self._res_cpu.value()))
+        self._cfg.set("monitor.mem_alert_mb", float(self._res_mem.value()))
+        # 挂机时段
+        self._cfg.set("farm_window.enabled", self._fw_enabled.isChecked())
+        self._cfg.set("farm_window.start", self._fw_start.time().toString("HH:mm"))
+        self._cfg.set("farm_window.end", self._fw_end.time().toString("HH:mm"))
+        self._cfg.set("farm_window.action", str(self._fw_action.currentData() or "pause"))
         self._cfg.set("settings.check_updates", self._check_updates.isChecked())
         self._cfg.set(
             "settings.update_check_interval_hours",

@@ -5,6 +5,8 @@
 - 实时画面预览(GDI PrintWindow,被遮挡也能截到)
 - **窗口嵌入**:点击「嵌入」把原窗口收进卡片内显示,桌面上不再单独出现;
   再点「弹出」完整还原。卡片关闭/程序退出时自动还原。
+- **别名 / 强调色**:右键卡片可给窗口起名字(多开时一眼分得清)并选一个边框色。
+- **资源占用角标**:显示该窗口的 CPU / 内存,超阈值时标红。
 """
 
 from __future__ import annotations
@@ -12,16 +14,29 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QAction, QImage, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
-    QFrame, QSizePolicy, QCheckBox,
+    QFrame, QSizePolicy, QCheckBox, QInputDialog, QMenu,
 )
 
 from ..core.preview_capture import PreviewCapture, PreviewFrame
 from ..core import window_finder as wf
 from ..core import window_host
+from ..utils.sanitize import sanitize
 from .widgets import styled_message
+
+# 右键菜单里可选的强调色(名称 → 十六进制,空字符串 = 不强调)
+CARD_COLORS: tuple[tuple[str, str], ...] = (
+    ("不强调", ""),
+    ("红", "#e05555"),
+    ("橙", "#e09040"),
+    ("黄", "#d8c040"),
+    ("绿", "#5aa85a"),
+    ("青", "#40a8a8"),
+    ("蓝", "#4a9eff"),
+    ("紫", "#a06ad0"),
+)
 
 
 class PreviewWidget(QFrame):
@@ -43,16 +58,14 @@ class PreviewWidget(QFrame):
         phase: float = 0.0,
         card_size: tuple[int, int] | None = None,
         show_volume: bool = True,
+        show_resource: bool = True,
+        pm=None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.hwnd = int(hwnd)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setObjectName("PreviewCard")
-        self.setStyleSheet(
-            "#PreviewCard { border: 2px solid #3c3c3c; background:#222; }"
-            "#PreviewCard:hover { border: 2px solid #4a9eff; }"
-        )
         cw, ch = card_size or (240, 190)
         self.setMinimumSize(int(cw), int(ch))
         self._capture = PreviewCapture(self.hwnd, fps=fps, phase=phase)
@@ -62,8 +75,13 @@ class PreviewWidget(QFrame):
         self._status_extra = ""
         self._embedded = False
         self._show_volume = bool(show_volume)
+        self._show_resource = bool(show_resource)
+        self._pm = pm
+        self._res_text = ""
+        self._res_hot = False
         self._proc_alive = True
         self._last_pid = 0
+        self._apply_style()
         _info = wf.get_window_info(self.hwnd)
         if _info is not None:
             self._last_pid = _info.pid
@@ -87,6 +105,10 @@ class PreviewWidget(QFrame):
         f.setBold(True)
         self._title_lab.setFont(f)
         self._title_lab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        if self._pm is not None:
+            self._title_lab.setToolTip("右键:起别名 / 选强调色(多开时方便分辨)")
+            self._title_lab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self._title_lab.customContextMenuRequested.connect(self._on_title_menu)
         title_bar.addWidget(self._title_lab)
 
         self._btn_embed = QPushButton("嵌入")
@@ -129,6 +151,12 @@ class PreviewWidget(QFrame):
         self._status_lab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._status_lab.setMinimumWidth(0)
         status_bar.addWidget(self._status_lab, stretch=1)
+
+        self._res_lab = QLabel("")
+        self._res_lab.setStyleSheet("color:#888; font-size:10px;")
+        self._res_lab.setToolTip("该窗口的 CPU / 内存占用(主进程 + 子进程内存)")
+        self._res_lab.setVisible(self._show_resource)
+        status_bar.addWidget(self._res_lab)
 
         self._btn_volume = QPushButton("♪")
         self._btn_volume.setFixedSize(24, 22)
@@ -188,6 +216,100 @@ class PreviewWidget(QFrame):
         self._show_volume = bool(on)
         self._btn_volume.setVisible(self._show_volume)
 
+    def set_resource_visible(self, on: bool) -> None:
+        self._show_resource = bool(on)
+        self._res_lab.setVisible(self._show_resource)
+
+    def set_resource_text(self, text: str, hot: bool = False) -> None:
+        """由预览网格每轮刷新推送:卡片的 CPU / 内存角标."""
+        text = text or ""
+        if text == self._res_text and hot == self._res_hot:
+            return
+        self._res_text, self._res_hot = text, bool(hot)
+        if not self._show_resource:
+            return
+        self._res_lab.setText(text)
+        self._res_lab.setStyleSheet(
+            "color:#e08080; font-size:10px; font-weight:bold;" if hot
+            else "color:#888; font-size:10px;"
+        )
+        if hot:
+            self._res_lab.setToolTip("占用偏高 —— 具体数值看设置里的阈值,不会自动处置")
+        else:
+            self._res_lab.setToolTip("该窗口的 CPU / 内存占用(主进程 + 子进程内存)")
+
+    # --- 别名 / 强调色 ---
+    def _alias(self) -> str:
+        if self._pm is None:
+            return ""
+        item = self._pm.get(self.hwnd)
+        return (item.alias if item else "") or ""
+
+    def _color(self) -> str:
+        if self._pm is None:
+            return ""
+        item = self._pm.get(self.hwnd)
+        return (item.color if item else "") or ""
+
+    def _apply_style(self) -> None:
+        """边框:选中 > 自定义强调色 > 默认;悬停统一高亮."""
+        chk = getattr(self, "_chk", None)
+        selected = bool(chk is not None and chk.isChecked())
+        border = "#4a9eff" if selected else (self._color() or "#3c3c3c")
+        width = 3 if border not in ("#3c3c3c", "#4a9eff") else 2
+        self.setStyleSheet(
+            f"#PreviewCard {{ border: {width}px solid {border}; background:#222; }}"
+            "#PreviewCard:hover { border: 2px solid #4a9eff; }"
+        )
+
+    def _on_title_menu(self, pos) -> None:
+        """右键标题:起别名 / 选强调色."""
+        if self._pm is None:
+            return
+        menu = QMenu(self)
+        act_rename = QAction("重命名(别名)...", self)
+        act_rename.triggered.connect(self._on_rename)
+        menu.addAction(act_rename)
+
+        sub = menu.addMenu("强调色")
+        cur = self._color()
+        for name, hexv in CARD_COLORS:
+            act = QAction(("● " if hexv else "○ ") + name, self)
+            act.setCheckable(True)
+            act.setChecked((cur or "") == hexv)
+            act.triggered.connect(lambda _c=False, h=hexv: self._set_color(h))
+            sub.addAction(act)
+
+        act_clear = QAction("清除别名", self)
+        act_clear.setEnabled(bool(self._alias()))
+        act_clear.triggered.connect(lambda: self._set_alias(""))
+        menu.addAction(act_clear)
+        menu.exec(self._title_lab.mapToGlobal(pos))
+
+    def _on_rename(self) -> None:
+        info = wf.get_window_info(self.hwnd)
+        default = self._alias() or (sanitize(info.title) if info else "")
+        text, ok = QInputDialog.getText(
+            self, "窗口别名",
+            "给这个窗口起个名字(留空恢复成窗口标题):\n"
+            "多开同一个游戏时,用别名一眼就能分清是哪个号。",
+            text=default,
+        )
+        if ok:
+            self._set_alias(text.strip())
+
+    def _set_alias(self, alias: str) -> None:
+        if self._pm is None:
+            return
+        self._pm.set_alias(self.hwnd, alias)
+        self._refresh_status()
+
+    def _set_color(self, color: str) -> None:
+        if self._pm is None:
+            return
+        self._pm.set_alias(self.hwnd, self._alias(), color)
+        self._apply_style()
+
     def pid(self) -> int:
         """当前 pid(窗口失效时回退到最近一次记录的值)."""
         info = wf.get_window_info(self.hwnd)
@@ -197,6 +319,11 @@ class PreviewWidget(QFrame):
 
     def refresh_now(self) -> None:
         """外部(如设置变更后)立刻刷新一次状态."""
+        self._refresh_status()
+
+    def refresh_alias(self) -> None:
+        """别名 / 强调色变更后刷新标题与边框."""
+        self._apply_style()
         self._refresh_status()
 
     def is_selected(self) -> bool:
@@ -290,16 +417,8 @@ class PreviewWidget(QFrame):
 
     # --- 内部 ---
     def _on_check_toggled(self, on: bool) -> None:
-        # 选中时高亮边框
-        if on:
-            self.setStyleSheet(
-                "#PreviewCard { border: 2px solid #4a9eff; background:#222; }"
-            )
-        else:
-            self.setStyleSheet(
-                "#PreviewCard { border: 2px solid #3c3c3c; background:#222; }"
-                "#PreviewCard:hover { border: 2px solid #4a9eff; }"
-            )
+        # 选中时高亮边框(自定义强调色仍保留在未选中状态)
+        self._apply_style()
         self.selection_changed.emit(self.hwnd, bool(on))
 
     def _on_frame(self, frame: PreviewFrame) -> None:
@@ -333,14 +452,21 @@ class PreviewWidget(QFrame):
             )
             self._image_lab.setText("(窗口已失效)")
             self._image_lab.setPixmap(QPixmap())
+            self.set_resource_text("")
             self._sync_proc_buttons(alive=False)
             return
         self._last_pid = info.pid
-        title = info.title
-        if len(title) > 36:
-            title = title[:33] + "..."
-        self._title_lab.setText(f"[{info.pid}] {title}")
+        alias = self._alias()
+        base = alias or sanitize(info.title)
+        if len(base) > 36:
+            base = base[:33] + "..."
+        self._title_lab.setText(f"[{info.pid}] {base}")
         self._title_lab.setStyleSheet("color:white;")
+        if self._pm is not None:
+            tip = "右键:起别名 / 选强调色(多开时方便分辨)"
+            if alias:
+                tip = f"别名:{alias}\n原名:{sanitize(info.title)}\n\n{tip}"
+            self._title_lab.setToolTip(tip)
         runtime = time.time() - self._added_at
         h = int(runtime // 3600)
         m = int((runtime % 3600) // 60)

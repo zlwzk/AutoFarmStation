@@ -5,9 +5,13 @@
 * **一次性**  指定日期时间,跑完自动停用
 * **间隔**    每隔 N 秒 / 分钟 / 小时
 * **每天**    HH:MM
-* **每周**    周几 + HH:MM
+* **每周**    周几(可多选,例如一/三/五)+ HH:MM
+
+另外每个任务都可以设「延时执行」:到点后再等 N 秒才动手 ——
+配两条任务就能串流程,比如「22:00 启动全部」+「22:00 延时 30 秒开始连点」。
 
 动作可以直接指向「全部窗口」或某一个被追踪的窗口。
+音量类动作只作用于已加入本软件的窗口,不会动系统总音量。
 任务持久化在 ``%APPDATA%\\AutoFarmStation\\schedules.json``。
 """
 
@@ -110,19 +114,63 @@ class TaskEditDialog(QDialog):
         self._day_time.setDisplayFormat("HH:mm")
         f_day.addRow("时间:", self._day_time)
         self._stack.addWidget(w_day)
-        # --- weekly ---
+        # --- weekly(可多选)---
         w_week = QWidget()
         f_week = QFormLayout(w_week)
         f_week.setContentsMargins(0, 0, 0, 0)
-        self._week_day = QComboBox()
-        for i, name in enumerate(("周一", "周二", "周三", "周四", "周五", "周六", "周日")):
-            self._week_day.addItem(name, i)
-        f_week.addRow("星期:", self._week_day)
+        self._week_boxes: list[QCheckBox] = []
+        days_row = QWidget()
+        dl = QHBoxLayout(days_row)
+        dl.setContentsMargins(0, 0, 0, 0)
+        for i, (short, full) in enumerate(
+            zip("一二三四五六日", ("周一", "周二", "周三", "周四", "周五", "周六", "周日"))
+        ):
+            cb = QCheckBox(short)
+            cb.setToolTip(full)
+            cb.toggled.connect(self._refresh_day_shortcuts)
+            dl.addWidget(cb)
+            self._week_boxes.append(cb)
+        dl.addStretch()
+        f_week.addRow("星期:", days_row)
+
+        quick = QWidget()
+        ql = QHBoxLayout(quick)
+        ql.setContentsMargins(0, 0, 0, 0)
+        for text, days in (
+            ("工作日", (0, 1, 2, 3, 4)),
+            ("周末", (5, 6)),
+            ("每天", tuple(range(7))),
+            ("清空", ()),
+        ):
+            b = QPushButton(text)
+            b.setMaximumWidth(72)
+            b.clicked.connect(lambda _c=False, d=days: self._set_weekdays(d))
+            ql.addWidget(b)
+        ql.addStretch()
+        f_week.addRow("", quick)
+
         self._week_time = QTimeEdit(QTime(9, 0))
         self._week_time.setDisplayFormat("HH:mm")
         f_week.addRow("时间:", self._week_time)
+        f_week.addRow("", QLabel("可多选,例如勾「一三五」就是每周一、三、五各跑一次。"))
         self._stack.addWidget(w_week)
         form.addRow("", self._stack)
+
+        # 延时执行(四种频率通用)
+        delay_row = QWidget()
+        drl = QHBoxLayout(delay_row)
+        drl.setContentsMargins(0, 0, 0, 0)
+        self._delay = QSpinBox()
+        self._delay.setRange(0, 86400)
+        self._delay.setToolTip(
+            "到点后再等这么多秒才真正执行。\n"
+            "用来串流程:比如「22:00 启动全部」+「22:00 延时 30 秒开始连点」。"
+        )
+        drl.addWidget(self._delay)
+        drl.addWidget(QLabel("秒"))
+        drl.addWidget(QLabel("(0 = 到点立刻执行)"))
+        drl.addStretch()
+        form.addRow("延时执行:", delay_row)
 
         # 动作
         self._action = QComboBox()
@@ -160,6 +208,25 @@ class TaskEditDialog(QDialog):
         self._stack.setCurrentIndex(self._freq.currentIndex())
         self._on_action_changed()
 
+    # --- 星期多选 ---
+    def _set_weekdays(self, days) -> None:
+        want = {int(d) for d in days}
+        for i, cb in enumerate(self._week_boxes):
+            cb.setChecked(i in want)
+
+    def _selected_weekdays(self) -> list[int]:
+        return [i for i, cb in enumerate(self._week_boxes) if cb.isChecked()]
+
+    def _refresh_day_shortcuts(self) -> None:
+        n = len(self._selected_weekdays())
+        if n == 7:
+            tip = "每天"
+        elif n == 0:
+            tip = "未选择(保存时会提示)"
+        else:
+            tip = f"已选 {n} 天"
+        self._week_time.setToolTip(tip)
+
     # --- 载入 ---
     def _load(self, t: ScheduledTask) -> None:
         idx = {"once": 0, "interval": 1, "daily": 2, "weekly": 3}.get(
@@ -179,8 +246,9 @@ class TaskEditDialog(QDialog):
                 break
         self._day_time.setTime(QTime(int(t.hour), int(t.minute)))
         self._week_time.setTime(QTime(int(t.hour), int(t.minute)))
-        if 0 <= int(t.weekday) <= 6:
-            self._week_day.setCurrentIndex(int(t.weekday))
+        days = t.effective_weekdays()
+        self._set_weekdays(days if days else (0,))
+        self._delay.setValue(max(0, int(t.delay_sec or 0)))
         ai = self._action.findData(t.action)
         if ai >= 0:
             self._action.setCurrentIndex(ai)
@@ -202,6 +270,9 @@ class TaskEditDialog(QDialog):
             r = QMessageBox.question(self, "时间已过", "所选的触发时间已经过去了,仍要保存吗?")
             if r != QMessageBox.StandardButton.Yes:
                 return
+        if freq is TaskFreq.WEEKLY and not self._selected_weekdays():
+            QMessageBox.information(self, "每周", "请至少勾一个星期。")
+            return
         self._task = self._build()
         self.accept()
 
@@ -211,6 +282,7 @@ class TaskEditDialog(QDialog):
         interval_sec = 3600
         hour = minute = 9
         weekday = -1
+        days: list[int] = []
         if freq is TaskFreq.ONCE:
             run_at = self._once_at.dateTime().toPython().strftime("%Y-%m-%dT%H:%M")
         elif freq is TaskFreq.INTERVAL:
@@ -222,7 +294,9 @@ class TaskEditDialog(QDialog):
         elif freq is TaskFreq.WEEKLY:
             t = self._week_time.time()
             hour, minute = t.hour(), t.minute()
-            weekday = int(self._week_day.currentData() or 0)
+            days = self._selected_weekdays() or [0]
+            # 只勾一天时同时写老字段,方便降级到旧版本也能读
+            weekday = days[0] if len(days) == 1 else -1
         return ScheduledTask(
             name=self._name.text().strip(),
             freq=freq,
@@ -231,6 +305,8 @@ class TaskEditDialog(QDialog):
             hour=hour,
             minute=minute,
             weekday=weekday,
+            weekdays=days,
+            delay_sec=int(self._delay.value()),
             action=str(self._action.currentData() or "start_all"),
             target_hwnd=int(self._target.currentData() or 0),
             enabled=self._enabled.isChecked(),

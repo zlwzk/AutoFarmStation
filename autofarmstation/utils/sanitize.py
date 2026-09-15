@@ -88,6 +88,11 @@ def user_data_dir_display() -> str:
     return f"{PLACEHOLDER_APPDATA}\\{'AutoFarmStation'}"
 
 
+def user_log_dir_display() -> str:
+    """UI 显示用:返回 %APPDATA%\\AutoFarmStation\\logs."""
+    return f"{user_data_dir_display()}\\logs"
+
+
 def get_username() -> str:
     """获取当前用户名(返回占位符以避免日志/UI 暴露)."""
     _init()

@@ -43,6 +43,28 @@ def hline() -> QFrame:
     return f
 
 
+def with_unit(spin: QWidget, unit: str) -> QWidget:
+    """把一个数值控件和单位标签拼成一行.
+
+    单位(ms / 秒 / % / px …)放在控件**外部**作为独立标签,
+    输入框内部只留半角数字 —— 见「UI 数值输入强制规则」第 3 条。
+    传入空字符串则只返回控件本身。
+    """
+    unit = (unit or "").strip()
+    if not unit:
+        return spin
+    holder = QWidget()
+    lay = QHBoxLayout(holder)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(4)
+    lay.addWidget(spin)
+    lab = QLabel(unit)
+    lab.setStyleSheet("color:#999;")
+    lay.addWidget(lab)
+    lay.addStretch(1)
+    return holder
+
+
 def bytes_to_qimage(bgra: bytes, width: int, height: int, bpl: int) -> QImage:
     """把 BGRA 原始字节包装为 QImage."""
     from PySide6.QtGui import QImage as _QI
@@ -114,12 +136,17 @@ class NumberField(QWidget):
             self._spin.setSingleStep(step)
         else:
             self._spin.setSingleStep(int(step))
-        if suffix:
-            self._spin.setSuffix(suffix)
         self._spin.setValue(value)
         # 中转:不管 spin 发 int 还是 double,统一转 float 再 emit
         self._spin.valueChanged.connect(self._on_value_changed)
         layout.addWidget(self._spin)
+        # 单位放在输入框外部作为独立标签(不用 setSuffix,保证框内只有数字)
+        self._unit = (suffix or "").strip()
+        self._unit_label: QLabel | None = None
+        if self._unit:
+            self._unit_label = QLabel(self._unit)
+            self._unit_label.setStyleSheet("color:#999;")
+            layout.addWidget(self._unit_label)
 
     def _on_value_changed(self, v) -> None:
         self.valueChanged.emit(float(v))
