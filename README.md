@@ -2,7 +2,7 @@
 
 > 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.1.0-blue)
+![banner](https://img.shields.io/badge/version-1.4.1-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -22,7 +22,8 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
 
 ## 亮点功能
 
-- **多窗口预览**:左侧自适应网格(1/2/3/4/6 格子),实时刷新,点击聚焦对应窗口,双击最大化。
+- **窗口嵌入**:把游戏窗口收进软件内显示,桌面/任务栏不再散落窗口,一键嵌入/弹出,退出自动还原。
+- **多窗口预览**:左侧自适应网格(1/2/3/4/6 格子),GDI 实时抓帧(被遮挡也能截到),点击聚焦对应窗口,双击最大化。
 - **多窗口同步执行 / 单窗口独立执行**(核心):
   - 勾选左侧任意几个窗口 → `📡 应用当前配置` / `▶ 同步启动` / `■ 同步停止`,让它们同时跑同一套连贯操作。
   - 广播只是复制一份初始配置,**每个窗口各存一份**,之后可以分别改成互不相同的操作(窗口 A 点左边、窗口 B 点右边、窗口 C 跑键盘宏,互不干扰)。
@@ -30,12 +31,14 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
 - **连点器**:多点击点位轮询、可设随机抖动、左右中双击支持、可视化选点、每进程独立配置。
 - **键盘宏**:按键序列回放、持续按键、单键循环,任意组合。
 - **宏录制/回放**:录制鼠标 + 键盘轨迹,保存为可分享的 JSON,任意窗口回放。
+- **Steam 状态联动**:开始挂机自动把 Steam 状态切到「在线 / 离开 / 隐身」,挂机停完自动还原;
+  切换后回读本地配置确认生效。全程本地,不需要账号密码。
 - **窗口控制**:置顶、透明度、位置记忆,按进程独立配置。
 - **定时任务**:定时启停某个动作、倒计时关游戏、每日定时重启游戏。
 - **进程监控**:进程崩溃检测 + 自动重启、运行状态实时展示。
 - **预设库**:内置 10+ 个 Steam 挂机游戏预设(Melvor Idle、Universal Paperclips、Clicker Heroes、Idle Slayer、Mr. Mine、NGU IDLE、Cell to Singularity、AdVenture Capitalist、Egg, Inc. 等),一键应用最佳实践配置。
 - **统计**:每进程运行时长、点击/按键次数、累计天数。
-- **设置**:全局热键(F9 启动 / F10 停止 / Ctrl+Alt+P 急停)、截图帧率、深色/浅色主题、开机自启动、检查更新。
+- **设置**:全局热键(F9 启动 / F10 停止 / Ctrl+Alt+P 急停)、Steam 状态联动、截图帧率、深色/浅色主题、开机自启动、检查更新。
 
 ## 多窗口同步 / 单窗口独立
 
@@ -104,6 +107,30 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
    **多窗口同步挂机**:在左侧勾选要同步的窗口 → 点「📡 同步启动(勾选窗口)」,它们同时开跑。
 7. 想给某个窗口换一套不同的操作?点它的卡片把它设为当前目标,重新配一套点位再启动即可 —— 其它窗口不受影响。
 8. 想要一键启停?按 **F9** / **F10**,一键急停按 **Ctrl+Alt+P**(有勾选时 F9 只启动勾选的窗口)。
+9. 想让别人看到你在「在线」而不是挂机中消失?打开「工具 → 设置 → Steam 状态联动」,
+   选好挂机时切到哪个状态(在线 / 离开 / 隐身),挂机开始时自动切换、挂机停止后自动还原。
+
+## Steam 状态联动
+
+挂机时自动管好你的 Steam 状态,不用手动点好友状态:
+
+| 时机 | 动作 |
+|------|------|
+| 开始挂机 | 切到你设定的状态:**在线 / 离开 / 隐身** |
+| 挂机全部停止 | 还原成挂机前的状态(可在设置里关掉,改成保持不动) |
+| 手动 | 菜单「工具 → 还原 Steam 在线状态」 |
+
+实现方式(全程本地,**不需要账号密码、不联网**):
+
+1. 注册表 `HKCU\Software\Valve\Steam\ActiveProcess → ActiveUser` 取出当前登录账号;
+2. 触发 Steam 自带的 `steam://friends/status/<online|away|invisible>` 协议(等同手动点好友状态);
+3. 回读 `<Steam>\userdata\<accountid>\config\localconfig.vdf` 的 `ePersonaState` 校验是否生效。
+
+两个已知点:
+
+- **只支持「在线 / 离开 / 隐身」**:实测 `steam://friends/status/offline` 在当前 Steam 客户端不生效,
+  所以不提供「离线」;需要离线请在 Steam 里手动切。
+- 切换时 Steam 好友窗口可能**短暂浮现**,这是 `steam://` 协议的正常行为。
 
 ## 隐私
 
@@ -136,11 +163,24 @@ A:本工具只发鼠标键盘输入,不修改游戏进程、不读游戏内存�
 **Q:数据会不会上传?**
 A:不会。除非你手动点击「反馈建议」前往 GitHub Issues。
 
+**Q:Steam 状态联动会动我的账号吗?安全吗?**
+A:不会。它只是触发 Steam 自带的 `steam://friends/status/...` 协议(等于你自己点好友状态),
+再读一下本地的 `localconfig.vdf` 确认生效。不联网、不读账号密码、不碰 Steam 令牌文件。
+
+**Q:为什么状态只能选在线/离开/隐身,没有离线?**
+A:实测 `offline` 走这个协议在当前 Steam 客户端不生效(状态不会变),所以干脆不提供,
+免得出现「设置里写着离线、实际还是在线」的假功能。要离线请在 Steam 里手动切。
+
 ## 自检与开发
 
 ```bash
-python -m scripts.selftest   # 19 项自检
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包
+python -m scripts.selftest   # 20 项自检
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe)
+powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(可选)
+```
+
+打包产物带 Windows 版本资源,右键「属性 → 详细信息」可看到版本;
+构建脚本会核对 `FileVersion` 与 `autofarmstation.__version__` 是否一致,不一致直接失败。
 ```
 
 依赖:

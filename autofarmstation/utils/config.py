@@ -26,6 +26,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "minimize_to_tray": True,
         "start_minimized": False,
         "confirm_exit": True,
+        "restore_session_ask": True,  # 启动时弹框问是否恢复上次的窗口
+        # Steam 叠加层:勾选后写 %APPDATA%\Steam\steam.cfg 关闭 Shift+Tab
+        # 实际生效需要重启 Steam 客户端(配置会被 store 进程读取)
+        "disable_steam_overlay": False,
+        "steam_overlay_backup": "",  # 上次写入前的原文件内容(留空表示尚未备份)
+        "steam_overlay_applied_at": "",
     },
     "global_hotkeys": {
         "start_all": "F9",
@@ -34,10 +40,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "tracked_processes": [],  # list[dict]: {hwnd, pid, name, title, exe, added_at}
     "presets": [],  # list[dict]: 用户保存的预设
+    # 新建追踪窗口时,自动给「连点器」填充的默认参数
+    "defaults": {
+        "clicker_interval_ms": 200,
+        "clicker_jitter_ms": 30,
+        "clicker_button": "left",  # left / right / middle
+        "clicker_mode": "fixed",   # fixed / random / hold
+    },
     "settings": {
         "check_updates": True,
+        "update_check_interval_hours": 1,  # 自动检查频率:1/6/12/24
+        "last_update_check_at": "",  # ISO 时间戳,记录上次检查时间
+        "last_update_found": "",  # 上次检查发现的新版本
+        "skipped_version": "",  # 用户点过「稍后」跳过的版本,不再提示
         "auto_start_windows": False,
         "log_level": "INFO",
+    },
+    # Steam 状态联动:挂机时自动切换 Steam 在线状态,停止后还原
+    "steam": {
+        "enabled": False,
+        "farm_state": "online",  # online / away / invisible
+        "restore_previous": True,  # 挂机结束后还原挂机前的状态
+        "verify": True,  # 切换后回读本地配置校验是否生效
     },
     "stats": {
         "total_runtime_ms": 0,

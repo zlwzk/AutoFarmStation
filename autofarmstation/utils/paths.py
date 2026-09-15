@@ -86,6 +86,35 @@ def stats_path() -> Path:
     return user_data_dir() / "stats.json"
 
 
+def session_path() -> Path:
+    """上次会话快照路径(用于「是否恢复上次的窗口」)."""
+    return user_data_dir() / "session.json"
+
+
+def user_bat_dir() -> Path:
+    """%APPDATA%\\AutoFarmStation\\bats —— 用户自加的 bat 脚本."""
+    p = user_data_dir() / "bats"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def bundled_bat_dir() -> Path:
+    """内置 bat 库:PyInstaller 时指向 _MEIPASS/bat,源码运行时指向仓库根/bat."""
+    return resource_dir() / "bat"
+
+
+def steam_config_path() -> Path:
+    """Steam 的 steam.cfg 路径(平台 store 进程读取)."""
+    base = _env("APPDATA", str(Path.home() / "AppData" / "Roaming"))
+    return Path(base) / "Steam" / "steam.cfg"
+
+
+def steam_userdata_dir() -> Path:
+    """Steam 用户数据根目录(localconfig.vdf 等)."""
+    base = _env("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+    return Path(base) / "Steam" / "htmlcache"  # 占位,实际路径见具体子模块调用方
+
+
 # === 工具函数 ===
 def safe_filename(name: str) -> str:
     """把任意字符串规整为合法文件名."""

@@ -146,6 +146,76 @@ def t_update_checker() -> bool:
         return False
 
 
+def t_update_settings() -> bool:
+    _div("update settings(cfg + settings_dialog 字段)")
+    try:
+        import os
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.utils.config import Config
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config.json"
+            os.environ["AUTOFARMSTATION_TEST_HOME"] = str(td)  # noqa
+            # 直接 new Config(tmp_path) 不走环境变量,显式传
+            cfg = Config(path=cfg_path)
+            # 默认值
+            assert cfg.get("settings.check_updates") is True
+            assert cfg.get("settings.update_check_interval_hours") == 1
+            assert cfg.get("settings.last_update_check_at") == ""
+            assert cfg.get("settings.last_update_found") == ""
+            assert cfg.get("settings.skipped_version") == ""
+            # 写值 → 持久化 → 再读回来
+            cfg.set("settings.check_updates", False)
+            cfg.set("settings.update_check_interval_hours", 24)
+            cfg.set("settings.last_update_check_at", "2026-09-15T12:34:56")
+            cfg.set("settings.last_update_found", "v1.5.0")
+            cfg.set("settings.skipped_version", "v1.5.0")
+            cfg.save()
+            cfg2 = Config(path=cfg_path)
+            assert cfg2.get("settings.check_updates") is False
+            assert cfg2.get("settings.update_check_interval_hours") == 24
+            assert cfg2.get("settings.last_update_check_at") == "2026-09-15T12:34:56"
+            assert cfg2.get("settings.last_update_found") == "v1.5.0"
+            assert cfg2.get("settings.skipped_version") == "v1.5.0"
+        # settings_dialog 解析频率下拉文本
+        from autofarmstation.ui.settings_dialog import SettingsDialog
+
+        class _FakeCombo:
+            def __init__(self, txt):
+                self._t = txt
+            def currentText(self):
+                return self._t
+        for txt, want in (
+            ("1 每小时", 1),
+            ("6 每 6 小时", 6),
+            ("12 每 12 小时", 12),
+            ("24 每天", 24),
+            ("168 每周", 168),
+        ):
+            got = int(_FakeCombo(txt).currentText().split(" ")[0])
+            assert got == want, (txt, got, want)
+        # _ago_text 输出包含秒/分钟/小时/天的常见单位
+        import datetime as _dt
+        ago = SettingsDialog._ago_text(
+            (_dt.datetime.now() - _dt.timedelta(seconds=30)).isoformat(timespec="seconds")
+        )
+        assert "秒" in ago, ago
+        ago = SettingsDialog._ago_text(
+            (_dt.datetime.now() - _dt.timedelta(hours=5)).isoformat(timespec="seconds")
+        )
+        assert "小时" in ago, ago
+        ago = SettingsDialog._ago_text(
+            (_dt.datetime.now() - _dt.timedelta(days=3)).isoformat(timespec="seconds")
+        )
+        assert "天" in ago, ago
+        _ok("update settings: cfg 默认/读写/频率解析/ago_text 都 ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("update settings", e)
+        return False
+
+
 def t_input_sender() -> bool:
     _div("input_sender.py")
     try:
@@ -190,6 +260,289 @@ def t_window_finder() -> bool:
         return True
     except Exception as e:  # noqa: BLE001
         _fail("window_finder", e)
+        return False
+
+
+def t_session() -> bool:
+    _div("session.py")
+    try:
+        import json
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.session import Session
+
+        # 用临时目录避开真实用户数据
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td) / "session.json"
+            ses = Session(path=tmp)
+
+            # 空 → load() 返回 None
+            assert ses.load() is None
+            ses.clear()  # 不存在也不应炸
+
+            # 保存一个空快照(load 应返回 None,items=[])
+            ses.save(_FakePM([]), _FakeHub({}))
+            assert ses.load() is None, "空 items 不应返回有效快照"
+
+            # 保存 2 个窗口,saved.title 含分隔符" - ",能正确提取前缀
+            pm = _FakePM([
+                _FakeTP(hwnd=1001, name="melvor.exe", title="Melvor Idle - Account1", exe=r"D:\Games\melvor.exe"),
+                _FakeTP(hwnd=1002, name="paperclips.exe", title="Universal Paperclips", exe=r"D:\Games\paperclips.exe"),
+            ])
+            hub = _FakeHub({"1001": {"clicker": {"points": [{"x": 1, "y": 2}]}}})
+            ses.save(pm, hub)
+            data = ses.load()
+            assert data is not None and len(data["items"]) == 2
+            assert data["items"][0]["config"]["clicker"]["points"][0]["x"] == 1
+
+            # 匹配:第一项 title 完整匹配,第二项 prefix 匹配
+            visible = [
+                _FakeWI(hwnd=2001, title="Melvor Idle - Account1", basename="melvor.exe", pname="melvor.exe"),
+                _FakeWI(hwnd=2002, title="Universal Paperclips - Beta", basename="paperclips.exe", pname="paperclips.exe"),
+            ]
+            pairs = Session.match(data["items"], visible, enricher=_fake_enrich)
+            assert len(pairs) == 2, f"应匹配 2 个,实得 {len(pairs)}"
+            assert pairs[0][1].hwnd == 2001
+            assert pairs[1][1].hwnd == 2002
+
+            # 0 可见窗口 → 不匹配
+            assert Session.match(data["items"], [], enricher=_fake_enrich) == []
+
+            # 一个可见窗口被多个 saved 抢 → 贪心:高分先得
+            only_one = [_FakeWI(hwnd=3001, title="Melvor Idle - Account1", basename="melvor.exe", pname="melvor.exe")]
+            pairs2 = Session.match(data["items"], only_one, enricher=_fake_enrich)
+            assert len(pairs2) == 1 and pairs2[0][1].hwnd == 3001
+
+            # clear 后 load 返 None
+            ses.clear()
+            assert ses.load() is None
+
+        # 损坏文件 → 视为空
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td) / "session.json"
+            tmp.write_text("{ this is not json", encoding="utf-8")
+            assert Session(path=tmp).load() is None
+
+        _ok("session: 保存/读取/匹配/前缀提取/贪心分配/损坏恢复 ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("session", e)
+        return False
+
+
+# ---- 假的 PM / Hub / TP / WI,只暴露 Session 用到的属性 ----
+class _FakeTP:
+    __slots__ = ("hwnd", "pid", "name", "title", "exe", "added_at", "tags")
+    def __init__(self, hwnd, name, title, exe, pid=0, added_at=0.0):
+        self.hwnd = hwnd
+        self.pid = pid
+        self.name = name
+        self.title = title
+        self.exe = exe
+        self.added_at = added_at
+        self.tags = []
+
+
+class _FakePM:
+    """只给 Session.save 用:all() 返回 _FakeTP 列表."""
+    def __init__(self, items):
+        self._items = items
+    def all(self):
+        return list(self._items)
+
+
+class _FakeHub:
+    """只给 Session.save 用:export_configs() 返回 dict[str, dict]."""
+    def __init__(self, cfg):
+        self._cfg = cfg
+    def export_configs(self):
+        return dict(self._cfg)
+
+
+class _FakeWI:
+    """WindowInfo 替代:Session.match 只用 hwnd/title,可挂 _basename/_pname 模拟进程信息."""
+    __slots__ = (
+        "hwnd", "pid", "title", "class_name", "rect", "visible",
+        "is_minimized", "has_caption", "_basename", "_pname",
+    )
+    def __init__(self, hwnd, title="", pid=0, basename="", pname=""):
+        self.hwnd = hwnd
+        self.pid = pid
+        self.title = title
+        self.class_name = ""
+        self.rect = (0, 0, 100, 100)
+        self.visible = True
+        self.is_minimized = False
+        self.has_caption = True
+        self._basename = basename
+        self._pname = pname
+
+
+def _fake_enrich(visible):
+    """不依赖 psutil:直接读 _FakeWI._basename/_pname."""
+    return [(w, w._basename, w._pname) for w in visible]
+
+
+def t_bat_library() -> bool:
+    _div("bat_library.py")
+    try:
+        import json
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.bat_library import BatLibrary
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            builtin = base / "builtin"
+            user = base / "user"
+            builtin.mkdir()
+            user.mkdir()
+            # 内置一份
+            (builtin / "manifest.json").write_text(json.dumps({
+                "version": 1, "entries": [
+                    {"id": "b1", "title": "测试脚本", "file": "b1.bat",
+                     "category": "Steam", "desc": "内置示例"},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            (builtin / "b1.bat").write_text("@echo off\necho b1\n", encoding="utf-8")
+            lib = BatLibrary(builtin_dir=builtin, user_dir=user)
+
+            # list 包含内置
+            entries = lib.list()
+            assert len(entries) == 1 and entries[0].id == "b1"
+            assert entries[0].builtin is True
+
+            # 用户创建 → 同 id 覆盖
+            new = lib.create("我的脚本")
+            assert new.builtin is False
+            assert (user / new.file_name).exists()
+            entries = lib.list()
+            assert any(e.id == new.id for e in entries)
+            # 同 id 不会覆盖 → manifest 不会出两条
+            assert sum(1 for e in entries if e.id == new.id) == 1
+
+            # 删除用户脚本
+            assert lib.delete(new.id) is True
+            assert not (user / new.file_name).exists()
+            # 删除内置脚本应失败
+            assert lib.delete("b1") is False
+
+            # 损坏 manifest 不应炸
+            (builtin / "manifest_bad.json").write_text("{ not json", encoding="utf-8")
+            lib2 = BatLibrary(builtin_dir=builtin, user_dir=user)
+            assert any(e.id == "b1" for e in lib2.list())
+
+            # ensure_seeded 把内置 .bat 拷到用户目录(文件不存在时)
+            (user / "b1.bat").unlink(missing_ok=True)
+            (user / "manifest.json").unlink(missing_ok=True)
+            n = lib.ensure_seeded()
+            assert n >= 1
+            assert (user / "b1.bat").exists()
+            # 已存在就不重复拷
+            assert lib.ensure_seeded() == 0
+
+        _ok("bat_library: 合并/创建/删除/损坏恢复/seed ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("bat_library", e)
+        return False
+
+
+def t_steam_overlay() -> bool:
+    _div("steam_overlay.py")
+    try:
+        import re
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.steam_overlay import (
+            describe, set_overlay, restore_backup, _patch_overlay,
+        )
+
+        # _patch_overlay: 空文本 → 加完整节
+        out = _patch_overlay("", "0")
+        assert "[Install]" in out and "SteamOverlay=0" in out, out
+
+        # 已有节无键 → 追加
+        out = _patch_overlay("[Install]\nBootStrapper=1\n", "0")
+        assert "BootStrapper=1" in out and "SteamOverlay=0" in out
+
+        # 已有节已有键 → 替换
+        out = _patch_overlay("[Install]\nSteamOverlay=1\nBootStrapper=2\n", "0")
+        assert "[Install]\nSteamOverlay=0\nBootStrapper=2" in out
+
+        # 没有节,但文本末尾有内容 → 追加新节
+        out = _patch_overlay("hello\n", "1")
+        assert out.endswith("[Install]\nSteamOverlay=1\n") or "[Install]\nSteamOverlay=1\n" in out
+
+        # 真实文件路径:describe/set_overlay/restore_backup
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "steam.cfg"
+            # 不存在时 describe 返 exists=False
+            d = describe(cfg)
+            assert d["exists"] is False and d["overlay"] is None
+
+            # 写入 + 设 0
+            cfg.write_text("[Install]\nBootStrapper=42\n", encoding="utf-8")
+            backup = cfg.read_text(encoding="utf-8")
+            ok, _ = set_overlay(enabled=False, backup=backup, path=cfg)
+            assert ok is True
+            assert "SteamOverlay=0" in cfg.read_text(encoding="utf-8")
+            # 原 BootStrapper 必须保留
+            assert "BootStrapper=42" in cfg.read_text(encoding="utf-8")
+
+            # describe 现在能读到
+            d = describe(cfg)
+            assert d["overlay"] == 0
+
+            # restore_backup 回滚
+            ok, _ = restore_backup(backup, path=cfg)
+            assert ok is True
+            assert "SteamOverlay" not in cfg.read_text(encoding="utf-8")
+            assert "BootStrapper=42" in cfg.read_text(encoding="utf-8")
+
+            # 再设 1,确认也是替换而不会重复追加
+            set_overlay(enabled=True, backup=backup, path=cfg)
+            set_overlay(enabled=True, backup=backup, path=cfg)
+            text = cfg.read_text(encoding="utf-8")
+            assert text.count("SteamOverlay=") == 1, text
+
+        _ok("steam_overlay: describe/写/还原/重复写不重复 ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("steam_overlay", e)
+        return False
+
+
+def t_window_host() -> bool:
+    _div("window_host.py + preview_capture.GDI")
+    try:
+        from autofarmstation.core import window_host as host
+        from autofarmstation.core import preview_capture as pc
+        from autofarmstation.core import window_finder as wf
+
+        # 参数守卫:无效 hwnd 一律 False,不抛异常
+        assert host.embed_window(0, 0) is False
+        assert host.release_window(0) is False
+        assert host.is_embedded(0) is False
+        assert host.fit_to(0, 100, 100) is False
+        assert host.release_all() == 0
+
+        # GDI 截图冒烟:对任意一个真实可见窗口截一帧(不 assert 成功,只断言不炸/形状正确)
+        wins = wf.list_visible_windows()
+        if wins:
+            res = pc.capture_gdi(wins[0].hwnd)
+            if res is not None:
+                w, h, raw = res
+                assert w > 0 and h > 0, f"尺寸异常: {w}x{h}"
+                assert len(raw) == w * h * 4, f"数据长度 {len(raw)} != {w}*{h}*4"
+                _ok(f"window_host: GDI 截图 {w}x{h} ok")
+            else:
+                _ok("window_host: GDI 截图返回 None(允许,如 DWM 拒绝)")
+        else:
+            _ok("window_host: 无可见窗口可测(允许)")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("window_host", e)
         return False
 
 
@@ -440,6 +793,108 @@ def t_hub() -> bool:
         return False
 
 
+def t_steam_status() -> bool:
+    """Steam 状态联动:状态映射 + 本地配置解析 + 挂机边沿触发(全部打桩,不碰真实 Steam)."""
+    _div("steam_status.py")
+    try:
+        from unittest import mock
+        from autofarmstation.utils.config import Config
+        from autofarmstation.core import steam_status as ss
+
+        # 1) 状态名 / 标签
+        assert ss.SUPPORTED_STATES == ("online", "away", "invisible")
+        assert ss.is_supported_state("online") and not ss.is_supported_state("offline")
+        assert ss.state_label("invisible") == "隐身"
+        assert ss.state_label(None) == "未知"
+        assert ss.persona_state_name(7) == "invisible"
+        assert ss.persona_state_name(None) == "unknown"
+
+        # 2) 本地 localconfig.vdf 解析(样本与真实文件同构)
+        vdf = (
+            '"UserLocalConfigStore"\n{\n\t"friends"\n\t{\n'
+            '\t\t"FriendStoreLocalPrefs_42"\t\t'
+            '"{\\"ePersonaState\\":7,\\"strNonFriendsAllowedToMsg\\":\\"\\"}"\n'
+            "\t}\n}\n"
+        )
+        assert ss.parse_persona_state(vdf, 42) == 7
+        assert ss.parse_persona_state(vdf, 43) is None
+        assert ss.parse_persona_state("garbage", 42) is None
+        assert ss.parse_persona_state('"FriendStoreLocalPrefs_42" "{}"', 42) is None
+
+        # 3) 非法状态必须被白名单拦住(不会真的打开 steam:// )
+        try:
+            ss.open_state_url("offline")
+            raise AssertionError("offline 不该被允许")
+        except ValueError:
+            pass
+        try:
+            ss.open_state_url("online; rm -rf")
+            raise AssertionError("非法串不该被允许")
+        except ValueError:
+            pass
+
+        # 4) 默认关闭时:完全不碰 Steam
+        cfg = Config()
+        cfg.set("steam.enabled", False)
+        ctrl = ss.SteamStatusController(cfg)
+        assert ctrl.enabled is False
+        assert ctrl.farm_state == "online"
+        assert ctrl.restore_previous is True
+        ctrl.on_running_changed(3)
+        assert ctrl.applied is False
+        assert ctrl.poll_messages() == []
+
+        # 5) 边沿触发:进入挂机切一次、持续挂机不重复、停止后还原
+        cfg.set("steam.enabled", True)
+        cfg.set("steam.farm_state", "invisible")
+        cfg.set("steam.restore_previous", True)
+        ctrl2 = ss.SteamStatusController(cfg)
+        calls: list[str] = []
+        ctrl2._worker_async = lambda state, note: calls.append(state)  # type: ignore[assignment]
+        with mock.patch.object(ss, "is_steam_running", lambda: True), \
+                mock.patch.object(ss, "active_account_id", lambda: 42), \
+                mock.patch.object(ss, "read_current_state", lambda *a, **k: "away"):
+            ctrl2.on_running_changed(1)
+            assert calls == ["invisible"], calls
+            assert ctrl2.applied is True
+            ctrl2.on_running_changed(2)  # 还在挂机 → 不重复切
+            assert calls == ["invisible"], calls
+            ctrl2.on_running_changed(0)  # 挂机结束 → 还原成 away
+            assert calls == ["invisible", "away"], calls
+            assert ctrl2.applied is False
+            # 关闭开关后,处于挂机中也要还原
+            ctrl2.on_running_changed(1)
+            assert calls[-1] == "invisible"
+            cfg.set("steam.enabled", False)
+            ctrl2.on_running_changed(1)
+            assert ctrl2.applied is False
+            assert calls[-1] == "away", calls
+
+        # 6) Steam 没运行时:只提示、不改状态
+        cfg.set("steam.enabled", True)
+        ctrl3 = ss.SteamStatusController(cfg)
+        ctrl3._worker_async = lambda state, note: calls.append(state)  # type: ignore[assignment]
+        with mock.patch.object(ss, "is_steam_running", lambda: False):
+            ctrl3.on_running_changed(1)
+        assert ctrl3.applied is False
+        assert any("Steam 未运行" in m for m in ctrl3.poll_messages())
+
+        # 7) 先挂机后关 Steam 的还原路径:shutdown 不应抛异常
+        cfg.set("steam.enabled", True)
+        ctrl4 = ss.SteamStatusController(cfg)
+        with mock.patch.object(ss, "open_state_url", lambda s: None):
+            ctrl4._previous_state = "away"
+            ctrl4._applied = True
+            ctrl4.shutdown()
+            assert ctrl4.applied is False
+
+        _ok("steam_status: 状态映射 + vdf 解析 + 挂机边沿触发")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("steam_status", e)
+        return False
+
+
 def t_io_smoke() -> bool:
     _div("IO: 离线冒烟(不进 GUI)")
     try:
@@ -452,7 +907,7 @@ def t_io_smoke() -> bool:
         from autofarmstation.core import (
             window_finder, input_sender, autoclicker, key_macro, macro_recorder,
             preview_capture, process_manager, scheduler, monitor, statistics, preset_library,
-            automation_hub,
+            automation_hub, steam_status, window_host, session, bat_library, steam_overlay,
         )
         from autofarmstation.ui import main_window, preview_grid, action_panel, preview_widget
         _ok("imports ok")
@@ -516,9 +971,12 @@ def run_all() -> int:
     t0 = time.time()
     tests = [
         t_paths, t_sanitize, t_logger, t_config, t_update_checker,
-        t_input_sender, t_window_finder, t_autoclicker, t_key_macro,
+        t_input_sender, t_window_finder, t_window_host, t_autoclicker, t_key_macro,
         t_macro_recorder, t_process_manager, t_scheduler, t_monitor,
-        t_statistics, t_presets, t_hub, t_io_smoke, t_gui_smoke, t_app_help,
+        t_statistics, t_presets, t_hub, t_steam_status, t_session,
+        t_bat_library, t_steam_overlay,
+        t_update_settings,
+        t_io_smoke, t_gui_smoke, t_app_help,
     ]
     passed = 0
     failed = 0

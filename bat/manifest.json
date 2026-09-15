@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "builtin_disable_steam_overlay",
+      "title": "禁用 Steam 叠加层(Shift+Tab)",
+      "desc": "写入 %APPDATA%\\Steam\\steam.cfg 关闭 Steam Overlay。\n生效方式:重启 Steam 客户端后,新启动的游戏不会再注入 GameOverlayRenderer.dll,Shift+Tab 不再唤起叠加层。\n已运行的进程不受影响;若要还原,在本软件「设置 → Steam 状态联动」中关闭或运行「启用 Steam 叠加层」脚本。",
+      "file": "disable_steam_overlay.bat",
+      "category": "Steam",
+      "tags": ["steam", "overlay"],
+      "confirm": true,
+      "args": []
+    },
+    {
+      "id": "builtin_enable_steam_overlay",
+      "title": "启用 Steam 叠加层(默认行为)",
+      "desc": "把 %APPDATA%\\Steam\\steam.cfg 的 SteamOverlay 改回 1(默认)。\n重启 Steam 后生效。",
+      "file": "enable_steam_overlay.bat",
+      "category": "Steam",
+      "tags": ["steam", "overlay"],
+      "confirm": false,
+      "args": []
+    },
+    {
+      "id": "builtin_clear_steam_download_cache",
+      "title": "清空 Steam 下载缓存",
+      "desc": "停止 Steam 后删除 Steam\\depotcache 与 htmlcache 下的临时文件,常用于修复下载卡 0%。\n需要管理员权限(脚本内会请求 UAC)。",
+      "file": "clear_steam_download_cache.bat",
+      "category": "Steam",
+      "tags": ["steam", "cleanup"],
+      "confirm": true,
+      "args": []
+    },
+    {
+      "id": "builtin_mod_install_template",
+      "title": "[模板] 一键安装 mod",
+      "desc": "用户自定义 mod 安装脚本的起点模板 —— 编辑这个 bat,在里面写解压 / 拷贝 / 注册表命令。\n双击或在 Bat 脚本库里点「运行」即可。",
+      "file": "mod_install_template.bat",
+      "category": "模板",
+      "tags": ["template", "mod"],
+      "confirm": true,
+      "args": [
+        {"name": "source", "label": "mod 源路径", "default": "", "required": false},
+        {"name": "target", "label": "游戏安装路径", "default": "", "required": false}
+      ]
+    }
+  ]
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import webbrowser
 
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
@@ -18,7 +19,8 @@ from .. import __version__, __app_name__, __app_name_cn__, __author_handle__
 from ..core import (
     ProcessManager, ProcessMonitor, MonitorEvent, MonitorStatus,
     Scheduler, ScheduledTask, TaskFreq, Statistics,
-    PresetLibrary, Preset, AutomationHub,
+    PresetLibrary, Preset, AutomationHub, SteamStatusController,
+    Session,
 )
 from ..core import window_finder as wf
 from ..utils import config as cfg_mod
@@ -28,6 +30,8 @@ from .preview_grid import PreviewGrid
 from .action_panel import ActionPanel
 from .process_selector_dialog import ProcessSelectorDialog
 from .widgets import styled_message
+from .bat_library_dialog import BatLibraryDialog
+from ..core.bat_library import BatLibrary
 
 
 # === 全局热键监听(基于 keyboard hook) ===
@@ -95,8 +99,11 @@ class MainWindow(QMainWindow):
         self._presets = PresetLibrary(logger=self._log)
         self._sched = Scheduler(logger=self._log)
         self._monitor = ProcessMonitor(self._pm, logger=self._log)
+        self._bat_lib = BatLibrary()
         # 多窗口自动化中枢:每窗口独立配置 + 多窗口同步执行
         self._hub = AutomationHub(stats=self._stats, logger=self._log)
+        # Steam 状态联动:挂机时自动切状态,停完再还原
+        self._steam = SteamStatusController(self._cfg, self._log)
         self._pm.on_change(self._on_pm_change)
 
         # 全局热键
@@ -122,10 +129,15 @@ class MainWindow(QMainWindow):
 
         # 加载持久化
         self._load_state()
-        # 检查更新
+        # 跨启动的窗口快照(独立于 config):启动后弹框问是否恢复上次窗口
+        self._session = Session()
+        self._restore_asked = False
+        QTimer.singleShot(800, self._maybe_prompt_restore_session)
+        # 检查更新 — 用 cfg 里的频率(默认每小时)
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._periodic_update_check)
-        self._update_timer.start(60 * 60 * 1000)  # 每小时
+        interval_h = max(1, int(self._cfg.get("settings.update_check_interval_hours", 1)))
+        self._update_timer.start(interval_h * 3600 * 1000)
         QTimer.singleShot(3000, self._periodic_update_check)
 
         # 退出时保存
@@ -140,12 +152,19 @@ class MainWindow(QMainWindow):
                 return
         self._save_state()
         try:
+            self._steam.shutdown()
             self._hub.stop_all()
             self._monitor.stop()
             self._sched.stop()
             self._hotkeys.stop()
             self._stats.on_session_end()
             self._stats.save()
+        except Exception:
+            pass
+        # 还原所有嵌入窗口,避免退出后游戏窗口跟着消失
+        try:
+            from ..core import window_host
+            window_host.release_all()
         except Exception:
             pass
         super().closeEvent(ev)
@@ -187,8 +206,17 @@ class MainWindow(QMainWindow):
         # 工具
         menu_tool = mb.addMenu("工具(&T)")
         a_settings = QAction("设置...", self)
+        a_settings.setShortcut("Ctrl+,")
         a_settings.triggered.connect(self._on_open_settings)
         menu_tool.addAction(a_settings)
+        a_bat = QAction("Bat 脚本库...", self)
+        a_bat.setShortcut("Ctrl+B")
+        a_bat.triggered.connect(self._on_open_bat_library)
+        menu_tool.addAction(a_bat)
+        menu_tool.addSeparator()
+        a_steam = QAction("还原 Steam 在线状态", self)
+        a_steam.triggered.connect(self._on_restore_steam)
+        menu_tool.addAction(a_steam)
         a_update = QAction("检查更新", self)
         a_update.triggered.connect(lambda: self._do_update_check(show_dialog=True))
         menu_tool.addAction(a_update)
@@ -464,7 +492,16 @@ class MainWindow(QMainWindow):
             txt += f" · 运行:{len(running)}"
         if sel:
             txt += f" · 已选:{sel}"
+        if self._steam.applied:
+            txt += " · Steam已切"
         self._process_count_label.setText(txt)
+        # Steam 状态联动:边沿触发(运行数 0↔N 时切一次)
+        try:
+            self._steam.on_running_changed(len(running))
+            for msg in self._steam.poll_messages():
+                self._statusBar().showMessage(f"[Steam] {msg}", 6000)  # type: ignore[union-attr]
+        except Exception as e:  # noqa: BLE001
+            self._log.debug("Steam 状态联动出错: %s", e)
 
     # --- 持久化 ---
     def _save_state(self) -> None:
@@ -476,29 +513,127 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log.debug("保存自动化配置失败: %s", e)
         self._cfg.save()
+        # 跨启动窗口快照(独立:启动时按 exe+title 匹配当前可见窗口)
+        try:
+            self._session.save(self._pm, self._hub)
+        except Exception as e:
+            self._log.debug("保存 session 快照失败: %s", e)
 
     def _load_state(self) -> None:
-        lst = self._cfg.get("tracked_processes", []) or []
-        self._pm.import_list(lst)
-        # 清理已失效的
-        gone = self._pm.refresh()
-        if gone:
-            # 移除失效条目
-            for h in gone:
-                self._pm.remove(h)
-        # 恢复自动化配置(仅保留仍存在的窗口)
+        # 不再从 config 恢复 tracked_processes/automation_configs:
+        # hwnd 跨启动失效,这些字段在程序运行期内由 _save_state 自然维护。
+        # 跨启动恢复改走 Session(由 _maybe_prompt_restore_session 处理)。
+        pass
+
+    # --- 启动恢复上次窗口 ---
+    def _maybe_prompt_restore_session(self) -> None:
+        """首次启动后异步检查 session.json,匹配当前可见窗口,弹框询问是否恢复."""
+        if self._restore_asked:
+            return
+        self._restore_asked = True
         try:
-            saved = self._cfg.get("automation_configs", {}) or {}
-            alive = {str(tp.hwnd) for tp in self._pm.all()}
-            self._hub.import_configs({k: v for k, v in saved.items() if k in alive})
+            data = self._session.load()
         except Exception as e:
-            self._log.debug("恢复自动化配置失败: %s", e)
+            self._log.warning("加载 session 快照失败: %s", e)
+            return
+        if not data:
+            return
+        saved_items = data.get("items") or []
+        if not saved_items:
+            return
+        # 用户在设置里关掉了「每次询问恢复」
+        if not self._cfg.get("ui.restore_session_ask", True):
+            return
+        # 取当前可见窗口(过滤掉本程序自身)
+        try:
+            visible = [
+                w for w in wf.list_visible_windows()
+                if __app_name_cn__ not in (w.title or "")
+            ]
+        except Exception as e:
+            self._log.warning("枚举可见窗口失败: %s", e)
+            return
+        pairs = Session.match(saved_items, visible)
+        if not pairs:
+            # 上次有窗口但现在一个都没找到 → 自动清掉,不再打扰
+            self._session.clear()
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                "上次的窗口已不在桌面上,无需恢复", 4000,
+            )
+            return
+        # 弹框询问
+        matched = len(pairs)
+        total = len(saved_items)
+        missed = total - matched
+        title = "恢复上次的窗口"
+        msg = (
+            f"上次关闭时共追踪 {total} 个窗口。\n"
+            f"在当前桌面上匹配到 {matched} 个"
+            + (f",还有 {missed} 个未找到(可能未启动)。" if missed else "。")
+            + "\n\n是否把它们自动加回来并套用上次的连点/宏配置?"
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(title)
+        box.setText(msg)
+        yes = box.addButton("恢复", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("不恢复", QMessageBox.ButtonRole.NoRole)
+        never = box.addButton("不再提示", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is yes:
+            self._do_restore_session(pairs)
+        elif clicked is never:
+            self._cfg.set("ui.restore_session_ask", False)
+            self._cfg.save()
+            self._session.clear()
+        else:
+            # 「不恢复」保留文件,下次启动仍会问(用户可改主意)
+            pass
+
+    def _do_restore_session(self, pairs: list[tuple[dict, wf.WindowInfo]]) -> None:
+        """按匹配结果把窗口加回来 + 套用保存的连点/宏配置."""
+        added = 0
+        new_configs: dict[str, dict] = {}
+        for s, w in pairs:
+            tp = self._pm.add_by_hwnd(w.hwnd)
+            if tp is None:
+                continue
+            added += 1
+            cfg = (s.get("config") or {}) if isinstance(s, dict) else {}
+            if cfg:
+                new_configs[str(int(w.hwnd))] = cfg
+        if new_configs:
+            try:
+                self._hub.import_configs(new_configs)
+            except Exception as e:
+                self._log.warning("恢复配置失败: %s", e)
+        self._save_state()
+        self._refresh_status()
+        self._statusBar().showMessage(  # type: ignore[union-attr]
+            f"已恢复 {added} 个窗口(套用上次配置)", 4000,
+        )
+
+    # --- Steam 状态 ---
+    def _on_restore_steam(self) -> None:
+        """手动把 Steam 状态还原成挂机前的值."""
+        if self._steam.restore_if_needed(reason="手动还原"):
+            self._statusBar().showMessage("已请求还原 Steam 状态", 3000)  # type: ignore[union-attr]
+        else:
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                f"[Steam] {self._steam.describe()}", 5000)
+        self._refresh_status()
 
     # --- 设置 ---
     def _on_open_settings(self) -> None:
         from .settings_dialog import SettingsDialog
         dlg = SettingsDialog(self._cfg, self)
         dlg.exec()
+
+    def _on_open_bat_library(self) -> None:
+        dlg = BatLibraryDialog(self._bat_lib, self)
+        dlg.show()
 
     def _on_about(self) -> None:
         from ..__init__ import PROJECT_DESCRIPTION, PROJECT_TAGLINE
@@ -556,20 +691,88 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True, name="UpdateCheck").start()
 
     def _on_update_done(self, info: UpdateInfo, show_dialog: bool) -> None:
+        import datetime as _dt
+        ts = _dt.datetime.now().isoformat(timespec="seconds")
+        self._cfg.set("settings.last_update_check_at", ts)
         if info.error:
+            self._cfg.save()
             if show_dialog:
-                QMessageBox.warning(self, "检查更新", f"检查失败:{info.error}")
+                QMessageBox.warning(
+                    self, "检查更新",
+                    f"检查失败:{info.error}\n\n下次按设置频率自动重试。",
+                )
             return
+        skipped = self._cfg.get("settings.skipped_version", "")
         if info.has_update:
-            r = QMessageBox.question(
-                self, "发现新版本",
-                f"发现新版本 {info.latest_version}(当前 v{info.current_version})。\n\n"
-                f"是否前往下载?\n{info.release_url}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if r == QMessageBox.StandardButton.Yes:
-                import webbrowser
-                webbrowser.open(info.release_url)
-        else:
+            self._cfg.set("settings.last_update_found", info.latest_version)
+            self._cfg.save()
+            # 跳过被「稍后」忽略的版本
+            if not show_dialog and skipped == info.latest_version:
+                return
+            # 静默检查 → 用顶部横幅,不打断用户
             if show_dialog:
-                QMessageBox.information(self, "检查更新", f"已是最新版本(v{info.current_version})")
+                r = QMessageBox.question(
+                    self, "发现新版本",
+                    f"发现新版本 v{info.latest_version}(当前 v{info.current_version})。\n\n"
+                    f"更新说明(摘要):\n{info.release_notes[:400]}\n\n"
+                    f"是否前往下载?\n{info.release_url}",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No
+                    | QMessageBox.StandardButton.Ignore,
+                )
+                if r == QMessageBox.StandardButton.Yes:
+                    import webbrowser
+                    webbrowser.open(info.release_url)
+                elif r == QMessageBox.StandardButton.Ignore:
+                    self._cfg.set("settings.skipped_version", info.latest_version)
+                    self._cfg.save()
+            else:
+                self._show_update_banner(info)
+        else:
+            self._cfg.set("settings.last_update_found", "")
+            self._cfg.set("settings.skipped_version", "")
+            self._cfg.save()
+            if show_dialog:
+                QMessageBox.information(
+                    self, "检查更新",
+                    f"当前 v{info.current_version} 已是最新版本。",
+                )
+
+    def _show_update_banner(self, info: UpdateInfo) -> None:
+        """在状态栏上方贴一个非模态横幅,不打扰."""
+        bar = getattr(self, "_update_banner", None)
+        if bar is not None:
+            bar.close()
+            bar.deleteLater()
+        from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
+        bar = QFrame(self)
+        bar.setObjectName("UpdateBanner")
+        bar.setStyleSheet(
+            "QFrame#UpdateBanner { background:#3a3a00; border:1px solid #888800;"
+            " border-radius:6px; padding:4px; }"
+            "QLabel { color:#ffe; }"
+            "QPushButton { color:#ffe; background:#666600; border:none;"
+            " padding:4px 10px; border-radius:3px; }"
+            "QPushButton:hover { background:#888800; }"
+        )
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(8)
+        lbl = QLabel(
+            f"发现新版本 v{info.latest_version}"
+            f"(当前 v{info.current_version})"
+        )
+        h.addWidget(lbl, stretch=1)
+        btn_dl = QPushButton("去下载")
+        btn_dl.clicked.connect(lambda: (webbrowser.open(info.release_url), bar.close()))
+        h.addWidget(btn_dl)
+        btn_close = QPushButton("✕")
+        btn_close.setFixedWidth(28)
+        btn_close.clicked.connect(bar.close)
+        h.addWidget(btn_close)
+        # 插到主布局顶部
+        layout = self.layout()
+        if layout is not None:
+            layout.insertWidget(0, bar)
+        self._update_banner = bar
+        bar.show()

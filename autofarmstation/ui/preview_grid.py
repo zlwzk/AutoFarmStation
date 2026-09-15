@@ -208,10 +208,10 @@ class PreviewGrid(QWidget):
                 w.deleteLater()
                 if self._hub:
                     self._hub.forget(hwnd)
-        # 新增
-        for it in items:
+        # 新增(phase 错峰:多开时各窗口截图时刻错开,避免同一瞬间抢 GDI)
+        for idx, it in enumerate(items):
             if it.hwnd not in self._items:
-                w = PreviewWidget(it.hwnd, fps=self._fps)
+                w = PreviewWidget(it.hwnd, fps=self._fps, phase=idx * 0.13)
                 w.selection_changed.connect(self._on_card_selection_changed)
                 self._items[it.hwnd] = w
         # 空提示

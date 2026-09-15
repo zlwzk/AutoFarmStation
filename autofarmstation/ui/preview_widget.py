@@ -1,11 +1,18 @@
-"""单个窗口预览卡片."""
+"""单个窗口预览卡片.
+
+支持:
+- 勾选(用于「多窗口同步执行」)
+- 实时画面预览(GDI PrintWindow,被遮挡也能截到)
+- **窗口嵌入**:点击「嵌入」把原窗口收进卡片内显示,桌面上不再单独出现;
+  再点「弹出」完整还原。卡片关闭/程序退出时自动还原。
+"""
 
 from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, QSize, Signal, QTimer
-from PySide6.QtGui import QImage, QPainter, QPixmap, QColor, QFont
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QFrame, QSizePolicy, QCheckBox,
@@ -13,21 +20,26 @@ from PySide6.QtWidgets import (
 
 from ..core.preview_capture import PreviewCapture, PreviewFrame
 from ..core import window_finder as wf
+from ..core import window_host
 from .widgets import styled_message
 
 
 class PreviewWidget(QFrame):
-    """单个窗口预览卡片.
-
-    支持勾选(用于「多窗口同步执行」):勾上的窗口会被一起施加同一套操作。
-    """
+    """单个窗口预览卡片(可勾选 / 可嵌入)."""
 
     focused = Signal(int)  # hwnd
     closed = Signal(int)  # hwnd(请求从追踪列表移除)
     autoclick_toggle = Signal(int)  # hwnd
     selection_changed = Signal(int, bool)  # hwnd, 是否选中
 
-    def __init__(self, hwnd: int, *, fps: float = 1.0, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        hwnd: int,
+        *,
+        fps: float = 1.0,
+        phase: float = 0.0,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.hwnd = int(hwnd)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -37,11 +49,12 @@ class PreviewWidget(QFrame):
             "#PreviewCard:hover { border: 2px solid #4a9eff; }"
         )
         self.setMinimumSize(220, 180)
-        self._capture = PreviewCapture(self.hwnd, fps=fps)
+        self._capture = PreviewCapture(self.hwnd, fps=fps, phase=phase)
         self._capture.on_frame = self._on_frame
         self._autoclicker_running = False
         self._fps = fps
         self._status_extra = ""
+        self._embedded = False
 
         v = QVBoxLayout(self)
         v.setContentsMargins(4, 4, 4, 4)
@@ -64,8 +77,18 @@ class PreviewWidget(QFrame):
         self._title_lab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         title_bar.addWidget(self._title_lab)
 
+        self._btn_embed = QPushButton("嵌入")
+        self._btn_embed.setCheckable(True)
+        self._btn_embed.setFixedWidth(44)
+        self._btn_embed.setToolTip(
+            "把原窗口收进这张卡片里显示(桌面/任务栏上不再单独出现),\n"
+            "画面直接可见可操作;再点「弹出」还原到桌面。"
+        )
+        self._btn_embed.toggled.connect(self._on_embed_toggled)
+        title_bar.addWidget(self._btn_embed)
+
         self._btn_focus = QPushButton("聚焦")
-        self._btn_focus.setFixedWidth(48)
+        self._btn_focus.setFixedWidth(44)
         self._btn_focus.clicked.connect(self._on_focus_clicked)
         title_bar.addWidget(self._btn_focus)
 
@@ -76,7 +99,7 @@ class PreviewWidget(QFrame):
         title_bar.addWidget(self._btn_close)
         v.addLayout(title_bar)
 
-        # 预览图
+        # 预览图(同时也是嵌入容器)
         self._image_lab = QLabel()
         self._image_lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._image_lab.setStyleSheet("background:#000; color:#888;")
@@ -122,6 +145,9 @@ class PreviewWidget(QFrame):
     def set_selected(self, on: bool) -> None:
         self._chk.setChecked(bool(on))
 
+    def is_embedded(self) -> bool:
+        return self._embedded
+
     def set_autoclicker_state(self, running: bool) -> None:
         """由 main_window 在连点器状态变化时同步."""
         self._autoclicker_running = running
@@ -138,8 +164,69 @@ class PreviewWidget(QFrame):
         self._refresh_status()
 
     def stop(self) -> None:
+        """卡片销毁前调用:必须先还原嵌入窗口,再停截图."""
+        self._release_embed(quiet=True)
         self._capture.stop()
         self._refresh_timer.stop()
+
+    # --- 嵌入 ---
+    def _on_embed_toggled(self, on: bool) -> None:
+        if on:
+            if not self._do_embed():
+                self._btn_embed.blockSignals(True)
+                self._btn_embed.setChecked(False)
+                self._btn_embed.blockSignals(False)
+        else:
+            self._release_embed()
+
+    def _do_embed(self) -> bool:
+        """把原窗口收进预览区."""
+        info = wf.get_window_info(self.hwnd)
+        if info is None:
+            return False
+        if window_host.is_embedded(self.hwnd):
+            return True
+        # 保证原生句柄存在
+        container = int(self._image_lab.winId())
+        ok = window_host.embed_window(self.hwnd, container)
+        if not ok:
+            return False
+        self._embedded = True
+        self._capture.stop()  # 画面直接可见,截图线程省掉
+        self._image_lab.setText("")
+        self._image_lab.setPixmap(QPixmap())
+        self._image_lab.installEventFilter(self)
+        self._btn_embed.setText("弹出")
+        self._refresh_status()
+        return True
+
+    def _release_embed(self, quiet: bool = False) -> None:
+        """把窗口还原回桌面."""
+        self._image_lab.removeEventFilter(self)
+        if window_host.release_window(self.hwnd) or self._embedded:
+            self._embedded = False
+            self._btn_embed.blockSignals(True)
+            self._btn_embed.setChecked(False)
+            self._btn_embed.blockSignals(False)
+            self._btn_embed.setText("嵌入")
+            self._image_lab.setText("(无图像)")
+            self._capture.start()
+            if not quiet:
+                self._refresh_status()
+
+    def eventFilter(self, obj, ev) -> bool:  # noqa: N802
+        """嵌入窗口跟随容器尺寸变化(逻辑像素 → 物理像素)."""
+        if obj is self._image_lab and self._embedded and ev.type() == QEvent.Type.Resize:
+            try:
+                dpr = self.devicePixelRatioF()
+                window_host.fit_to(
+                    self.hwnd,
+                    int(ev.size().width() * dpr),
+                    int(ev.size().height() * dpr),
+                )
+            except Exception:
+                pass
+        return super().eventFilter(obj, ev)
 
     # --- 内部 ---
     def _on_check_toggled(self, on: bool) -> None:
@@ -160,9 +247,12 @@ class PreviewWidget(QFrame):
         QTimer.singleShot(0, lambda: self._render_frame(frame))
 
     def _render_frame(self, frame: PreviewFrame) -> None:
+        if self._embedded:
+            return
         try:
+            # GDI 的 BGRA 数据,alpha 字节不可靠 → 用 BGRX8888 忽略 alpha
             img = QImage(frame.pixels, frame.width, frame.height, frame.bytes_per_line,
-                         QImage.Format.Format_BGR888)
+                         QImage.Format.Format_BGRX8888)
             pix = QPixmap.fromImage(img)
             target = self._image_lab.size()
             scaled = pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
@@ -173,7 +263,7 @@ class PreviewWidget(QFrame):
 
     def _refresh_status(self) -> None:
         info = wf.get_window_info(self.hwnd)
-        if info is None or not info.visible:
+        if info is None:
             self._title_lab.setText("[已失效]")
             self._title_lab.setStyleSheet("color:#888;")
             self._status_lab.setText(styled_message("窗口已失效", level="warn"))
@@ -189,16 +279,23 @@ class PreviewWidget(QFrame):
         h = int(runtime // 3600)
         m = int((runtime % 3600) // 60)
         s = int(runtime % 60)
-        msg = f"已追踪 {h:02d}:{m:02d}:{s:02d} · {self._fps:.1f}fps"
+        prefix = "已嵌入 · " if self._embedded else ""
+        msg = f"{prefix}已追踪 {h:02d}:{m:02d}:{s:02d}"
+        if not self._embedded:
+            msg += f" · {self._fps:.1f}fps"
         if self._status_extra:
             msg = f"● {self._status_extra} · " + msg
         self._status_lab.setText(msg)
 
     def _on_image_click(self, ev) -> None:
+        if self._embedded:
+            return  # 嵌入时点击直接作用于游戏,不再抢前台
         if ev.button() == Qt.MouseButton.LeftButton:
             self._do_focus()
 
     def _on_image_dblclick(self, ev) -> None:
+        if self._embedded:
+            return  # 嵌入时最大化会破坏卡片布局
         if ev.button() == Qt.MouseButton.LeftButton:
             info = wf.get_window_info(self.hwnd)
             if info is None:
@@ -212,7 +309,8 @@ class PreviewWidget(QFrame):
         self._do_focus()
 
     def _do_focus(self) -> None:
-        wf.set_foreground(self.hwnd)
+        if not self._embedded:
+            wf.set_foreground(self.hwnd)
         self.focused.emit(self.hwnd)
 
     def _on_autoclick_toggle(self, checked: bool) -> None:
