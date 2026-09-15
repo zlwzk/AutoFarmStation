@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QCheckBox, QComboBox, QLineEdit, QDialogButtonBox, QPushButton, QLabel,
     QMessageBox, QDoubleSpinBox, QSpinBox, QSlider, QScrollArea, QWidget,
-    QTimeEdit, QFileDialog,
+    QTimeEdit, QFileDialog, QProgressDialog,
 )
 
 from ..core import audio
@@ -589,6 +589,13 @@ class SettingsDialog(QDialog):
         btn_check_now = QPushButton("立即检查")
         btn_check_now.clicked.connect(self._on_check_now)
         rowh.addWidget(btn_check_now)
+        btn_update_now = QPushButton("立即更新")
+        btn_update_now.setToolTip(
+            "下载最新版 exe 并自动替换当前程序,完成后自动重启。\n"
+            "只在打包后的 exe 上生效(源码运行请用「立即检查 → 前往下载」)。"
+        )
+        btn_update_now.clicked.connect(self._on_update_now)
+        rowh.addWidget(btn_update_now)
         pf.addRow("上次检查:", rowh)
 
         self._skipped_label = QLabel("")
@@ -685,6 +692,132 @@ class SettingsDialog(QDialog):
             )
         self._cfg.save()
         self._refresh_update_status()
+
+    # --- 立即更新:下载 + 替换 + 自动重启 ---
+    def _on_update_now(self) -> None:
+        """检查 → 确认 → 下载(进度条)→ 写 cfg → 关闭主窗口(触发 swap helper)。"""
+        # 1) 拿 release 元信息(走 update_checker.check,带 download_url)
+        from ..utils.update_checker import check as check_update
+        info = check_update()
+        if info.error:
+            QMessageBox.warning(
+                self, "检查失败",
+                f"无法连接到 GitHub 检查更新:\n{info.error}",
+            )
+            return
+        if not info.has_update:
+            QMessageBox.information(
+                self, "已是最新",
+                f"当前 v{info.current_version} 已是最新,无需更新。",
+            )
+            return
+        if not info.download_url:
+            QMessageBox.warning(
+                self, "无法更新",
+                f"远端 v{info.latest_version} 的 release 没有提供 .exe 资产,\n"
+                "请用「立即检查 → 前往下载」手动处理。\n\n{info.release_url}",
+            )
+            return
+
+        # 2) 源码运行提前告知
+        import sys as _sys
+        if not getattr(_sys, "frozen", False):
+            r = QMessageBox.question(
+                self, "源码运行",
+                "检测到当前是源码运行,无法自动替换 exe。\n"
+                "是否打开 release 页面手动下载新版本?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if r == QMessageBox.StandardButton.Yes:
+                import webbrowser
+                webbrowser.open(info.release_url)
+            return
+
+        # 3) 确认对话框
+        size_mb = (info.asset_size or 0) / 1024 / 1024
+        size_txt = f"{size_mb:.1f} MB" if size_mb else "未知大小"
+        confirm = QMessageBox(self)
+        confirm.setIcon(QMessageBox.Icon.Question)
+        confirm.setWindowTitle("确认更新")
+        confirm.setText(
+            f"下载 v{info.latest_version} 的新版 exe({size_txt}),"
+            f"覆盖当前 v{info.current_version} 后自动重启。\n\n"
+            f"更新说明(摘要):\n{info.release_notes[:400]}"
+        )
+        confirm.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        confirm.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if confirm.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        # 4) 进度条对话框(模态、可取消)
+        progress = QProgressDialog(
+            f"正在下载 v{info.latest_version} ...", "取消", 0, 100, self,
+        )
+        progress.setWindowTitle("立即更新")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        # 5) 真正下载(阻塞 + 进度回调)
+        from ..utils.updater import download_and_apply_release, ApplyResult
+        apply_result: ApplyResult = ApplyResult(ok=False)
+
+        def _progress(recv: int, total: int) -> None:
+            if total <= 0:
+                progress.setLabelText(f"正在下载 v{info.latest_version} ...")
+                progress.setRange(0, 0)  # 不确定大小 → 转圈
+            else:
+                pct = max(0, min(100, int(recv * 100 / total)))
+                progress.setValue(pct)
+                mb = recv / 1024 / 1024
+                tot_mb = total / 1024 / 1024
+                progress.setLabelText(
+                    f"正在下载 v{info.latest_version} ... {mb:.1f}/{tot_mb:.1f} MB"
+                )
+
+        def _cancel() -> bool:
+            return progress.wasCanceled()
+
+        try:
+            apply_result = download_and_apply_release(
+                info,
+                progress_cb=_progress,
+                cancel_cb=_cancel,
+                log=getattr(self.parent(), "_log", None) if self.parent() else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            apply_result = ApplyResult(ok=False, error=f"更新失败:{e}")
+        finally:
+            progress.close()
+
+        if not apply_result.ok:
+            QMessageBox.warning(
+                self, "更新失败",
+                f"{apply_result.error}\n\n可以稍后重试,或用「立即检查 → 前往下载」手动处理。",
+            )
+            return
+
+        # 6) 写 cfg → 关闭主窗口(主窗口 closeEvent 会 spawn swap helper)
+        self._cfg.set("settings.pending_update_path", apply_result.downloaded_to)
+        self._cfg.set("settings.pending_update_target_exe", apply_result.target_exe)
+        self._cfg.set("settings.last_update_check_at",
+                      datetime.datetime.now().isoformat(timespec="seconds"))
+        self._cfg.set("settings.last_update_found", info.latest_version)
+        self._cfg.save()
+        self._refresh_update_status()
+
+        # 主窗口存不存在决定「关谁」
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "close"):
+            # 直接调 close,会走 closeEvent(skip 确认 / skip 杀游戏)
+            parent.close()
+        else:
+            # 兜底:settings_dialog 自身 accept,启动器再起时会读到 pending_update_path
+            import sys
+            sys.exit(0)
 
     def _build_paths_group(self, parent_layout: QVBoxLayout) -> None:
         box = QGroupBox("数据位置与备份")

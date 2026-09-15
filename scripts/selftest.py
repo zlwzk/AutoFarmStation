@@ -1546,6 +1546,163 @@ def t_focus_with_margins_and_auto_click() -> bool:
         return False
 
 
+def t_updater_helpers() -> bool:
+    _div("updater.py(立即更新按钮的纯逻辑)")
+    try:
+        from autofarmstation.utils import updater
+        from autofarmstation.utils.paths import temp_dir
+        from autofarmstation.__init__ import __version__
+
+        # 1) current_exe_path 在源码运行下返回 None(无法自动替换)
+        if updater.current_exe_path() is not None:
+            raise AssertionError("源码运行 current_exe_path 应该返回 None")
+        # 强制冻结模拟一下:sys.frozen = True → 返回 sys.executable
+        import sys as _sys
+        orig_frozen = getattr(_sys, "frozen", False)
+        orig_exec = _sys.executable
+        try:
+            _sys.frozen = True
+            _sys.executable = "C:/fake/AutoFarmStation.exe"
+            p = updater.current_exe_path()
+            assert p is not None and str(p).endswith(".exe"), p
+        finally:
+            if orig_frozen:
+                _sys.frozen = orig_frozen
+            else:
+                try:
+                    del _sys.frozen
+                except AttributeError:
+                    pass
+            _sys.executable = orig_exec
+
+        # 2) _pending_dest:版本号 v 前缀、特殊字符都该规整
+        dest = updater._pending_dest(Path("C:/fake/x.exe"), "v1.6.3")
+        assert dest.parent == temp_dir(), dest
+        assert "v1.6.3" in dest.name or "1.6.3" in dest.name, dest
+        # 路径分隔符 / 反斜杠都该被替换
+        dest2 = updater._pending_dest(Path("C:/fake/x.exe"), "v1\\6/3")
+        assert "\\" not in dest2.name and "/" not in dest2.name, dest2
+
+        # 3) build_fake_release:有 download_url / asset_size
+        info = updater.build_fake_release()
+        assert info.download_url and info.asset_size > 0
+        assert info.has_update is True
+
+        # 4) SWAP_HELPER_PS1:参数齐全 + 关键命令都有
+        s = updater.SWAP_HELPER_PS1
+        assert "param(" in s and "$ParentPid" in s and "$NewExe" in s and "$TargetExe" in s
+        assert "Wait-Process" in s, "应有 Wait-Process 等父进程退出"
+        assert "Copy-Item" in s and "-Force" in s, "应有 Copy-Item -Force 覆盖"
+        assert "Start-Process" in s, "应有 Start-Process 启动新版本"
+        # 关键退出码 0/1/2/3/4 都有
+        for code in (0, 1, 2, 3, 4):
+            assert f"exit {code}" in s, f"缺少 exit {code}"
+
+        # 5) download_with_progress:对 file:// URL 也能跑通,能取消、能回调
+        import http.server
+        import threading as _th
+        import socket as _socket
+
+        # 起一个一次性 HTTP 服务,返回 64KB 的随机数据
+        payload = bytes(range(256)) * 256  # 65536 bytes
+        served = []
+
+        class _H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Content-Type", "application/octet-stream")
+                self.end_headers()
+                self.wfile.write(payload)
+                served.append(self.path)
+            def log_message(self, *_a, **_k):  # noqa: N802
+                pass
+
+        # 找一个空闲端口
+        with _socket.socket() as s_:
+            s_.bind(("127.0.0.1", 0))
+            port = s_.getsockname()[1]
+        httpd = http.server.HTTPServer(("127.0.0.1", port), _H)
+        th = _th.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                dest3 = Path(td) / "out.bin"
+                seen = []
+                updater.download_with_progress(
+                    f"http://127.0.0.1:{port}/x.bin", dest3,
+                    progress_cb=lambda r, t: seen.append((r, t)),
+                    cancel_cb=lambda: False,
+                )
+                assert dest3.read_bytes() == payload, "内容对不上"
+                assert seen and seen[-1][0] == len(payload), seen
+                assert seen[-1][1] == len(payload), seen
+                # 取消路径:立刻 cancel_cb()=True → 应该抛
+                dest4 = Path(td) / "out_cancel.bin"
+                try:
+                    updater.download_with_progress(
+                        f"http://127.0.0.1:{port}/x.bin", dest4,
+                        cancel_cb=lambda: True,
+                    )
+                except updater._DownloadCancelled:
+                    pass
+                else:
+                    raise AssertionError("取消应该抛 _DownloadCancelled")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+        _ok("updater: current_exe_path / 临时路径 / PS1 脚本 / file download + cancel")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("updater_helpers", e)
+        return False
+
+
+def t_updater_apply_pending_no_pending() -> bool:
+    _div("updater.apply_pending_update:无 pending 时返回 False")
+    try:
+        import tempfile
+        from autofarmstation.utils.config import Config
+        from autofarmstation.utils import updater
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Config(path=Path(td) / "config.json")
+            assert cfg.get("settings.pending_update_path", "") == ""
+            assert cfg.get("settings.pending_update_target_exe", "") == ""
+            assert updater.apply_pending_update(cfg, None) is False
+        _ok("updater.apply_pending_update(empty) -> False")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("updater_apply_pending_no_pending", e)
+        return False
+
+
+def t_updater_apply_pending_cleans_missing() -> bool:
+    _div("updater.apply_pending_update:pending 指向不存在的文件 → 清掉 + False")
+    try:
+        import tempfile
+        from autofarmstation.utils.config import Config
+        from autofarmstation.utils import updater
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Config(path=Path(td) / "config.json")
+            cfg.set("settings.pending_update_path", "C:/no/such/file.exe")
+            cfg.set("settings.pending_update_target_exe", "C:/fake/target.exe")
+            cfg.save()
+            ok = updater.apply_pending_update(cfg, None)
+            assert ok is False
+            # pending 已被清掉
+            cfg2 = Config(path=Path(td) / "config.json")
+            assert cfg2.get("settings.pending_update_path") == ""
+            assert cfg2.get("settings.pending_update_target_exe") == ""
+        _ok("updater.apply_pending_update(缺文件) 清 cfg + 返回 False")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("updater_apply_pending_cleans_missing", e)
+        return False
+
+
 # === 入口 ===
 def run_all() -> int:
     t0 = time.time()
@@ -1564,7 +1721,10 @@ def run_all() -> int:
                 t_theme_actually_applies, t_language_placeholder_disabled,
                 t_default_clicker_params_applied, t_farm_window_guard,
                 t_user_bats_persist, t_builtin_manifest_merges,
-            ]
+                # v1.6.3 新增(立即更新按钮)
+                t_updater_helpers, t_updater_apply_pending_no_pending,
+                t_updater_apply_pending_cleans_missing,
+    ]
     passed = 0
     failed = 0
     for t in tests:

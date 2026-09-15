@@ -32,7 +32,23 @@ class UpdateInfo:
     current_version: str
     release_url: str
     release_notes: str
+    # 新增(供「立即更新」按钮用):首个 .exe 资产的直接下载 URL / 大小 / 文件名。
+    # 可能为空(没有 .exe 资产 / 没联网 / 没找到匹配)。
+    download_url: str = ""
+    asset_name: str = ""
+    asset_size: int = 0
     error: str = ""
+
+
+def _pick_exe_asset(assets: list) -> tuple[str, str, int]:
+    """从 release['assets'] 里挑第一个 .exe 资产,返回 (url, name, size)."""
+    for a in assets or []:
+        name = str(a.get("name") or "")
+        url = str(a.get("browser_download_url") or "")
+        size = int(a.get("size") or 0)
+        if name.lower().endswith(".exe") and url:
+            return url, name, size
+    return "", "", 0
 
 
 def _parse_version(v: str) -> tuple[int, ...]:
@@ -86,6 +102,10 @@ def check(repo: str = DEFAULT_REPO, current: str = __version__) -> UpdateInfo:
     info.latest_version = tag
     info.release_url = str(payload.get("html_url") or info.release_url)
     info.release_notes = str(payload.get("body") or "")
+    # 解析首个 .exe 资产(供「立即更新」按钮)
+    info.download_url, info.asset_name, info.asset_size = _pick_exe_asset(
+        payload.get("assets") or []
+    )
     info.has_update = is_newer(tag, current)
     return info
 

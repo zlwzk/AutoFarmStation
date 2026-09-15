@@ -5,6 +5,9 @@ v1.6.1 起:在导入 Qt 之前就把进程声明为「Per-Monitor DPI Aware」(W
 依次回退 SetProcessDpiAwarenessContext V2 / SetProcessDPIAware,全部失败就
 按系统默认(普通 Win7 兼容)。
 
+v1.6.3 起:设置 → 更新与日志里新增「立即更新」按钮 —— 点一下自动下载最新版 exe、
+校验大小、替换当前进程、自动启动新版本,全程不再弹浏览器。源码运行时引导用户
+到 release 页面手动下载。打包后 exe 与「立即检查 → 前往下载」入口并存,各取所需。
 v1.6.2 起:修了一批「设置里改了但实际不生效」的项目(主题切换、英文语言占位、
 默认连点参数、启动时最小化、挂机时段守护、Steam 叠加层自动应用)。
 所有用户数据严格保存在 `%APPDATA%\\AutoFarmStation\\`(Windows 自带的用户级目录),
@@ -16,7 +19,7 @@ from __future__ import annotations
 import ctypes
 import os
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 __app_name__ = "AutoFarmStation"
 __app_name_cn__ = "多开挂机大师"
 __author_handle__ = "zlwzk"
@@ -94,7 +97,7 @@ PROJECT_DESCRIPTION = (
 
 # === Release 公告(也作为 GitHub Release 正文) ===
 RELEASE_NOTES = """\
-# AutoFarmStation v1.6.2 · 修一批「改了设置」实际不生效的老 bug
+# AutoFarmStation v1.6.3 · 设置里直接「一键更新」,不弹浏览器不拷链接
 
 v1.6.1 解决了「点击、聚焦、缩放、识别」四件大事;但社区反馈:设置面板里
 **6 项勾上 / 改完根本没生效** —— 这一版按根因逐条修。同时把**所有用户数据

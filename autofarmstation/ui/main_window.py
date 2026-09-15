@@ -230,6 +230,25 @@ class MainWindow(QMainWindow):
 
     # --- 关闭 ---
     def closeEvent(self, ev) -> None:
+        # 1) 「立即更新」流程:已经在 cfg 写了 pending_update_path,跳过一切人工交互,
+        #    走「保存状态 → spawn swap helper → super().closeEvent」三步。
+        from ..utils.updater import apply_pending_update
+        if getattr(self, "_updating", False) or (
+            self._cfg.get("settings.pending_update_path", "").strip()
+        ):
+            if apply_pending_update(self._cfg, self):
+                # 把状态落盘(用户在对话框里改过设置的也保存),避免重启后丢失
+                try:
+                    self._save_state()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._log.info("正在退出以便更新...")
+                ev.accept()
+                super().closeEvent(ev)
+                return
+            # apply_pending_update 失败(下载文件没了等)→ 退回正常关闭流程
+            self._log.warning("无法启动更新助手,按正常流程关闭")
+
         close_games = bool(self._cfg.get("launch.close_games_on_exit", True))
         pids = self._tracked_pids()
         if self._cfg.get("ui.confirm_exit", True):
