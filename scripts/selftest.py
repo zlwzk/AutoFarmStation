@@ -1440,6 +1440,96 @@ def t_builtin_manifest_merges() -> bool:
         return False
 
 
+def t_bat_drag_import_is_bat_url_matrix() -> bool:
+    """v1.6.5:BatLibraryDialog._is_bat_url() — 本地 .bat/.cmd 收,远程 / 其它后缀拒。"""
+    _div("v1.6.5 bat drag/drop url filter matrix")
+    try:
+        # 直接类内静态方法 + 假 URL,确保 Qt URL 行为跨平台一致
+        from autofarmstation.ui.bat_library_dialog import BatLibraryDialog
+        from PySide6.QtCore import QUrl
+
+        ok = BatLibraryDialog._is_bat_url(QUrl.fromLocalFile("C:/x/测试.bat"))
+        assert ok, "本地 .bat 必须接受"
+        ok2 = BatLibraryDialog._is_bat_url(QUrl.fromLocalFile("C:/x/y.CMD"))
+        assert ok2, "本地 .cmd(大写) 必须接受"
+        bad = BatLibraryDialog._is_bat_url(QUrl.fromLocalFile("C:/x/y.txt"))
+        assert not bad, ".txt 必须拒"
+        bad2 = BatLibraryDialog._is_bat_url(QUrl("https://example.com/a.bat"))
+        assert not bad2, "远程 URL 必须拒"
+        bad3 = BatLibraryDialog._is_bat_url(QUrl("file:///C:/x/y.exe"))
+        assert not bad3, ".exe 必须拒"
+        # 没后缀的本地 file URL 也应拒
+        bad4 = BatLibraryDialog._is_bat_url(QUrl.fromLocalFile("C:/x/no_ext"))
+        assert not bad4, "无后缀必须拒"
+        _ok("_is_bat_url 矩阵(.bat/.cmd 收;.txt/.exe/远程/无后缀 拒)")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("bat_drag_is_bat_url_matrix", e)
+        return False
+
+
+def t_bat_pick_files_calls_import_paths() -> bool:
+    """v1.6.5:_on_pick_files() 必须走 _import_paths()(单点逻辑,拖拽 / 选择共用)。"""
+    _div("v1.6.5 bat pick files uses shared _import_paths")
+    try:
+        # 通过 pytest-qt 的 QApplication / QFileDialog 钩子拦截真实选择路径:
+        # monkey-patch QFileDialog.getOpenFileNames 让它直接返回我们造的路径,
+        # 再触发 _on_pick_files() → 应当落到 _import_paths() 里去调 import_bat。
+        import os, tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from PySide6.QtWidgets import QApplication
+        from autofarmstation.core.bat_library import BatLibrary
+        from autofarmstation.ui.bat_library_dialog import BatLibraryDialog
+
+        # 确保 QApplication 存在(selftest 主流程已建;若没建则补)
+        _app = QApplication.instance() or QApplication([])
+
+        with tempfile.TemporaryDirectory(prefix="afs-bat-pick-") as tmp:
+            base = Path(tmp)
+            user = base / "user"
+            user.mkdir()
+            lib = BatLibrary(builtin_dir=base / "builtin", user_dir=user)
+
+            src1 = base / "pick_one.bat"
+            src1.write_text("@echo off\necho picked1\r\n", encoding="utf-8")
+            src2 = base / "pick_two.cmd"
+            src2.write_text("@echo off\necho picked2\r\n", encoding="utf-8")
+
+            dlg = BatLibraryDialog(lib)
+            called = {"n": 0, "with": None}
+            orig = dlg._import_paths  # bound method,签名 (paths, *, source)
+
+            def spy(paths, *, source):
+                called["n"] += 1
+                called["with"] = (list(paths), source)
+                return orig(paths, source=source)
+
+            # patch 单实例的 bound method(spy 就不用再接 self),
+            # 同时拦截 QFileDialog.getOpenFileNames 让它直接返回造好的两个 .bat 路径
+            with patch.object(dlg, "_import_paths", spy), \
+                 patch("autofarmstation.ui.bat_library_dialog.QFileDialog.getOpenFileNames",
+                       return_value=([str(src1), str(src2)], "")):
+                dlg._on_pick_files()
+
+            assert called["n"] == 1, f"_import_paths 应被调一次,实际 {called['n']}"
+            assert called["with"][1] == "选择"
+            assert called["with"][0] == [str(src1), str(src2)]
+
+            # 真的落了用户目录
+            assert (user / "pick_one.bat").exists()
+            assert (user / "pick_two.cmd".replace(".cmd", ".bat")).exists() or \
+                   (user / "pick_two.bat").exists()
+
+            dlg.close()
+            dlg.deleteLater()
+        _ok("_on_pick_files → _import_paths 透传(source='选择'),真实文件已落用户目录")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("bat_pick_files_calls_import_paths", e)
+        return False
+
+
 # === v1.6.4 新增:bat 库拖拽导入 ===
 def t_bat_drag_import_basic() -> bool:
     """v1.6.4:BatLibrary.import_bat() — 把外部 .bat 拷到用户目录并写 manifest。"""
@@ -1874,10 +1964,13 @@ def run_all() -> int:
                                     t_updater_helpers, t_updater_apply_pending_no_pending,
                                     t_updater_apply_pending_cleans_missing,
                                     # v1.6.4 新增(bat 拖拽导入)
-                                        t_bat_drag_import_basic, t_bat_drag_import_collision,
-                                        t_bat_drag_import_rejects_non_bat,
-                                        t_bat_drag_import_rejects_missing,
-                    ]
+                                                            t_bat_drag_import_basic, t_bat_drag_import_collision,
+                                                            t_bat_drag_import_rejects_non_bat,
+                                                            t_bat_drag_import_rejects_missing,
+                                                            # v1.6.5 新增(bat 文件选择 + url 矩阵)
+                                                                t_bat_drag_import_is_bat_url_matrix,
+                                                                t_bat_pick_files_calls_import_paths,
+                                        ]
     passed = 0
     failed = 0
     for t in tests:

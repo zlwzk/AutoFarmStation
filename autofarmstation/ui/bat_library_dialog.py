@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import (
+    QDesktopServices, QDragEnterEvent, QDragMoveEvent, QDragLeaveEvent,
+    QDropEvent,
+)
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QTreeWidget, QTreeWidgetItem,
     QLabel, QPushButton, QLineEdit, QInputDialog, QMessageBox, QGroupBox,
-    QFormLayout, QTextEdit, QDialogButtonBox, QWidget,
+    QFormLayout, QTextEdit, QDialogButtonBox, QWidget, QFileDialog,
 )
 
 from ..core import BatLibrary, BatEntry
@@ -52,6 +55,15 @@ class BatLibraryDialog(QDialog):
         btn_data_dir.clicked.connect(self._on_open_data_dir)
         top.addWidget(btn_data_dir)
 
+        btn_pick = QPushButton("📁 从文件选择 .bat / .cmd…")
+        btn_pick.setToolTip(
+            "点击 → 弹出 Windows 文件选择框\n"
+            "可一次选多个 .bat / .cmd 脚本,自动加进用户目录\n"
+            "等同拖拽进来,只是用鼠标点出来选",
+        )
+        btn_pick.clicked.connect(self._on_pick_files)
+        top.addWidget(btn_pick)
+
         btn_new = QPushButton("➕ 新建脚本")
         btn_new.clicked.connect(self._on_new)
         top.addWidget(btn_new)
@@ -62,10 +74,14 @@ class BatLibraryDialog(QDialog):
 
         v.addLayout(top)
 
-        # 拖拽提示(很轻,不抢眼)
-        hint = QLabel("📥 提示:可从文件管理器把 .bat / .cmd 拖到本窗口,快速加为脚本")
-        hint.setStyleSheet("color:#888; padding:2px 4px;")
-        v.addWidget(hint)
+        # 拖拽 / 选择 提示(很轻,不抢眼)
+        self._hint = QLabel(
+            "📥 两种方式快速加脚本:① 把 .bat / .cmd 从文件管理器拖到本窗口任一处  "
+            "② 点上方「📁 从文件选择 .bat / .cmd…」",
+        )
+        self._hint.setStyleSheet("color:#888; padding:2px 4px;")
+        self._hint.setWordWrap(True)
+        v.addWidget(self._hint)
 
         # 主体:左树 + 右详情
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -73,9 +89,14 @@ class BatLibraryDialog(QDialog):
         self._tree.setHeaderLabels(["脚本"])
         self._tree.setColumnWidth(0, 280)
         self._tree.itemSelectionChanged.connect(self._on_select)
+        # 树内部也接受拖放,避免某些 Qt 版本里 QSplitter / QTreeWidget 拦截
+        self._tree.setAcceptDrops(True)
+        self._tree.setDragDropMode(QTreeWidget.DragDropMode.DropOnly)
+        self._tree.viewport().setAcceptDrops(True)
         split.addWidget(self._tree)
 
         right = QWidget()
+        right.setAcceptDrops(True)  # 右半边也接受拖放
         rv = QVBoxLayout(right)
         rv.setContentsMargins(8, 0, 0, 0)
         self._title = QLabel("(未选中)")
@@ -318,40 +339,85 @@ class BatLibraryDialog(QDialog):
 
 
 # --- 拖放支持:把 .bat / .cmd 从文件管理器拖进来 ---
+    # 状态保存原始样式表,drag 高亮时临时改、dragLeave 后还原
+    _HINT_BASE_STYLE = "color:#888; padding:2px 4px;"
+    _HINT_ACTIVE_STYLE = (
+        "color:#0a84ff; background:#e8f1ff; padding:6px 10px; "
+        "border:2px dashed #0a84ff; border-radius:4px;"
+    )
+
     def dragEnterEvent(self, ev: QDragEnterEvent) -> None:  # noqa: N802 (Qt)
         """光标进窗口时:有 .bat / .cmd 文件就接受,其它拒(光标显示「禁止」)。"""
-        if ev.mimeData().hasUrls() and any(
-            self._is_bat_url(u) for u in ev.mimeData().urls()
-        ):
+        urls = ev.mimeData().urls() if ev.mimeData().hasUrls() else []
+        if any(self._is_bat_url(u) for u in urls):
+            ev.acceptProposedAction()
+            self._set_hint_active(True,
+                f"📥 松开鼠标即可导入 {sum(1 for u in urls if self._is_bat_url(u))} 个脚本")
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev: QDragMoveEvent) -> None:  # noqa: N802 (Qt)
+        # 跟 dragEnter 一致(Qt 默认会调 dragMove,这里显式 accept 让光标显示正常)
+        urls = ev.mimeData().urls() if ev.mimeData().hasUrls() else []
+        if any(self._is_bat_url(u) for u in urls):
             ev.acceptProposedAction()
         else:
             ev.ignore()
 
-    def dragMoveEvent(self, ev: QDragEnterEvent) -> None:  # noqa: N802 (Qt)
-        # 跟 dragEnter 一致即可(Qt 默认会调 dragMove,这里显式 accept 让光标显示正常)
-        if ev.mimeData().hasUrls() and any(
-            self._is_bat_url(u) for u in ev.mimeData().urls()
-        ):
-            ev.acceptProposedAction()
-        else:
-            ev.ignore()
+    def dragLeaveEvent(self, ev: QDragLeaveEvent) -> None:  # noqa: N802 (Qt)
+        """鼠标拖出窗口 → 还原提示样式."""
+        self._set_hint_active(False, None)
 
     def dropEvent(self, ev: QDropEvent) -> None:  # noqa: N802 (Qt)
         """松手时:逐个调用 import_bat(),完成后给一个汇总状态。"""
-        urls = [u for u in ev.mimeData().urls() if self._is_bat_url(u)]
-        if not urls:
+        from pathlib import Path as _P
+        urls = ev.mimeData().urls() if ev.mimeData().hasUrls() else []
+        bat_urls = [u for u in urls if self._is_bat_url(u)]
+        if not bat_urls:
             ev.ignore()
+            self._set_hint_active(False, None)
             return
         ev.acceptProposedAction()
 
+        paths: list[str] = []
+        for u in bat_urls:
+            local = u.toLocalFile() if u.isLocalFile() else ""
+            if local:
+                paths.append(local)
+        self._import_paths(paths, source="拖拽")
+        self._set_hint_active(False, None)
+
+    @staticmethod
+    def _is_bat_url(u) -> bool:
+        """只接受本地文件 URL,且后缀是 .bat / .cmd。"""
+        if not u.isLocalFile():
+            return False
+        name = (u.fileName() or "").lower()
+        return name.endswith(".bat") or name.endswith(".cmd")
+
+    # --- 文件选择器:和拖拽共用一条逻辑 ---
+    def _on_pick_files(self) -> None:
+        """点「📁 从文件选择 .bat / .cmd…」按钮 → QFileDialog 多选 → 走 _import_paths。"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择要导入的 .bat / .cmd 脚本(可多选)",
+            str(self._lib.user_dir()),
+            "批处理文件 (*.bat *.cmd);;所有文件 (*.*)",
+        )
+        if not paths:
+            return
+        self._import_paths(paths, source="选择")
+
+    def _import_paths(self, paths: list[str], *, source: str) -> None:
+        """拖拽 / 文件选择都走这里:逐个 import_bat(),完后汇总反馈 + 选中第一个新条目。"""
+        from pathlib import Path as _P
         ok: list[str] = []
         skipped: list[str] = []
         failed: list[tuple[str, str]] = []
-        from pathlib import Path as _P
-        for u in urls:
-            src = _P(u.toLocalFile()) if u.isLocalFile() else None
-            if src is None or not src.exists():
-                skipped.append(u.fileName() or u.toString())
+        for raw in paths:
+            src = _P(raw)
+            if not src.exists() or not src.is_file():
+                skipped.append(src.name or raw)
                 continue
             try:
                 e = self._lib.import_bat(src)
@@ -363,28 +429,39 @@ class BatLibraryDialog(QDialog):
         if ok:
             self._refresh()
             self._select_first_with_title(ok[0])
+
         # 给个汇总反馈
         parts: list[str] = []
         if ok:
-            parts.append(f"已导入 {len(ok)} 个:" + "、".join(ok[:3])
-                         + (" ..." if len(ok) > 3 else ""))
+            tail = "、" .join(ok[:3]) + (" ..." if len(ok) > 3 else "")
+            parts.append(f"{source}导入 {len(ok)} 个:{tail}")
         if skipped:
             parts.append(f"跳过 {len(skipped)} 个(路径无效)")
         if failed:
             detail = "\n".join(f"• {n}: {msg}" for n, msg in failed[:5])
             parts.append(f"失败 {len(failed)} 个:\n{detail}")
-        self._status.setText("  |  ".join(parts) if parts else "(空)")
+        if parts:
+            self._status.setText("  |  ".join(parts))
+        elif not ok and not skipped and not failed:
+            self._status.setText("(空)")
 
-    @staticmethod
-    def _is_bat_url(u) -> bool:
-        """只接受本地文件 URL,且后缀是 .bat / .cmd。"""
-        if not u.isLocalFile():
-            return False
-        name = (u.fileName() or "").lower()
-        return name.endswith(".bat") or name.endswith(".cmd")
+    def _set_hint_active(self, active: bool, msg: str | None) -> None:
+        """拖拽中 / 离开 → 改 hint label 视觉反馈."""
+        if not hasattr(self, "_hint"):
+            return
+        if active:
+            self._hint.setStyleSheet(self._HINT_ACTIVE_STYLE)
+            if msg is not None:
+                self._hint.setText(msg)
+        else:
+            self._hint.setStyleSheet(self._HINT_BASE_STYLE)
+            self._hint.setText(
+                "📥 两种方式快速加脚本:① 把 .bat / .cmd 从文件管理器拖到本窗口任一处  "
+                "② 点上方「📁 从文件选择 .bat / .cmd…」",
+            )
 
     def _select_first_with_title(self, title: str) -> None:
-        """刷新后,选中第一个 title 等于 title 的条目(用于拖拽后高亮)。"""
+        """刷新后,选中第一个 title 等于 title 的条目(用于拖拽/选择后高亮)。"""
         for i in range(self._tree.topLevelItemCount()):
             grp = self._tree.topLevelItem(i)
             for j in range(grp.childCount()):

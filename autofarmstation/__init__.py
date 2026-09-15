@@ -5,6 +5,10 @@ v1.6.1 起:在导入 Qt 之前就把进程声明为「Per-Monitor DPI Aware」(W
 依次回退 SetProcessDpiAwarenessContext V2 / SetProcessDPIAware,全部失败就
 按系统默认(普通 Win7 兼容)。
 
+v1.6.5 起:Bat 脚本库对话框提供两种方式快速添加 .bat / .cmd 脚本:
+① **拖进来** —— 把文件管理器里的脚本拖到窗口任一处(标题 / 树 / 右侧详情都能放);
+② **点选进来** —— 点顶部「📁 从文件选择 .bat / .cmd…」按钮,弹出 Windows 文件选择框,可多选。
+两种方式共用同一份逻辑:自动识别 GBK / UTF-8 / UTF-16 编码、同名自动加 _N 后缀、绝不覆盖。
 v1.6.4 起:Bat 脚本库对话框启用拖放,可直接把文件管理器里的 .bat / .cmd 拖进窗口
 快速添加为脚本;自动识别 GBK / UTF-8 / UTF-16 编码;同名自动加 _N 后缀,不覆盖。
 v1.6.3 起:设置 → 更新与日志里新增「立即更新」按钮 —— 点一下自动下载最新版 exe、
@@ -21,7 +25,7 @@ from __future__ import annotations
 import ctypes
 import os
 
-__version__ = "1.6.4"
+__version__ = "1.6.5"
 __app_name__ = "AutoFarmStation"
 __app_name_cn__ = "多开挂机大师"
 __author_handle__ = "zlwzk"
@@ -99,7 +103,7 @@ PROJECT_DESCRIPTION = (
 
 # === Release 公告(也作为 GitHub Release 正文) ===
 RELEASE_NOTES = """\
-# AutoFarmStation v1.6.4 · Bat 脚本库支持拖拽 .bat / .cmd 快速添加
+# AutoFarmStation v1.6.5 · Bat 脚本库:同时支持「拖拽进来」与「点按钮选文件」
 
 v1.6.1 解决了「点击、聚焦、缩放、识别」四件大事;但社区反馈:设置面板里
 **6 项勾上 / 改完根本没生效** —— 这一版按根因逐条修。同时把**所有用户数据
