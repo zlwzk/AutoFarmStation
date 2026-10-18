@@ -116,6 +116,8 @@ class MainWindow(QMainWindow):
         self._monitor.on_event(self._on_monitor_event)
         # 自动重启节流:hwnd → 最近几次重启的时间戳
         self._restart_hist: dict[int, list[float]] = {}
+        # v1.8.0 窗口重开自动重绑:死 hwnd → 上次扫描时间(30s 冷却,避免狂扫)
+        self._rebind_scan_at: dict[int, float] = {}
         # v1.6.1:「选择窗口」对话框是否列出隐藏 / 无标题窗口
         self._include_hidden: bool = False
         # v1.6.2:挂机时段守护(时段外禁止启动;定时轮询进出)
@@ -483,6 +485,86 @@ class MainWindow(QMainWindow):
             f"已唤醒并接回:{win.title[:40]}{note}", 6000,
         )
         self._notify(f"已自动接回游戏窗口:{win.title[:40]}")
+
+    # --- v1.8.0 窗口重开自动重绑 ---
+    def _rebind_dead_windows(self) -> None:
+        """扫描「追踪列表里 hwnd 已失效」的窗口:同 exe 的新窗口出现时自动接回.
+
+        场景:游戏自己崩溃重启 / 闪退后重新打开,hwnd 变了但 exe 路径没变。
+        老逻辑里配置还挂在死 hwnd 上,新窗口等于「裸奔」;这里把配置 / 别名 /
+        分组整体搬到新 hwnd,并在「之前有配置」的前提下自动恢复运行。
+        """
+        import time as _t
+        from ..core import window_finder as wf
+        now = _t.time()
+        tracked = {int(tp.hwnd) for tp in self._pm.all()}
+        for tp in list(self._pm.all()):
+            old = int(tp.hwnd)
+            if wf.get_window_info(old) is not None:
+                self._rebind_scan_at.pop(old, None)  # 复活了,清冷却
+                continue
+            # 只对「有保存配置」或「之前在运行」的窗口做自动重绑,避免误接管
+            has_cfg = False
+            try:
+                has_cfg = self._hub.has_config(old)
+            except Exception:  # noqa: BLE001
+                has_cfg = False
+            if not has_cfg:
+                continue
+            if not tp.exe:
+                continue
+            last = self._rebind_scan_at.get(old, 0.0)
+            if now - last < 30.0:
+                continue
+            self._rebind_scan_at[old] = now
+            win = self._find_window_by_exe(tp.exe, exclude=tracked)
+            if win is None:
+                continue
+            self._log.info("检测到同 exe 新窗口,自动重绑: %s -> %s (%s)",
+                           old, win.hwnd, tp.exe)
+            # 之前有配置 = 之前在挂,重绑后直接恢复运行
+            self._rebind_window(old, win)
+            try:
+                if self._hub.clicker_config(int(win.hwnd)) is not None:
+                    self._hub.start_clicker(int(win.hwnd))
+                if self._hub.key_macro_config(int(win.hwnd)) is not None:
+                    self._hub.start_key_macro(int(win.hwnd))
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("重绑后自动恢复运行失败: %s", e)
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                f"游戏窗口重开,已自动接回配置: {win.title[:40]}", 6000,
+            )
+
+    def _find_window_by_exe(self, exe_path: str, *, exclude: set[int]):
+        """按 exe 路径找一个「当前未被追踪」的可见窗口,找不到返回 None."""
+        try:
+            import psutil  # type: ignore
+        except Exception:  # noqa: BLE001
+            return None
+        exe_norm = exe_path.replace("/", "\\").lower()
+        pids: list[int] = []
+        try:
+            for p in psutil.process_iter(["pid", "exe"]):
+                try:
+                    pexe = p.info.get("exe") or ""
+                except Exception:  # noqa: BLE001
+                    continue
+                if pexe and pexe.replace("/", "\\").lower() == exe_norm:
+                    pids.append(int(p.info["pid"]))
+        except Exception:  # noqa: BLE001
+            return None
+        if not pids:
+            return None
+        from ..core import window_finder as wf
+        try:
+            grouped = wf.find_windows_for_pids(pids)
+        except Exception:  # noqa: BLE001
+            return None
+        for _pid, wins in grouped.items():
+            for w in wins:
+                if int(w.hwnd) not in exclude:
+                    return w
+        return None
 
     # --- 监控事件 ---
     def _running_kinds(self, hwnd: int) -> tuple[bool, bool]:
@@ -1315,6 +1397,11 @@ class MainWindow(QMainWindow):
                 self._statusBar().showMessage(f"[Steam] {msg}", 6000)  # type: ignore[union-attr]
         except Exception as e:  # noqa: BLE001
             self._log.debug("Steam 状态联动出错: %s", e)
+        # v1.8.0 窗口重开自动重绑(低频:内部有 30s/窗口 冷却)
+        try:
+            self._rebind_dead_windows()
+        except Exception as e:  # noqa: BLE001
+            self._log.debug("自动重绑扫描出错: %s", e)
 
     # --- 持久化 ---
     def _save_state(self) -> None:

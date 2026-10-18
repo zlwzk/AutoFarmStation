@@ -9,6 +9,51 @@ from .__init__ import __version__, __app_name__, __app_name_cn__, __author_handl
 from .utils.logger import setup, get
 
 
+def _install_crash_guards(log) -> None:
+    """全局兜底:任何没接住的异常(含工作线程)都写日志,不让进程直接崩死.
+
+    - ``sys.excepthook``:PySide6 里 slot / QTimer 回调抛出的异常最终走到这里,
+      默认是打印到 stderr,打包成 exe 后等于「静默崩」;改成写日志并在状态栏提示。
+    - ``threading.excepthook``:截图 / 连点 / 宏等工作线程的未捕获异常,
+      默认只打印线程名,同样写进日志方便排查。
+    """
+    import threading
+    import traceback
+
+    def _format(exc_type, exc, tb) -> str:
+        return "".join(traceback.format_exception(exc_type, exc, tb))
+
+    def _notify_gui(text: str) -> None:
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is None:
+                return
+            win = app.activeWindow()
+            if win is not None and hasattr(win, "_statusBar"):
+                win._statusBar().showMessage(text, 6000)
+        except Exception:
+            pass
+
+    def _sys_hook(exc_type, exc, tb) -> None:
+        # KeyboardInterrupt / SystemExit 走原逻辑
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        log.error("未捕获异常(已拦截,程序继续运行):\n%s", _format(exc_type, exc, tb))
+        _notify_gui(f"⚠ 内部错误已拦截:{exc_type.__name__}: {exc}")
+
+    def _thread_hook(args) -> None:
+        log.error(
+            "工作线程 %s 未捕获异常(已拦截):\n%s",
+            getattr(args.thread, "name", "?"),
+            _format(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _sys_hook
+    threading.excepthook = _thread_hook
+
+
 def _apply_palette(app, theme: str = "dark") -> None:
     """按主题应用调色板. v1.6.2 起读 cfg.get("ui.theme") 而不是写死 dark.
 
@@ -66,6 +111,7 @@ def run(argv: list[str], version: str) -> int:
     # 启动 GUI
     setup()
     log = get()
+    _install_crash_guards(log)
     log.info("=== %s v%s 启动 ===", __app_name_cn__, version)
     # v1.6.2:启动时把「用户数据目录」+「bat 脚本库」位置打到日志,
     # 排查「升级后数据丢了」一类问题时第一时间能找到文件。

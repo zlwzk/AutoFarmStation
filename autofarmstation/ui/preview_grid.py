@@ -105,11 +105,17 @@ class PreviewGrid(QWidget):
 
         self._btn_sync_start = QPushButton("▶ 同步启动")
         self._btn_sync_start.setStyleSheet("QPushButton { font-weight:bold; }")
+        self._btn_sync_start.setToolTip(
+            "让所有勾选的窗口同时启动。\n"
+            "每个窗口用自己已保存的配置,可以各不相同(不同逻辑并行);\n"
+            "想让大家跑同一套,请先点旁边的「应用当前配置」。"
+        )
         self._btn_sync_start.clicked.connect(
             lambda: self.sync_start_requested.emit(self.selected_hwnds()))
         hl.addWidget(self._btn_sync_start)
 
         self._btn_sync_stop = QPushButton("■ 同步停止")
+        self._btn_sync_stop.setToolTip("同时停止所有勾选窗口的连点器 / 键盘宏")
         self._btn_sync_stop.clicked.connect(
             lambda: self.sync_stop_requested.emit(self.selected_hwnds()))
         hl.addWidget(self._btn_sync_stop)
@@ -275,7 +281,8 @@ class PreviewGrid(QWidget):
         n_un = sum(1 for h in self._items if not self._group_of(h))
         chips.append((f"未分组 {n_un}", "", n_un, "#888"))
         for text, fval, _cnt, color in chips:
-            btn = QToolButton(text)
+            btn = QToolButton()
+            btn.setText(text)
             btn.setCheckable(True)
             btn.setChecked(self._filter == fval)
             btn.setStyleSheet(
@@ -427,9 +434,12 @@ class PreviewGrid(QWidget):
         if n == 0:
             self._empty_label.setText(
                 "尚未选择任何进程。\n\n"
-                "点击左上角「添加窗口」,选择游戏窗口,即可开始挂机。\n\n"
+                "点击左上角「添加窗口」,选择游戏窗口,即可开始挂机。\n"
                 "支持任意进程,不限 Steam。\n\n"
-                "提示:勾选多个窗口后,可用上方「同步启动」让它们执行同一套操作。"
+                "三种用法:\n"
+                "· 单窗口:右侧配置只对该窗口生效,单独启停;\n"
+                "· 勾选多个后「同步启动」:各窗口用自己的配置同时跑(可互不相同);\n"
+                "· 右键卡片标题可分组(分屏分类),按分类整组启停。"
             )
             self._empty_label.setVisible(True)
             self._layout.addWidget(self._empty_label, 0, 0)

@@ -1321,6 +1321,64 @@ def t_group_feature() -> bool:
         return False
 
 
+def t_clicker_new_options() -> bool:
+    """v1.8.0:连点器新增位置抖动(jitter_px)+运行时长(run_minutes)字段序列化."""
+    _div("v1.8.0 clicker new options")
+    try:
+        from autofarmstation.core.autoclicker import AutoClickerConfig, ClickPoint
+        cfg = AutoClickerConfig(
+            hwnd=42,
+            points=[ClickPoint(10, 20)],
+            interval_ms=150,
+            jitter_pct=5,
+            jitter_px=12,
+            total_clicks=100,
+            run_minutes=60,
+        )
+        d = cfg.to_dict()
+        assert d["jitter_px"] == 12
+        assert d["run_minutes"] == 60
+        cfg2 = AutoClickerConfig.from_dict(d)
+        assert cfg2.jitter_px == 12
+        assert cfg2.run_minutes == 60
+        _ok("连点器新字段序列化 ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("clicker_new_options", e)
+        return False
+
+
+def t_crash_guards() -> bool:
+    """v1.8.0:全局 sys/threading excepthook 安装 + 拦截不崩溃."""
+    _div("v1.8.0 crash guards")
+    try:
+        import sys
+        import threading
+        original_sys = sys.excepthook
+        original_thread = threading.excepthook
+        import logging
+        log = logging.getLogger("test")
+        from autofarmstation.app import _install_crash_guards
+        _install_crash_guards(log)
+        assert sys.excepthook is not original_sys
+        assert threading.excepthook is not original_thread
+        # 验证拦截不会抛异常(模拟一个 slot 异常)
+        class FakeExc(Exception):
+            pass
+        try:
+            sys.excepthook(FakeExc, FakeExc("test"), None)
+        except Exception:  # noqa: BLE001
+            # excepthook 本身不应该抛异常让进程挂掉
+            pass
+        sys.excepthook = original_sys
+        threading.excepthook = original_thread
+        _ok("crash guards 安装并拦截 ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("crash_guards", e)
+        return False
+
+
 def t_user_bats_persist() -> bool:
     """v1.6.2:用户自加的 bat 脚本必须跨「重建 BatLibrary」持久化。
 
@@ -2024,6 +2082,9 @@ def run_all() -> int:
                                                                 t_bat_pick_files_calls_import_paths,
                                     # v1.7.0 新增(分屏分类 + 时段判定可测性)
                                         t_group_feature,
+                                        # v1.8.0 新增(防崩溃 + 连点新选项)
+                                        t_clicker_new_options,
+                                        t_crash_guards,
                                         ]
     passed = 0
     failed = 0

@@ -2,7 +2,7 @@
 
 > 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、分屏分类、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.7.0-blue)
+![banner](https://img.shields.io/badge/version-1.8.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -47,6 +47,11 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
 - **连点器**:多点击点位轮询、可设随机抖动、左右中双击支持、可视化选点、每进程独立配置。
   - **发送方式**:`auto`(默认推荐,后台投递优先、失败自动转真实输入)/ `post` 消息(安全,不抢前台)/
     `send` 真实输入(需前台);状态栏显示点击次数与失败数。
+  - **v1.8.0 新增**:位置抖动(±N px,更像真人)+ 运行时长限制(挂够 N 分钟自动停)。
+- **窗口重开自动接回**(v1.8.0):游戏崩溃重启 / 换句柄后,同 exe 的新窗口出现时自动迁移
+  配置 / 别名 / 分组并恢复运行,不用手动重新添加。
+- **稳定加固**(v1.8.0):全局异常兜底(界面回调 / 工作线程异常写日志并拦截,不再静默崩溃),
+  截图回调防销毁竞态 + 渲染节流。
 - **键盘宏**:按键序列回放、持续按键、单键循环,任意组合。
 - **宏录制/回放**:录制鼠标 + 键盘轨迹,保存为可分享的 JSON,任意窗口回放。
 - **Steam 状态联动**:开始挂机自动把 Steam 状态切到「在线 / 离开 / 隐身」,挂机停完自动还原;

@@ -83,8 +83,14 @@ class ClickerPanel(QWidget):
         f.addRow("基础间隔:", self._interval)
         self._jitter = NumberField(minimum=0, maximum=100, step=5, suffix=" %", value=init_jitter)
         f.addRow("随机抖动:", self._jitter)
+        self._jitter_px = NumberField(minimum=0, maximum=200, step=1, suffix=" px", value=0)
+        self._jitter_px.setToolTip("位置抖动:每次点击在点位 ±N 像素内随机偏移,更像真人操作")
+        f.addRow("位置抖动:", self._jitter_px)
         self._total = NumberField(minimum=0, maximum=999999, step=10, value=0)
         f.addRow("总次数(0=无限):", self._total)
+        self._run_minutes = NumberField(minimum=0, maximum=1440, step=5, suffix=" 分钟", value=0)
+        self._run_minutes.setToolTip("运行满 N 分钟后自动停止;0 = 不限时")
+        f.addRow("运行时长:", self._run_minutes)
         self._loop = QCheckBox("点位循环(否则按列表点完即停)")
         self._loop.setChecked(True)
         f.addRow("", self._loop)
@@ -200,7 +206,9 @@ class ClickerPanel(QWidget):
             points=pts,
             interval_ms=int(self._interval.value()),
             jitter_pct=int(self._jitter.value()),
+            jitter_px=int(self._jitter_px.value()),
             total_clicks=int(self._total.value()),
+            run_minutes=int(self._run_minutes.value()),
             loop=self._loop.isChecked(),
             mode=("auto", "post", "send")[self._mode.currentIndex()] if 0 <= self._mode.currentIndex() <= 2 else "auto",
             client_w=int(cw) if cw > 0 else 0,
@@ -395,7 +403,9 @@ class ClickerPanel(QWidget):
         cfg = preset.autoclicker or {}
         self._interval.setValue(int(cfg.get("interval_ms", 200)))
         self._jitter.setValue(int(cfg.get("jitter_pct", 10)))
+        self._jitter_px.setValue(int(cfg.get("jitter_px", 0)))
         self._total.setValue(int(cfg.get("total_clicks", 0)))
+        self._run_minutes.setValue(int(cfg.get("run_minutes", 0)))
         self._loop.setChecked(bool(cfg.get("loop", True)))
         self._points_list.clear()
         for cp in autoclicker_dict_to_points(cfg):

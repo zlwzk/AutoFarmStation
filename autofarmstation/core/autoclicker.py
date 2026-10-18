@@ -72,7 +72,9 @@ class AutoClickerConfig:
     points: list[ClickPoint] = field(default_factory=list)
     interval_ms: int = 100  # 点击间隔(毫秒)
     jitter_pct: int = 0  # 抖动百分比(0~100)
+    jitter_px: int = 0  # 位置抖动(像素,0=关闭;每次点击在点位 ±N px 内随机偏移,更像真人)
     total_clicks: int = 0  # 0 = 无限
+    run_minutes: int = 0  # 0 = 不限时;>0 表示运行满 N 分钟后自动停止
     loop: bool = True  # 到尾后回到第一点
     mode: str = "auto"  # 'auto' (默认先后台投递,失败改真实输入) / 'post' / 'send'
     # 记点位时该窗口的客户区尺寸,用来给老点位补算比例 / 「按当前窗口重算比例」
@@ -107,7 +109,9 @@ class AutoClickerConfig:
             ],
             "interval_ms": self.interval_ms,
             "jitter_pct": self.jitter_pct,
+            "jitter_px": self.jitter_px,
             "total_clicks": self.total_clicks,
+            "run_minutes": self.run_minutes,
             "loop": self.loop,
             "mode": self.mode,
             "client_w": self.client_w,
@@ -140,7 +144,9 @@ class AutoClickerConfig:
             points=pts,
             interval_ms=int(d.get("interval_ms", 100)),
             jitter_pct=int(d.get("jitter_pct", 0)),
+            jitter_px=max(0, int(d.get("jitter_px", 0) or 0)),
             total_clicks=int(d.get("total_clicks", 0)),
+            run_minutes=max(0, int(d.get("run_minutes", 0) or 0)),
             loop=bool(d.get("loop", True)),
             mode=str(d.get("mode", "auto")),
             client_w=int(d.get("client_w", 0) or 0),
@@ -325,6 +331,12 @@ class AutoClicker:
                 # 限流:次数
                 if self.config.total_clicks and self._done_count >= self.config.total_clicks:
                     return
+                # 限流:运行时长(分钟)
+                if self.config.run_minutes and \
+                        self.runtime_seconds >= self.config.run_minutes * 60:
+                    self._log.info("已达运行时长上限 %d 分钟,连点器自动停止 (hwnd=%s)",
+                                   self.config.run_minutes, self.config.hwnd)
+                    return
 
                 # 带比例的点位按「当前」客户区尺寸换算成像素,这样窗口被
                 # 聚焦铺满 / 手动缩放 / 换显示器之后依然打中同一个位置。
@@ -333,6 +345,17 @@ class AutoClicker:
                     cw, ch = wf.client_size(self.config.hwnd)
                     if cw > 0 and ch > 0:
                         cx, cy = p.resolve(cw, ch)
+
+                # 位置抖动:每次点击在 ±jitter_px 内随机偏移,更像真人,
+                # 也能规避一些游戏「完全同坐标连点」的检测。
+                jpx = max(0, int(self.config.jitter_px))
+                if jpx > 0:
+                    cw2, ch2 = wf.client_size(self.config.hwnd)
+                    cx += random.randint(-jpx, jpx)
+                    cy += random.randint(-jpx, jpx)
+                    if cw2 > 0 and ch2 > 0:
+                        cx = max(0, min(int(cw2) - 1, cx))
+                        cy = max(0, min(int(ch2) - 1, cy))
 
                 try:
                     ok, reason = self._sender.click((self.config.hwnd, cx, cy), p.button, double=p.double)

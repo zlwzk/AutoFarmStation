@@ -86,6 +86,7 @@ class PreviewWidget(QFrame):
         self._fps = fps
         self._status_extra = ""
         self._embedded = False
+        self._frame_pending = False  # 截图渲染节流标记(见 _on_frame)
         self._show_volume = bool(show_volume)
         self._show_resource = bool(show_resource)
         self._pm = pm
@@ -516,10 +517,21 @@ class PreviewWidget(QFrame):
         self.selection_changed.emit(self.hwnd, bool(on))
 
     def _on_frame(self, frame: PreviewFrame) -> None:
-        """截图回调(子线程).用 QTimer.singleShot 切到主线程."""
-        QTimer.singleShot(0, lambda: self._render_frame(frame))
+        """截图回调(子线程).切到主线程渲染.
+
+        两个防崩点:
+        - ``QTimer.singleShot(0, self, ...)`` 带上接收者:卡片被销毁后,
+          还没执行的回调会被 Qt 直接丢弃,不会在已删除的对象上渲染。
+        - ``_frame_pending`` 节流:上一帧还没渲染完就丢弃新帧,
+          避免窗口很多 / fps 调高时事件队列被截图回调刷爆。
+        """
+        if self._frame_pending:
+            return
+        self._frame_pending = True
+        QTimer.singleShot(0, self, lambda: self._render_frame(frame))
 
     def _render_frame(self, frame: PreviewFrame) -> None:
+        self._frame_pending = False
         if self._embedded:
             return
         try:
@@ -531,6 +543,9 @@ class PreviewWidget(QFrame):
             scaled = pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
                                 Qt.TransformationMode.SmoothTransformation)
             self._image_lab.setPixmap(scaled)
+        except RuntimeError:
+            # 底层 C++ 对象已被销毁(卡片关闭竞态),静默丢弃
+            pass
         except Exception:
             pass
 
