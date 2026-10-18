@@ -332,7 +332,7 @@ def t_session() -> bool:
 
 # ---- 假的 PM / Hub / TP / WI,只暴露 Session 用到的属性 ----
 class _FakeTP:
-    __slots__ = ("hwnd", "pid", "name", "title", "exe", "added_at", "tags")
+    __slots__ = ("hwnd", "pid", "name", "title", "exe", "added_at", "tags", "group")
     def __init__(self, hwnd, name, title, exe, pid=0, added_at=0.0):
         self.hwnd = hwnd
         self.pid = pid
@@ -341,6 +341,7 @@ class _FakeTP:
         self.exe = exe
         self.added_at = added_at
         self.tags = []
+        self.group = ""  # v1.7.0 分屏分类
 
 
 class _FakePM:
@@ -1195,7 +1196,7 @@ def t_default_clicker_params_applied() -> bool:
         cfg.set("defaults.clicker_interval_ms", 333)
         cfg.set("defaults.clicker_jitter_ms", 25)
         cfg.set("defaults.clicker_button", "right")
-        cfg.set("defaults.clicker_mode", "random")
+        cfg.set("defaults.clicker_mode", "send")
 
         hub = AutomationHub()
         cp = ClickerPanel(hub=hub, defaults={
@@ -1206,8 +1207,8 @@ def t_default_clicker_params_applied() -> bool:
         })
         assert cp._interval.value() == 333, f"interval 应是 333,实际 {cp._interval.value()}"
         assert cp._jitter.value() == 25, f"jitter 应是 25,实际 {cp._jitter.value()}"
-        # mode 索引 0=post, 1=send;random 走 send,所以应是 1
-        assert cp._mode.currentIndex() == 1, f"mode 应是 send(1),实际 {cp._mode.currentIndex()}"
+        # v1.7.0 mode 索引 0=auto, 1=post, 2=send
+        assert cp._mode.currentIndex() == 2, f"mode 应是 send(2),实际 {cp._mode.currentIndex()}"
 
         # 不传 cfg / defaults 时仍是硬编码默认(向后兼容)
         cp_default = ClickerPanel(hub=hub)
@@ -1245,7 +1246,9 @@ def t_farm_window_guard() -> bool:
         assert not g.in_window(morning)
         assert g.in_window(noon)
         assert not g.in_window(evening)
-        assert g.should_block_start(), "不在时段应返回 True"
+        # v1.7.0:用显式时间判定,不再依赖跑测试的真实钟点
+        assert g.should_block_start(morning), "不在时段应返回 True"
+        assert not g.should_block_start(noon), "时段内不应阻挡"
 
         # 3) 跨天:start=22:00, end=08:00
         cfg.set("farm_window.start", "22:00")
@@ -1266,6 +1269,55 @@ def t_farm_window_guard() -> bool:
         return True
     except Exception as e:  # noqa: BLE001
         _fail("farm_window", e)
+        return False
+
+
+def t_group_feature() -> bool:
+    """v1.7.0 分屏分类:group 字段序列化 + set_group/all_groups + session 往返 + 组色稳定."""
+    _div("v1.7.0 group feature")
+    try:
+        import tempfile
+        from pathlib import Path
+        from autofarmstation.core.process_manager import ProcessManager, TrackedProcess
+        from autofarmstation.core.session import Session
+        from autofarmstation.ui.preview_widget import GROUP_PRESETS, group_color
+
+        # 1) 预设分组 + 组色稳定(同名永远同色,不同名尽量不同色)
+        assert "需点击" in GROUP_PRESETS and "纯挂时长" in GROUP_PRESETS
+        assert group_color("需点击") == group_color("需点击")
+        assert group_color("") == group_color("")
+
+        # 2) TrackedProcess.to_dict/from_dict 保留 group
+        tp = TrackedProcess(hwnd=11, pid=22, name="g.exe", title="G", exe="g.exe", group="需点击")
+        tp2 = TrackedProcess.from_dict(tp.to_dict())
+        assert tp2.group == "需点击", f"group 应保留,实际 {tp2.group!r}"
+
+        # 3) ProcessManager.set_group / all_groups
+        pm = ProcessManager()
+        pm._items[11] = tp  # 直接塞,绕过 add_by_hwnd 的窗口探测
+        pm._items[12] = TrackedProcess(hwnd=12, pid=23, name="h.exe", title="H", exe="h.exe")
+        assert pm.set_group(11, "纯挂时长")
+        assert pm.set_group(12, "需点击")
+        assert pm.set_group(99, "X") is False  # 不存在的 hwnd
+        assert pm.all_groups() == ["纯挂时长", "需点击"], pm.all_groups()
+        pm.set_group(12, "")
+        assert pm.all_groups() == ["纯挂时长"]
+
+        # 4) session 保存/恢复带 group
+        f1 = _FakeTP(hwnd=11, name="g.exe", title="G", exe=r"D:\G\g.exe")
+        f2 = _FakeTP(hwnd=12, name="h.exe", title="H", exe=r"D:\G\h.exe")
+        f1.group = "需点击"
+        with tempfile.TemporaryDirectory() as td:
+            ses = Session(path=Path(td) / "s.json")
+            ses.save(_FakePM([f1, f2]), _FakeHub({}))
+            data = ses.load()
+            assert data is not None and len(data["items"]) == 2
+            assert data["items"][0]["group"] == "需点击", data["items"][0]
+            assert data["items"][1]["group"] == "", data["items"][1]
+        _ok("分屏分类: 预设/组色/序列化/set_group/all_groups/session 字段 ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("group_feature", e)
         return False
 
 
@@ -1970,6 +2022,8 @@ def run_all() -> int:
                                                             # v1.6.5 新增(bat 文件选择 + url 矩阵)
                                                                 t_bat_drag_import_is_bat_url_matrix,
                                                                 t_bat_pick_files_calls_import_paths,
+                                    # v1.7.0 新增(分屏分类 + 时段判定可测性)
+                                        t_group_feature,
                                         ]
     passed = 0
     failed = 0

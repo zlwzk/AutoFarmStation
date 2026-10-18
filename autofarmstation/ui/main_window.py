@@ -7,8 +7,8 @@ import threading
 import time
 import webbrowser
 
-from PySide6.QtCore import Qt, QTimer, QSize
-from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
+from PySide6.QtCore import Qt, QTimer, QSize, QUrl
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QMenuBar,
     QToolBar, QStatusBar, QMessageBox, QFileDialog, QLabel, QComboBox,
@@ -452,6 +452,7 @@ class MainWindow(QMainWindow):
         old_item = self._pm.get(int(old_hwnd))
         old_alias = (old_item.alias if old_item else "") or ""
         old_color = (old_item.color if old_item else "") or ""
+        old_group = (old_item.group if old_item else "") or ""  # v1.7.0 分组也跟着搬
         old_kinds = self._running_kinds(int(old_hwnd))
         try:
             self._hub.forget(int(old_hwnd))
@@ -464,6 +465,8 @@ class MainWindow(QMainWindow):
             return
         if old_alias or old_color:
             self._pm.set_alias(int(win.hwnd), old_alias, old_color)
+        if old_group:
+            self._pm.set_group(int(win.hwnd), old_group)
         if old_cfg:
             try:
                 self._hub.import_configs({str(int(win.hwnd)): old_cfg})
@@ -740,6 +743,9 @@ class MainWindow(QMainWindow):
         left.sync_start_requested.connect(right.sync_start)
         left.sync_stop_requested.connect(right.sync_stop)
         left.sync_broadcast_requested.connect(right.broadcast_current_config)
+        # v1.7.0 分屏分类:整组启动 / 停止复用同步通道(各自用已保存的配置)
+        left.group_start_requested.connect(right.sync_start)
+        left.group_stop_requested.connect(right.sync_stop)
         # 卡片上的 停止进程 / 恢复进程 / 音量
         left.stop_process_requested.connect(self._on_card_stop_process)
         left.resume_process_requested.connect(self._on_card_resume_process)
@@ -1263,9 +1269,13 @@ class MainWindow(QMainWindow):
         try:
             self._hub.stop_all()
             self._right.stop_all()
+            # 急停也要停定时任务,但调度器 / 监控线程必须拉起来,
+            # 否则急停一次之后定时任务、掉线监控全部静默失效到重启为止。
             self._sched.stop()
             self._monitor.stop()
-            self._statusBar().showMessage("急停:全部停止", 3000)  # type: ignore[union-attr]
+            self._sched.start()
+            self._monitor.start()
+            self._statusBar().showMessage("急停:全部停止(定时任务也已暂停,可用工具菜单重新打开)", 3000)  # type: ignore[union-attr]
         except Exception:
             pass
 
@@ -1415,6 +1425,11 @@ class MainWindow(QMainWindow):
             added += 1
             self._remember_launch(int(w.hwnd), int(w.pid), w.title)
             self._apply_default_session_volume(int(w.hwnd))
+            # v1.7.0:恢复分组标签(分屏分类跟着窗口走)
+            try:
+                self._pm.set_group(int(w.hwnd), str(s.get("group") or "") if isinstance(s, dict) else "")
+            except Exception:  # noqa: BLE001
+                pass
             cfg = (s.get("config") or {}) if isinstance(s, dict) else {}
             if cfg:
                 new_configs[str(int(w.hwnd))] = cfg
@@ -1423,6 +1438,10 @@ class MainWindow(QMainWindow):
                 self._hub.import_configs(new_configs)
             except Exception as e:
                 self._log.warning("恢复配置失败: %s", e)
+        try:
+            self._left.refresh_group_bar()  # v1.7.0 恢复的分组标签上分类条
+        except Exception:  # noqa: BLE001
+            pass
         self._save_state()
         self._refresh_status()
         self._statusBar().showMessage(  # type: ignore[union-attr]

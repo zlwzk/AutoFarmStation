@@ -59,10 +59,23 @@ class AutomationHub:
 
     # ---------- 工具 ----------
     def _sender_for(self, hwnd: int) -> InputSender:
+        """按该窗口已保存的配置选择发送方式.
+
+        之前这里硬编码 ``post``,导致 UI 里选「send 真实输入」完全不起作用
+        (post 消息很多游戏引擎不认,点了没反应)。现在优先读该窗口连点器
+        配置里的 ``mode``;没有配置时才用安全的默认值 ``auto``。
+        """
         s = self._senders.get(hwnd)
         if s is None:
-            s = InputSender(default_mode="post")
+            cfg = self._clicker_cfg.get(int(hwnd))
+            mode = (cfg.mode if cfg is not None and cfg.mode in ("auto", "post", "send") else "auto")
+            s = InputSender(default_mode=mode)
             self._senders[hwnd] = s
+        else:
+            # 已有 sender:配置改过模式的话同步过来(下次启动生效)
+            cfg = self._clicker_cfg.get(int(hwnd))
+            if cfg is not None and cfg.mode in ("auto", "post", "send"):
+                s.default_mode = cfg.mode
         return s
 
     def forget(self, hwnd: int) -> None:
@@ -249,7 +262,9 @@ class AutomationHub:
         if c and c.is_running:
             tag = "暂停" if c.is_paused else "连点"
             sec = int(c.runtime_seconds)
-            parts.append(f"{tag} {sec // 60:02d}:{sec % 60:02d} ({c.click_count})")
+            fails = c.fail_count
+            fail_txt = f" 失败{fails}" if fails else ""
+            parts.append(f"{tag} {sec // 60:02d}:{sec % 60:02d} ({c.click_count}{fail_txt})")
         if m and m.is_running:
             parts.append(f"宏 {m.rounds} 轮")
         return " · ".join(parts)

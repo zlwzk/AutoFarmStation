@@ -105,6 +105,8 @@ _user32.PostMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, 
 _user32.PostMessageW.restype = wintypes.BOOL
 _user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
 _user32.SendMessageW.restype = wintypes.LPARAM
+_user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+_user32.MapVirtualKeyW.restype = wintypes.UINT
 
 
 # --- 显示器工作区 / 前置窗口 ---
@@ -415,16 +417,35 @@ def _makelparam(x: int, y: int) -> int:
     return (y & 0xFFFF) << 16 | (x & 0xFFFF)
 
 
+def _key_lparam(vk: int, *, up: bool = False) -> int:
+    """构造键盘消息的 LPARAM(bit30/31 清零,24 位 = 1 视为合成事件可留 0).
+
+    很多游戏引擎(尤其 Unity / 一些直接读 scan code 的框架)只认扫描码,
+    lParam=0 的 WM_KEYDOWN 会被直接丢弃 —— 这是键盘宏「有的游戏没反应」的原因。
+    bit 16-23 是扫描码,bit 30 上一次按下状态,bit 31 转换状态(KEYUP 置 1)。
+    """
+    scan = _user32.MapVirtualKeyW(int(vk) & 0xFFFF, 0) & 0xFF  # MAPVK_VK_TO_VSC
+    lp = 1 | (scan << 16)
+    if up:
+        lp |= 0xC0000000  # bit30(前态=1) + bit31(KEYUP 转换)
+    return lp
+
+
 def post_click(hwnd: int, x: int, y: int, button: str = "left", double: bool = False) -> bool:
-    """用 PostMessage 给指定窗口发鼠标点击(客户区坐标)."""
+    """用 PostMessage 给指定窗口发鼠标点击(客户区坐标).
+
+    按下前先补一条 WM_MOUSEMOVE:不少游戏框架以「最后移动位置」决定命中区域,
+    不发移动直接 down/up 会点在引擎内部认为的旧坐标上。
+    """
+    _user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, _makelparam(x, y))
     if button == "left":
         if double:
-            ok1 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONDBLCLK, 0, _makelparam(x, y)))
-        else:
-            ok1 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, _makelparam(x, y)))
+            ok1 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, _makelparam(x, y)))
             ok2 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, _makelparam(x, y)))
             return ok1 and ok2
-        return ok1
+        ok1 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, _makelparam(x, y)))
+        ok2 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, _makelparam(x, y)))
+        return ok1 and ok2
     elif button == "right":
         ok1 = bool(_user32.PostMessageW(hwnd, WM_RBUTTONDOWN, MK_RBUTTON, _makelparam(x, y)))
         ok2 = bool(_user32.PostMessageW(hwnd, WM_RBUTTONUP, 0, _makelparam(x, y)))
@@ -442,9 +463,10 @@ def post_mouse_move(hwnd: int, x: int, y: int) -> bool:
 
 
 def post_key(hwnd: int, vk: int, *, down: bool = True) -> bool:
-    """发送按键消息(虚拟键码)."""
+    """发送按键消息(虚拟键码 + 扫描码 lParam,bit30/31 按 down/up 置位)."""
     msg = WM_KEYDOWN if down else WM_KEYUP
-    return bool(_user32.PostMessageW(hwnd, msg, vk, 0))
+    lp = _key_lparam(vk, up=not down)
+    return bool(_user32.PostMessageW(hwnd, msg, int(vk) & 0xFFFF, lp))
 
 
 # === 显示器工作区 / 聚焦 ===

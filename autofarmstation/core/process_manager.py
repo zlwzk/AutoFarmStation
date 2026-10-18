@@ -32,6 +32,7 @@ class TrackedProcess:
     tags: list[str] = field(default_factory=list)
     alias: str = ""  # 用户给这个窗口起的别名(多开时靠它分辨)
     color: str = ""  # 卡片强调色(十六进制,空 = 不强调)
+    group: str = ""  # v1.7.0 分屏分类标签:「需点击」/「纯挂时长」/自定义;空 = 未分组
     # === v1.6.1 聚焦时的窗口几何偏好(每窗口独立,默认不缩不放) ===
     margin_left: int = 0  # 左边距(像素)
     margin_top: int = 0
@@ -77,6 +78,7 @@ class TrackedProcess:
             tags=list(d.get("tags", []) or []),
             alias=str(d.get("alias", "") or ""),
             color=str(d.get("color", "") or ""),
+            group=str(d.get("group", "") or ""),  # v1.7.0 分屏分类
             margin_left=int(d.get("margin_left", 0) or 0),
             margin_top=int(d.get("margin_top", 0) or 0),
             margin_right=int(d.get("margin_right", 0) or 0),
@@ -283,6 +285,21 @@ class ProcessManager:
         if item is not None:
             item.cpu = float(cpu)
             item.mem_mb = float(mem_mb)
+
+    def set_group(self, hwnd: int, group: str) -> bool:
+        """v1.7.0 设置窗口的分组标签(空串 = 移出分组)."""
+        with self._lock:
+            item = self._items.get(int(hwnd))
+        if item is None:
+            return False
+        item.group = str(group or "").strip()
+        return True
+
+    def all_groups(self) -> list[str]:
+        """当前已使用的分组名(按名称排序,去空)."""
+        with self._lock:
+            names = {it.group for it in self._items.values()}
+        return sorted(n for n in names if n)
 
     def set_alias(self, hwnd: int, alias: str, color: str | None = None) -> bool:
         """改别名 / 强调色(别名留空则回退成窗口标题)."""

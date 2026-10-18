@@ -109,6 +109,7 @@ class Session:
                     "config": cfg_map.get(str(tp.hwnd), {}) or {},
                     "added_at": float(tp.added_at or 0.0),
                     "launch": launch,
+                    "group": tp.group or "",  # v1.7.0 分屏分类
                 }
             )
         payload = {

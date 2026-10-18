@@ -322,7 +322,7 @@ class InputSender:
 
         # send 模式 / auto 回退
         try:
-            wf.set_foreground(hwnd)
+            wf.force_foreground(hwnd)
             time.sleep(0.02)
             sx, sy = ox + x, oy + y
             _InputHelper.click_at(sx, sy, button)

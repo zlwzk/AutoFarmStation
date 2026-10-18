@@ -61,7 +61,9 @@ class ClickerPanel(QWidget):
             init_jitter = max(0, min(100, int(d.get("jitter_pct", 10))))
         except Exception:
             init_jitter = 10
-        init_mode_idx = 0 if str(d.get("mode", "post")).lower().startswith("post") else 1
+        # v1.7.0:发送方式补上 auto(先后台投递,失败自动改真实输入)
+        init_mode = str(d.get("mode", "auto")).lower()
+        init_mode_idx = {"auto": 0, "post": 1, "send": 2}.get(init_mode, 0)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 8, 8, 8)
@@ -87,7 +89,16 @@ class ClickerPanel(QWidget):
         self._loop.setChecked(True)
         f.addRow("", self._loop)
         self._mode = QComboBox()
-        self._mode.addItems(["post 消息(安全)", "send 真实输入(需前台)"])
+        self._mode.addItems([
+            "auto 自动(推荐,后台优先失败转前台)",
+            "post 消息(安全,不抢前台)",
+            "send 真实输入(需前台)",
+        ])
+        self._mode.setToolTip(
+            "auto:先用 post 后台投递,很多游戏收不到时自动改用真实输入;\n"
+            "post:只发窗口消息,最安全,适合大部分窗口化挂机游戏;\n"
+            "send:直接模拟真实鼠标(需要窗口在前台),适合独占全屏/不认消息的游戏。"
+        )
         self._mode.setCurrentIndex(init_mode_idx)
         f.addRow("发送方式:", self._mode)
         v.addWidget(interval_box)
@@ -191,7 +202,7 @@ class ClickerPanel(QWidget):
             jitter_pct=int(self._jitter.value()),
             total_clicks=int(self._total.value()),
             loop=self._loop.isChecked(),
-            mode="send" if self._mode.currentIndex() == 1 else "post",
+            mode=("auto", "post", "send")[self._mode.currentIndex()] if 0 <= self._mode.currentIndex() <= 2 else "auto",
             client_w=int(cw) if cw > 0 else 0,
             client_h=int(ch) if ch > 0 else 0,
         )

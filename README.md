@@ -1,8 +1,8 @@
 # AutoFarmStation · 多开挂机大师
 
-> 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、Steam 挂机游戏预设,一站搞定。
+> 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、分屏分类、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.6.5-blue)
+![banner](https://img.shields.io/badge/version-1.7.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -41,7 +41,12 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
   - 勾选左侧任意几个窗口 → `📡 应用当前配置` / `▶ 同步启动` / `■ 同步停止`,让它们同时跑同一套连贯操作。
   - 广播只是复制一份初始配置,**每个窗口各存一份**,之后可以分别改成互不相同的操作(窗口 A 点左边、窗口 B 点右边、窗口 C 跑键盘宏,互不干扰)。
   - 也可以完全不勾选,只对某一个窗口单独配置、单独启停。
+- **分屏分类**(v1.7.0):右键卡片标题把窗口归入「需点击 / 纯挂时长 / 自定义」分组;
+  顶部分类条一键过滤(全部 / 各分组 / 未分组,带数量),选中分类后可「▶ 启动本组 / ■ 停止本组」;
+  卡片带彩色分组徽标;全选 / 反选只作用于当前分类;分组随会话恢复、游戏重启换句柄也跟着迁移。
 - **连点器**:多点击点位轮询、可设随机抖动、左右中双击支持、可视化选点、每进程独立配置。
+  - **发送方式**:`auto`(默认推荐,后台投递优先、失败自动转真实输入)/ `post` 消息(安全,不抢前台)/
+    `send` 真实输入(需前台);状态栏显示点击次数与失败数。
 - **键盘宏**:按键序列回放、持续按键、单键循环,任意组合。
 - **宏录制/回放**:录制鼠标 + 键盘轨迹,保存为可分享的 JSON,任意窗口回放。
 - **Steam 状态联动**:开始挂机自动把 Steam 状态切到「在线 / 离开 / 隐身」,挂机停完自动还原;
@@ -192,7 +197,7 @@ A:实测 `offline` 走这个协议在当前 Steam 客户端不生效(状态不�
 ## 自检与开发
 
 ```bash
-python -m scripts.selftest   # 46 项自检(v1.6.5;v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
+python -m scripts.selftest   # 47 项自检(v1.7.0;v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe)
 powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(可选)
 ```

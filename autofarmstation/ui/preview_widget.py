@@ -38,6 +38,17 @@ CARD_COLORS: tuple[tuple[str, str], ...] = (
     ("紫", "#a06ad0"),
 )
 
+# v1.7.0 分屏分类:预设分组 + 组名 → 颜色(按名字稳定哈希,同组永远同色)
+GROUP_PRESETS: tuple[str, ...] = ("需点击", "纯挂时长")
+_GROUP_PALETTE = ("#4a9eff", "#8fd18f", "#e8b34b", "#e07b7b", "#b48ee0", "#5bc8c4", "#c8c8c8")
+
+
+def group_color(name: str) -> str:
+    h = 0
+    for ch in name or "?":
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return _GROUP_PALETTE[h % len(_GROUP_PALETTE)]
+
 
 class PreviewWidget(QFrame):
     """单个窗口预览卡片(可勾选 / 可嵌入)."""
@@ -49,6 +60,7 @@ class PreviewWidget(QFrame):
     stop_process = Signal(int)  # hwnd → 结束该游戏进程
     resume_process = Signal(int)  # hwnd → 重新唤醒该游戏
     volume_requested = Signal(int)  # hwnd → 打开单窗口音量面板
+    group_changed = Signal()  # v1.7.0 分组标签变化(网格据此重建分类条)
 
     def __init__(
         self,
@@ -110,6 +122,15 @@ class PreviewWidget(QFrame):
             self._title_lab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self._title_lab.customContextMenuRequested.connect(self._on_title_menu)
         title_bar.addWidget(self._title_lab)
+
+        # v1.7.0 分屏分类徽标(「需点击」/「纯挂时长」/自定义)
+        self._group_badge = QLabel("")
+        self._group_badge.setVisible(False)
+        self._group_badge.setStyleSheet(
+            "color:#4a9eff; border:1px solid #4a9eff; border-radius:6px;"
+            "padding:0 5px; font-size:10px; background:rgba(74,158,255,0.12);"
+        )
+        title_bar.addWidget(self._group_badge)
 
         self._btn_embed = QPushButton("嵌入")
         self._btn_embed.setCheckable(True)
@@ -259,6 +280,44 @@ class PreviewWidget(QFrame):
         item = self._pm.get(self.hwnd)
         return (item.color if item else "") or ""
 
+    # === v1.7.0 分屏分类 ===
+    def _group_name(self) -> str:
+        if self._pm is None:
+            return ""
+        item = self._pm.get(self.hwnd)
+        return (item.group if item else "") or ""
+
+    def _set_group(self, group: str) -> None:
+        if self._pm is None:
+            return
+        self._pm.set_group(self.hwnd, group)
+        self._update_group_badge()
+        self.group_changed.emit()
+
+    def _on_new_group(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "新建分组",
+            "分组名(如:需点击 / 纯挂时长 / 主力号):\n"
+            "同名窗口归入同一组,可在顶部分类条里按组过滤和批量启动。",
+        )
+        if ok and name.strip():
+            self._set_group(name.strip())
+
+    def _update_group_badge(self) -> None:
+        g = self._group_name()
+        if g == getattr(self, "_last_group_shown", None):
+            return  # 没变化就不重设样式(每秒刷一次,避免无谓的重新渲染)
+        self._last_group_shown = g
+        self._group_badge.setText(g)
+        self._group_badge.setVisible(bool(g))
+        if g:
+            c = group_color(g)
+            self._group_badge.setStyleSheet(
+                f"color:{c}; border:1px solid {c}; border-radius:6px;"
+                f"padding:0 5px; font-size:10px;"
+            )
+            self._group_badge.setToolTip(f"分组:{g}\n(右键标题 → 分组 可修改)")
+
     def _apply_style(self) -> None:
         """边框:选中 > 自定义强调色 > 默认;悬停统一高亮."""
         chk = getattr(self, "_chk", None)
@@ -292,6 +351,33 @@ class PreviewWidget(QFrame):
         act_clear.setEnabled(bool(self._alias()))
         act_clear.triggered.connect(lambda: self._set_alias(""))
         menu.addAction(act_clear)
+
+        # v1.7.0 分屏分类:把窗口归入「需点击」/「纯挂时长」等分组
+        sub_g = menu.addMenu("分组(分屏分类)")
+        cur_g = self._group_name()
+        names = list(GROUP_PRESETS)
+        try:
+            for g in self._pm.all_groups():
+                if g not in names:
+                    names.append(g)
+        except Exception:  # noqa: BLE001
+            pass
+        for g in names:
+            act = QAction(("● " if cur_g == g else "○ ") + g, self)
+            act.setCheckable(True)
+            act.setChecked(cur_g == g)
+            act.triggered.connect(lambda _c=False, s=g: self._set_group(s))
+            sub_g.addAction(act)
+        act_ungroup = QAction("未分组", self)
+        act_ungroup.setCheckable(True)
+        act_ungroup.setChecked(not cur_g)
+        act_ungroup.triggered.connect(lambda: self._set_group(""))
+        sub_g.addAction(act_ungroup)
+        sub_g.addSeparator()
+        act_new_g = QAction("新建分组...", self)
+        act_new_g.triggered.connect(self._on_new_group)
+        sub_g.addAction(act_new_g)
+
         menu.exec(self._title_lab.mapToGlobal(pos))
 
     def _on_rename(self) -> None:
@@ -449,6 +535,7 @@ class PreviewWidget(QFrame):
             pass
 
     def _refresh_status(self) -> None:
+        self._update_group_badge()  # v1.7.0 分组标签跟着进程数据走
         info = wf.get_window_info(self.hwnd)
         if info is None:
             self._title_lab.setText("[已失效]")

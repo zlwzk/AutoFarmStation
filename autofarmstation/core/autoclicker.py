@@ -142,7 +142,7 @@ class AutoClickerConfig:
             jitter_pct=int(d.get("jitter_pct", 0)),
             total_clicks=int(d.get("total_clicks", 0)),
             loop=bool(d.get("loop", True)),
-            mode=str(d.get("mode", "post")),
+            mode=str(d.get("mode", "auto")),
             client_w=int(d.get("client_w", 0) or 0),
             client_h=int(d.get("client_h", 0) or 0),
         )
@@ -173,6 +173,7 @@ class AutoClicker:
         self._pause = threading.Event()
         self._pause.set()  # 默认非暂停
         self._done_count = 0
+        self._fail_count = 0
         self._lock = threading.Lock()
         self._started_at: float = 0.0
         # 回调
@@ -196,6 +197,12 @@ class AutoClicker:
             return self._done_count
 
     @property
+    def fail_count(self) -> int:
+        """本次运行里投递失败的点击次数(连续失败说明发送方式不适用)."""
+        with self._lock:
+            return self._fail_count
+
+    @property
     def runtime_seconds(self) -> float:
         if not self._started_at:
             return 0.0
@@ -214,6 +221,7 @@ class AutoClicker:
         self._stop.clear()
         self._pause.set()
         self._done_count = 0
+        self._fail_count = 0
         self._started_at = time.time()
         self._thread = threading.Thread(
             target=self._run, name=f"AutoClicker-{self.config.hwnd}", daemon=True
@@ -288,14 +296,20 @@ class AutoClicker:
                 while not self._pause.is_set() and not self._stop.is_set():
                     self._pause.wait(timeout=0.1)
 
-                # 检查窗口是否还存在
+                # 检查窗口是否还存在(窗口销毁才停;最小化不停 —— post 消息
+                # 对最小化窗口照样有效,挂机时把游戏最小化是常态,
+                # 之前「最小化连点器就死」是个大坑)
                 if self._stop.is_set():
                     return
                 from . import window_finder as wf
                 info = wf.get_window_info(self.config.hwnd)
-                if info is None or not info.visible:
-                    self._log.info("窗口已失效,连点器自动停止 (hwnd=%s)", self.config.hwnd)
+                if info is None:
+                    self._log.info("窗口已销毁,连点器自动停止 (hwnd=%s)", self.config.hwnd)
                     return
+                if info.is_minimized and self._sender.default_mode == "send":
+                    # send 模式必须前台,最小化时打不到 —— 跳过这一轮,不清空计数
+                    self._sleep_interval()
+                    continue
 
                 pts = self.config.points
                 if not pts:
@@ -323,11 +337,15 @@ class AutoClicker:
                 try:
                     ok, reason = self._sender.click((self.config.hwnd, cx, cy), p.button, double=p.double)
                     if not ok:
+                        with self._lock:
+                            self._fail_count += 1
                         self._log.warning("点击失败: %s", reason or "未知原因")
                     elif reason:
                         # auto 模式回退提示,不是错误
                         self._log.info("连点回退: %s", reason)
                 except Exception as e:  # noqa: BLE001
+                    with self._lock:
+                        self._fail_count += 1
                     self._log.warning("点击异常: %s", e)
 
                 with self._lock:

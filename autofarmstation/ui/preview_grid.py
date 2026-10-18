@@ -1,13 +1,10 @@
 """左侧预览网格.
 
-顶部增加一条「多窗口同步」工具条:
-    * 勾选若干窗口卡片 = 选中一组窗口
-    * 「同步启动 / 同步停止」= 对这一组窗口同时施加操作
+顶部两条工具条:
+    * 「多窗口同步」:勾选若干窗口卡片 → 同步启动 / 停止 / 广播配置
+    * 「分屏分类」(v1.7.0):把窗口归入分组(如「需点击」「纯挂时长」),
+      点击分类条上的组名即可只看该组窗口,并可对整组一键启动 / 停止
     * 卡片各自仍可独立配置(右侧面板只作用于「当前聚焦窗口」)
-
-这样就同时满足:
-    - 多个窗口同步执行同一套连贯操作
-    - 单个窗口分开执行各自不同的操作
 """
 
 from __future__ import annotations
@@ -17,17 +14,17 @@ import logging
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QGridLayout, QScrollArea, QVBoxLayout, QHBoxLayout,
-    QFrame, QLabel, QPushButton, QSizePolicy,
+    QFrame, QLabel, QPushButton, QSizePolicy, QToolButton,
 )
 
 from ..core.process_manager import ProcessManager, TrackedProcess
 from ..core.automation_hub import AutomationHub
-from .preview_widget import PreviewWidget
+from .preview_widget import GROUP_PRESETS, PreviewWidget, group_color
 from .widgets import styled_message
 
 
 class PreviewGrid(QWidget):
-    """左侧预览网格 + 多窗口同步工具条."""
+    """左侧预览网格 + 多窗口同步工具条 + 分屏分类条."""
 
     selection_changed = Signal(list)        # list[int] 当前勾选的 hwnd
     sync_start_requested = Signal(list)     # 请求对勾选窗口同步启动
@@ -36,6 +33,8 @@ class PreviewGrid(QWidget):
     stop_process_requested = Signal(int)    # hwnd → 结束该游戏进程
     resume_process_requested = Signal(int)  # hwnd → 重新唤醒该游戏
     volume_requested = Signal(int)          # hwnd → 打开单窗口音量面板
+    group_start_requested = Signal(list)    # v1.7.0 对当前分类下的整组窗口启动
+    group_stop_requested = Signal(list)     # v1.7.0 对当前分类下的整组窗口停止
 
     def __init__(
         self,
@@ -116,6 +115,39 @@ class PreviewGrid(QWidget):
         hl.addWidget(self._btn_sync_stop)
 
         outer.addWidget(header)
+
+        # ---------- v1.7.0 分屏分类条 ----------
+        # 「需点击」= 挂机时要点按钮/收菜的游戏;「纯挂时长」= 挂着不动也行的游戏。
+        # 点组名只显示该组窗口,「启动本组/停止本组」对整组批量操作。
+        self._filter: str | None = None  # None=全部; ""=未分组; 其他=组名
+        gbar = QWidget()
+        gbar.setStyleSheet("background:#262626; border-bottom:1px solid #3c3c3c;")
+        gl = QHBoxLayout(gbar)
+        gl.setContentsMargins(8, 4, 8, 4)
+        gl.setSpacing(4)
+
+        glab = QLabel("分类:")
+        glab.setStyleSheet("color:#999; font-size:11px;")
+        gl.addWidget(glab)
+
+        self._chip_layout = QHBoxLayout()
+        self._chip_layout.setSpacing(4)
+        gl.addLayout(self._chip_layout)
+        gl.addStretch()
+
+        self._btn_group_start = QPushButton("▶ 启动本组")
+        self._btn_group_start.setToolTip("对当前选中的分类里的全部窗口同步启动(各自用已有配置)")
+        self._btn_group_start.setEnabled(False)
+        self._btn_group_start.clicked.connect(self._on_group_start)
+        gl.addWidget(self._btn_group_start)
+
+        self._btn_group_stop = QPushButton("■ 停止本组")
+        self._btn_group_stop.setToolTip("对当前选中的分类里的全部窗口停止连点/宏等自动化")
+        self._btn_group_stop.setEnabled(False)
+        self._btn_group_stop.clicked.connect(self._on_group_stop)
+        gl.addWidget(self._btn_group_stop)
+
+        outer.addWidget(gbar)
 
         # ---------- 滚动网格 ----------
         self._scroll = QScrollArea()
@@ -205,14 +237,92 @@ class PreviewGrid(QWidget):
         for w in self._items.values():
             w.stop()
 
+    # ---------- v1.7.0 分屏分类 ----------
+    def _group_of(self, hwnd: int) -> str:
+        item = self._pm.get(int(hwnd))
+        return (item.group if item else "") or ""
+
+    def _passes_filter(self, hwnd: int) -> bool:
+        """None=全部;""=未分组;其他=只显示该组."""
+        if self._filter is None:
+            return True
+        return self._group_of(hwnd) == self._filter
+
+    def refresh_group_bar(self) -> None:
+        """按当前进程数据重建分类条(组名 chip + 数量)."""
+        names: list[str] = list(GROUP_PRESETS)
+        try:
+            for g in self._pm.all_groups():
+                if g not in names:
+                    names.append(g)
+        except Exception:  # noqa: BLE001
+            pass
+        # 当前过滤目标已不存在 → 回到「全部」
+        if self._filter is not None and self._filter not in names and self._filter != "":
+            self._filter = None
+        # 清空旧 chip
+        while self._chip_layout.count():
+            it = self._chip_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        n_all = len(self._items)
+        chips: list[tuple[str, str | None, int, str]] = []  # (文本, 过滤值, 数量, 颜色)
+        chips.append((f"全部 {n_all}", None, n_all, "#9ad"))
+        for g in names:
+            cnt = sum(1 for h in self._items if self._group_of(h) == g)
+            chips.append((f"{g} {cnt}", g, cnt, group_color(g)))
+        n_un = sum(1 for h in self._items if not self._group_of(h))
+        chips.append((f"未分组 {n_un}", "", n_un, "#888"))
+        for text, fval, _cnt, color in chips:
+            btn = QToolButton(text)
+            btn.setCheckable(True)
+            btn.setChecked(self._filter == fval)
+            btn.setStyleSheet(
+                f"QToolButton {{ color:#ccc; border:1px solid #444; border-radius:8px;"
+                f"padding:1px 8px; font-size:11px; background:transparent; }}"
+                f"QToolButton:hover {{ border-color:{color}; }}"
+                f"QToolButton:checked {{ color:{color}; border-color:{color};"
+                f"background:rgba(255,255,255,0.06); font-weight:bold; }}"
+            )
+            btn.clicked.connect(lambda _c=False, v=fval: self._on_filter_chip(v))
+            self._chip_layout.addWidget(btn)
+        has_filter = self._filter is not None
+        self._btn_group_start.setEnabled(has_filter and n_all > 0)
+        self._btn_group_stop.setEnabled(has_filter and n_all > 0)
+        self._apply_filter()
+
+    def _on_filter_chip(self, value: str | None) -> None:
+        self._filter = value
+        self.refresh_group_bar()
+
+    def _on_group_start(self) -> None:
+        hwnds = [h for h in self._items if self._passes_filter(h)]
+        if hwnds:
+            self.group_start_requested.emit(hwnds)
+
+    def _on_group_stop(self) -> None:
+        hwnds = [h for h in self._items if self._passes_filter(h)]
+        if hwnds:
+            self.group_stop_requested.emit(hwnds)
+
+    def _apply_filter(self) -> None:
+        """按当前分类过滤卡片可见性并重排."""
+        for hwnd, w in self._items.items():
+            w.setVisible(self._passes_filter(hwnd))
+        self._relayout()
+
     # ---------- 内部 ----------
     def _set_all(self, on: bool) -> None:
-        for w in self._items.values():
-            w.set_selected(on)
+        # 全选 / 清空只作用于当前分类下可见的窗口(配合分屏分类做组级勾选)
+        for hwnd, w in self._items.items():
+            if self._passes_filter(hwnd):
+                w.set_selected(on)
 
     def _invert(self) -> None:
-        for w in self._items.values():
-            w.set_selected(not w.is_selected())
+        for hwnd, w in self._items.items():
+            if self._passes_filter(hwnd):
+                w.set_selected(not w.is_selected())
 
     def _on_card_selection_changed(self, hwnd: int, on: bool) -> None:
         self._update_sel_label()
@@ -220,8 +330,13 @@ class PreviewGrid(QWidget):
 
     def _update_sel_label(self) -> None:
         n = len(self.selected_hwnds())
-        total = len(self._items)
-        self._sel_lab.setText(f"已选 {n} / {total} 个")
+        # 过滤状态下分母只算当前分类里的窗口,数量更直观
+        if self._filter is None:
+            total = len(self._items)
+        else:
+            total = sum(1 for h in self._items if self._passes_filter(h))
+        suffix = f"(分类内 {total})" if self._filter is not None else f" / {total}"
+        self._sel_lab.setText(f"已选 {n}{suffix}")
         has = n > 0
         for b in (self._btn_sync_start, self._btn_sync_stop, self._btn_broadcast):
             b.setEnabled(has)
@@ -290,14 +405,19 @@ class PreviewGrid(QWidget):
                 w.stop_process.connect(self.stop_process_requested.emit)
                 w.resume_process.connect(self.resume_process_requested.emit)
                 w.volume_requested.connect(self.volume_requested.emit)
+                w.group_changed.connect(self._on_group_changed)  # v1.7.0
                 self._items[it.hwnd] = w
             else:
                 # 已存在的卡片:别名 / 强调色可能在别处改过,顺手刷新
                 self._items[it.hwnd].refresh_alias()
         # 空提示
         self._empty_label.setVisible(not self._items)
-        self._relayout()
+        self.refresh_group_bar()
         self._update_sel_label()
+
+    def _on_group_changed(self) -> None:
+        """某张卡片改了分组 → 重建分类条并重新过滤."""
+        self.refresh_group_bar()
 
     def _relayout(self) -> None:
         # 清空 layout(保留 widget 引用)
@@ -305,8 +425,25 @@ class PreviewGrid(QWidget):
             self._layout.takeAt(0)
         n = len(self._items)
         if n == 0:
+            self._empty_label.setText(
+                "尚未选择任何进程。\n\n"
+                "点击左上角「添加窗口」,选择游戏窗口,即可开始挂机。\n\n"
+                "支持任意进程,不限 Steam。\n\n"
+                "提示:勾选多个窗口后,可用上方「同步启动」让它们执行同一套操作。"
+            )
+            self._empty_label.setVisible(True)
             self._layout.addWidget(self._empty_label, 0, 0)
             return
+        # v1.7.0:只摆放通过分类过滤的卡片(隐藏的卡片会被布局自动跳过)
+        visible = [w for h, w in self._items.items() if self._passes_filter(h)]
+        if not visible:
+            self._empty_label.setText(
+                "该分类下暂无窗口。\n\n右键卡片标题 →「分组(分屏分类)」可把窗口归入分类。"
+            )
+            self._empty_label.setVisible(True)
+            self._layout.addWidget(self._empty_label, 0, 0)
+            return
+        self._empty_label.setVisible(False)
         cols = self._columns
         if cols <= 0:
             # 按当前卡片宽度自适应列数(卡片越大,一行放得越少)
@@ -317,7 +454,7 @@ class PreviewGrid(QWidget):
             except Exception:
                 cols = 2
             cols = min(max(1, cols), 6)
-        for idx, w in enumerate(self._items.values()):
+        for idx, w in enumerate(visible):
             r, c = divmod(idx, cols)
             self._layout.addWidget(w, r, c)
         self._layout.setRowStretch(self._layout.rowCount(), 1)
