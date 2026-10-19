@@ -311,6 +311,9 @@ class InputSender:
             x, y = cw // 2, ch // 2
         else:
             hwnd, x, y = int(target[0]), int(target[1]), int(target[2])
+            if wf.get_window_info(hwnd) is None:
+                # 窗口刚销毁:若继续走 send 回退会点到屏幕上错误位置,必须拦下
+                return (False, "窗口已失效")
             ox, oy = wf.client_origin(hwnd)
 
         if m in ("post", "auto"):

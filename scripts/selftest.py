@@ -1395,6 +1395,98 @@ def t_hub_pause_clicker() -> bool:
         return False
 
 
+def t_post_click_child_hit() -> bool:
+    """v1.8.2:post_click/post_mouse_move 命中坐标处最深层子窗口.
+
+    修「后台运行时窗口选择异常」:CEF 页游 / 模拟器 / 部分 Unity 游戏的
+    输入由渲染子窗口处理,投给顶层 hwnd 收不到。
+    """
+    _div("v1.8.2 post click child-window hit")
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from autofarmstation.core import window_finder as wf
+
+        # 1) 无效句柄 / 负坐标:原样回退,不抛异常
+        assert wf._deepest_child_at(0, 10, 10) == (0, 10, 10)
+        assert wf._deepest_child_at(999999, -5, 10) == (999999, -5, 10)
+
+        # 2) 真实窗口树:父窗口内 (50,40) 处盖 200x150 子窗口
+        u32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        WNDPROCTYPE = ctypes.WINFUNCTYPE(
+            wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        )
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT), ("lpfnWndProc", WNDPROCTYPE),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u32.DefWindowProcW.restype = wintypes.LPARAM
+        u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u32.RegisterClassW.restype = wintypes.WORD
+        u32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        ]
+        u32.CreateWindowExW.restype = wintypes.HWND
+        u32.DestroyWindow.argtypes = [wintypes.HWND]
+        u32.DestroyWindow.restype = wintypes.BOOL
+        u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u32.ShowWindow.restype = wintypes.BOOL
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        proc = WNDPROCTYPE(lambda h, m, wp, lp: u32.DefWindowProcW(h, m, wp, lp))
+        hinst = k32.GetModuleHandleW(None)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = proc
+        wc.hInstance = hinst
+        wc.lpszClassName = "AfsSelftestParent"
+        u32.RegisterClassW(ctypes.byref(wc))
+
+        WS_OVERLAPPEDWINDOW = 0x00CF0000
+        WS_CHILD = 0x40000000
+        WS_VISIBLE = 0x10000000
+        SW_SHOWNOACTIVATE = 4
+        parent = u32.CreateWindowExW(
+            0, "AfsSelftestParent", "afs-selftest", WS_OVERLAPPEDWINDOW,
+            0, 0, 400, 300, None, None, hinst, None,
+        )
+        assert parent
+        child = u32.CreateWindowExW(
+            0, "Static", "child", WS_CHILD | WS_VISIBLE,
+            50, 40, 200, 150, parent, None, hinst, None,
+        )
+        assert child
+        try:
+            u32.ShowWindow(parent, SW_SHOWNOACTIVATE)  # 子窗口需可见才会被命中
+            # 子窗口内的点(父客户区 100,100)→ 命中子窗口,坐标≈(50,60)
+            t2, x2, y2 = wf._deepest_child_at(parent, 100, 100)
+            assert t2 == child, f"expected child {child}, got {t2}"
+            assert abs(x2 - 50) <= 2 and abs(y2 - 60) <= 2, f"child coords off: {(x2, y2)}"
+            # 子窗口外的点(父客户区 5,5)→ 仍是父窗口
+            t3, _, _ = wf._deepest_child_at(parent, 5, 5)
+            assert t3 == parent, f"expected parent {parent}, got {t3}"
+            # 消息投递链路不崩
+            assert wf.post_mouse_move(parent, 100, 100)
+            _ok("post 子窗口命中 + 坐标转换 ok")
+            return True
+        finally:
+            u32.DestroyWindow(child)
+            u32.DestroyWindow(parent)
+    except Exception as e:  # noqa: BLE001
+        _fail("post_click_child_hit", e)
+        return False
+
+
 def t_user_bats_persist() -> bool:
     """v1.6.2:用户自加的 bat 脚本必须跨「重建 BatLibrary」持久化。
 
@@ -2103,6 +2195,8 @@ def run_all() -> int:
                                         t_crash_guards,
                                         # v1.8.1 新增(连点暂停走 hub)
                                         t_hub_pause_clicker,
+                                        # v1.8.2 新增(后台连点命中子窗口)
+                                        t_post_click_child_hit,
                                         ]
     passed = 0
     failed = 0

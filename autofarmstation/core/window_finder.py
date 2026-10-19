@@ -107,6 +107,10 @@ _user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, 
 _user32.SendMessageW.restype = wintypes.LPARAM
 _user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
 _user32.MapVirtualKeyW.restype = wintypes.UINT
+_user32.ChildWindowFromPointEx.argtypes = [wintypes.HWND, wintypes.POINT, wintypes.UINT]
+_user32.ChildWindowFromPointEx.restype = wintypes.HWND
+_user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+_user32.ScreenToClient.restype = wintypes.BOOL
 
 
 # --- 显示器工作区 / 前置窗口 ---
@@ -417,6 +421,47 @@ def _makelparam(x: int, y: int) -> int:
     return (y & 0xFFFF) << 16 | (x & 0xFFFF)
 
 
+# ChildWindowFromPointEx 标志
+CWP_SKIPINVISIBLE = 0x0001
+CWP_SKIPDISABLED = 0x0002
+
+
+def _deepest_child_at(hwnd: int, x: int, y: int) -> tuple[int, int, int]:
+    """在 hwnd 客户区坐标 (x, y) 处定位最深层可见子窗口.
+
+    返回 (目标窗口, 目标窗口客户区坐标 x, y)。
+    找不到子窗口 / 任何一步出错时回退为 (hwnd, x, y) —— 保证不比以前差。
+
+    为什么需要这个:后台 post 模式下,消息必须投给「真正处理输入的窗口」。
+    CEF 页游(Chrome_RenderWidgetHostHWND)、安卓模拟器、部分 Unity 游戏的
+    渲染画面都在子窗口上,投给顶层 hwnd 它们根本收不到 —— 表现为
+    「窗口选对了但连点没反应」。
+    """
+    cur = int(hwnd)
+    cx, cy = int(x), int(y)
+    if cur <= 0 or cx < 0 or cy < 0:
+        return (cur, cx, cy)
+    try:
+        for _ in range(8):  # 层级有限,防异常窗口树死循环
+            child = _user32.ChildWindowFromPointEx(
+                cur, wintypes.POINT(cx, cy), CWP_SKIPINVISIBLE | CWP_SKIPDISABLED,
+            )
+            child = int(child or 0)
+            if not child or child == cur:
+                break
+            # 坐标从「当前窗口客户区」转换到「子窗口客户区」:
+            # 先转到屏幕坐标,再转到子窗口客户区
+            pt = wintypes.POINT(cx, cy)
+            if not _user32.ClientToScreen(cur, ctypes.byref(pt)):
+                break
+            if not _user32.ScreenToClient(child, ctypes.byref(pt)):
+                break
+            cur, cx, cy = child, int(pt.x), int(pt.y)
+    except Exception:
+        return (int(hwnd), int(x), int(y))
+    return (cur, cx, cy)
+
+
 def _key_lparam(vk: int, *, up: bool = False) -> int:
     """构造键盘消息的 LPARAM(bit30/31 清零,24 位 = 1 视为合成事件可留 0).
 
@@ -436,30 +481,35 @@ def post_click(hwnd: int, x: int, y: int, button: str = "left", double: bool = F
 
     按下前先补一条 WM_MOUSEMOVE:不少游戏框架以「最后移动位置」决定命中区域,
     不发移动直接 down/up 会点在引擎内部认为的旧坐标上。
+
+    v1.8.2:先命中 (x,y) 处最深层可见子窗口再投递 —— CEF 页游 / 模拟器 /
+    部分 Unity 游戏的输入由渲染子窗口处理,投给顶层 hwnd 收不到。
     """
-    _user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, _makelparam(x, y))
+    t, cx, cy = _deepest_child_at(hwnd, x, y)
+    _user32.PostMessageW(t, WM_MOUSEMOVE, 0, _makelparam(cx, cy))
     if button == "left":
         if double:
-            ok1 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, _makelparam(x, y)))
-            ok2 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, _makelparam(x, y)))
+            ok1 = bool(_user32.PostMessageW(t, WM_LBUTTONDBLCLK, MK_LBUTTON, _makelparam(cx, cy)))
+            ok2 = bool(_user32.PostMessageW(t, WM_LBUTTONUP, 0, _makelparam(cx, cy)))
             return ok1 and ok2
-        ok1 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, _makelparam(x, y)))
-        ok2 = bool(_user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, _makelparam(x, y)))
+        ok1 = bool(_user32.PostMessageW(t, WM_LBUTTONDOWN, MK_LBUTTON, _makelparam(cx, cy)))
+        ok2 = bool(_user32.PostMessageW(t, WM_LBUTTONUP, 0, _makelparam(cx, cy)))
         return ok1 and ok2
     elif button == "right":
-        ok1 = bool(_user32.PostMessageW(hwnd, WM_RBUTTONDOWN, MK_RBUTTON, _makelparam(x, y)))
-        ok2 = bool(_user32.PostMessageW(hwnd, WM_RBUTTONUP, 0, _makelparam(x, y)))
+        ok1 = bool(_user32.PostMessageW(t, WM_RBUTTONDOWN, MK_RBUTTON, _makelparam(cx, cy)))
+        ok2 = bool(_user32.PostMessageW(t, WM_RBUTTONUP, 0, _makelparam(cx, cy)))
         return ok1 and ok2
     elif button == "middle":
-        ok1 = bool(_user32.PostMessageW(hwnd, WM_MBUTTONDOWN, MK_MBUTTON, _makelparam(x, y)))
-        ok2 = bool(_user32.PostMessageW(hwnd, WM_MBUTTONUP, 0, _makelparam(x, y)))
+        ok1 = bool(_user32.PostMessageW(t, WM_MBUTTONDOWN, MK_MBUTTON, _makelparam(cx, cy)))
+        ok2 = bool(_user32.PostMessageW(t, WM_MBUTTONUP, 0, _makelparam(cx, cy)))
         return ok1 and ok2
     return False
 
 
 def post_mouse_move(hwnd: int, x: int, y: int) -> bool:
-    """发送鼠标移动消息."""
-    return bool(_user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, _makelparam(x, y)))
+    """发送鼠标移动消息(v1.8.2:命中坐标处最深层子窗口)."""
+    t, cx, cy = _deepest_child_at(hwnd, x, y)
+    return bool(_user32.PostMessageW(t, WM_MOUSEMOVE, 0, _makelparam(cx, cy)))
 
 
 def post_key(hwnd: int, vk: int, *, down: bool = True) -> bool:
