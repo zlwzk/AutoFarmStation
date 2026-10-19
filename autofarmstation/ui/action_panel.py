@@ -282,6 +282,18 @@ class ClickerPanel(QWidget):
             self._status.setText(styled_message("连点器已停止", level="info"))
 
     def _on_pause(self) -> None:
+        # hub 路径:暂停/继续当前目标窗口(之前这个按钮在 hub 模式下点了没反应)
+        if self._hub is not None:
+            if not self._target_hwnd:
+                self._status.setText(styled_message("请先选择目标窗口", level="warn"))
+                return
+            res = self._hub.toggle_pause_clicker(self._target_hwnd)
+            if res is None:
+                self._status.setText(styled_message("该窗口的连点器未在运行", level="warn"))
+            else:
+                self._status.setText(styled_message(
+                    f"连点器{'已暂停' if res else '继续运行'}", level="info"))
+            return
         if self._clicker and self._clicker.is_running:
             paused = self._clicker.toggle_pause()
             self._status.setText(styled_message(f"连点器{'暂停' if paused else '继续'}", level="info"))

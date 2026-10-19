@@ -175,6 +175,9 @@ class PreviewGrid(QWidget):
         )
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setStyleSheet("color:#888; font-size:13px;")
+        self._empty_label.setOpenExternalLinks(False)
+        # 空态里的「← 返回全部」链接(分类过滤后该组无窗口时出现)
+        self._empty_label.linkActivated.connect(lambda _l: self._on_filter_chip(None))
         self._layout.addWidget(self._empty_label, 0, 0)
 
         self._pm.on_change(self._sync)
@@ -281,26 +284,34 @@ class PreviewGrid(QWidget):
         n_un = sum(1 for h in self._items if not self._group_of(h))
         chips.append((f"未分组 {n_un}", "", n_un, "#888"))
         for text, fval, _cnt, color in chips:
-            btn = QToolButton()
-            btn.setText(text)
-            btn.setCheckable(True)
-            btn.setChecked(self._filter == fval)
-            btn.setStyleSheet(
-                f"QToolButton {{ color:#ccc; border:1px solid #444; border-radius:8px;"
-                f"padding:1px 8px; font-size:11px; background:transparent; }}"
-                f"QToolButton:hover {{ border-color:{color}; }}"
-                f"QToolButton:checked {{ color:{color}; border-color:{color};"
-                f"background:rgba(255,255,255,0.06); font-weight:bold; }}"
-            )
-            btn.clicked.connect(lambda _c=False, v=fval: self._on_filter_chip(v))
-            self._chip_layout.addWidget(btn)
+            try:
+                btn = QToolButton()
+                btn.setText(text)
+                btn.setCheckable(True)
+                btn.setChecked(self._filter == fval)
+                btn.setStyleSheet(
+                    f"QToolButton {{ color:#ccc; border:1px solid #444; border-radius:8px;"
+                    f"padding:1px 8px; font-size:11px; background:transparent; }}"
+                    f"QToolButton:hover {{ border-color:{color}; }}"
+                    f"QToolButton:checked {{ color:{color}; border-color:{color};"
+                    f"background:rgba(255,255,255,0.06); font-weight:bold; }}"
+                )
+                btn.clicked.connect(lambda _c=False, v=fval: self._on_filter_chip(v))
+                self._chip_layout.addWidget(btn)
+            except Exception:  # noqa: BLE001
+                # 单个 chip 出错不能拖垮整条分类条(全局兜底会吞异常,必须局部守住)
+                logging.getLogger(__name__).exception("分类条 chip 创建失败: %r", text)
         has_filter = self._filter is not None
         self._btn_group_start.setEnabled(has_filter and n_all > 0)
         self._btn_group_stop.setEnabled(has_filter and n_all > 0)
         self._apply_filter()
 
     def _on_filter_chip(self, value: str | None) -> None:
-        self._filter = value
+        # 再点一次当前已选中的分类 = 返回「全部」(空分组时这就是最直觉的「返回上一级」)
+        if value is not None and self._filter == value:
+            self._filter = None
+        else:
+            self._filter = value
         self.refresh_group_bar()
 
     def _on_group_start(self) -> None:
@@ -448,7 +459,10 @@ class PreviewGrid(QWidget):
         visible = [w for h, w in self._items.items() if self._passes_filter(h)]
         if not visible:
             self._empty_label.setText(
-                "该分类下暂无窗口。\n\n右键卡片标题 →「分组(分屏分类)」可把窗口归入分类。"
+                "该分类下暂无窗口。\n\n"
+                '<a href="#all" style="color:#4a9eff;">← 返回「全部」</a>'
+                "(或再点一次上方选中的分类)\n\n"
+                "右键卡片标题 →「分组(分屏分类)」可把窗口归入分类。"
             )
             self._empty_label.setVisible(True)
             self._layout.addWidget(self._empty_label, 0, 0)

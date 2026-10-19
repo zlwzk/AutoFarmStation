@@ -197,6 +197,20 @@ class AutomationHub:
         self.stop_clicker(hwnd)
         self.stop_key_macro(hwnd)
 
+    def toggle_pause_clicker(self, hwnd: int) -> bool | None:
+        """暂停/继续指定窗口的连点器。
+
+        返回 True=已暂停, False=继续运行, None=该窗口连点器未在运行。
+        """
+        with self._lock:
+            c = self._clickers.get(int(hwnd))
+        if c is None or not c.is_running:
+            return None
+        try:
+            return bool(c.toggle_pause())
+        except Exception:  # noqa: BLE001
+            return None
+
     def stop_all(self) -> None:
         with self._lock:
             hwnds = list(set(self._clickers) | set(self._macros))

@@ -53,7 +53,8 @@ def group_color(name: str) -> str:
 class PreviewWidget(QFrame):
     """单个窗口预览卡片(可勾选 / 可嵌入)."""
 
-    focused = Signal(int)  # hwnd
+    focused = Signal(int)  # hwnd(点击预览图/「聚焦」:抢前台 + 设为右侧目标)
+    target_requested = Signal(int)  # hwnd(勾选/左键标题:仅设为右侧目标,不抢前台)
     closed = Signal(int)  # hwnd(请求从追踪列表移除)
     autoclick_toggle = Signal(int)  # hwnd
     selection_changed = Signal(int, bool)  # hwnd, 是否选中
@@ -119,9 +120,14 @@ class PreviewWidget(QFrame):
         self._title_lab.setFont(f)
         self._title_lab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         if self._pm is not None:
-            self._title_lab.setToolTip("右键:起别名 / 选强调色(多开时方便分辨)")
+            self._title_lab.setToolTip(
+                "左键:设为右侧操作面板的目标窗口(不抢前台)\n"
+                "右键:起别名 / 选强调色 / 分组(多开时方便分辨)"
+            )
             self._title_lab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self._title_lab.customContextMenuRequested.connect(self._on_title_menu)
+        # 左键点标题 = 把它设为右侧面板目标(不抢前台,区别于点预览图的「聚焦」)
+        self._title_lab.mousePressEvent = self._on_title_press  # type: ignore[assignment]
         title_bar.addWidget(self._title_lab)
 
         # v1.7.0 分屏分类徽标(「需点击」/「纯挂时长」/自定义)
@@ -511,9 +517,17 @@ class PreviewWidget(QFrame):
         return super().eventFilter(obj, ev)
 
     # --- 内部 ---
+    def _on_title_press(self, ev) -> None:
+        """左键点标题:设为右侧面板目标(不抢前台);右键交给上下文菜单."""
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.target_requested.emit(self.hwnd)
+
     def _on_check_toggled(self, on: bool) -> None:
         # 选中时高亮边框(自定义强调色仍保留在未选中状态)
         self._apply_style()
+        # 勾选 = 用户正要操作这个窗口 → 顺手设为右侧面板目标
+        if on:
+            self.target_requested.emit(self.hwnd)
         self.selection_changed.emit(self.hwnd, bool(on))
 
     def _on_frame(self, frame: PreviewFrame) -> None:

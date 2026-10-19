@@ -1379,6 +1379,22 @@ def t_crash_guards() -> bool:
         return False
 
 
+def t_hub_pause_clicker() -> bool:
+    """v1.8.1:hub 暴露暂停/继续接口(修「暂停/继续」按钮在 hub 模式下无反应)."""
+    _div("v1.8.1 hub pause clicker")
+    try:
+        from autofarmstation.core.automation_hub import AutomationHub
+        hub = AutomationHub()
+        # 未运行的窗口返回 None(而不是静默/抛异常)
+        assert hub.toggle_pause_clicker(999999) is None
+        assert hub.toggle_pause_clicker(0) is None
+        _ok("hub.toggle_pause_clicker 未运行返回 None ok")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("hub_pause_clicker", e)
+        return False
+
+
 def t_user_bats_persist() -> bool:
     """v1.6.2:用户自加的 bat 脚本必须跨「重建 BatLibrary」持久化。
 
@@ -2085,6 +2101,8 @@ def run_all() -> int:
                                         # v1.8.0 新增(防崩溃 + 连点新选项)
                                         t_clicker_new_options,
                                         t_crash_guards,
+                                        # v1.8.1 新增(连点暂停走 hub)
+                                        t_hub_pause_clicker,
                                         ]
     passed = 0
     failed = 0

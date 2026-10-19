@@ -838,6 +838,7 @@ class MainWindow(QMainWindow):
             for w in left._items.values():
                 for sig, slot in (
                     (w.focused, self._on_focus_from_preview),
+                    (w.target_requested, self._on_focus_from_preview),
                     (w.closed, self._on_close_from_preview),
                     (w.autoclick_toggle, self._on_autoclick_toggle_from_preview),
                 ):
@@ -1019,9 +1020,14 @@ class MainWindow(QMainWindow):
         self._refresh_status()
 
     def _on_focus_from_preview(self, hwnd: int) -> None:
+        """把 hwnd 设为右侧面板目标。窗口信息取不到(失效/刚重开)时用追踪里的标题兜底,
+        保证「设目标」这件事本身一定生效."""
         info = wf.get_window_info(hwnd)
         if info:
             self._right.set_target(hwnd, info.title)
+            return
+        tp = self._pm.get(int(hwnd))
+        self._right.set_target(hwnd, (tp.title if tp else "") or str(hwnd))
 
     def _on_close_from_preview(self, hwnd: int) -> None:
         self._hub.forget(hwnd)
