@@ -25,6 +25,7 @@ from typing import Callable
 from . import window_finder as wf
 
 # === GDI 常量 ===
+PW_CLIENTONLY = 0x00000001  # 只渲染客户区(不含标题栏/边框) —— 选点坐标必须用它
 PW_RENDERFULLCONTENT = 0x00000002  # Win8.1+,包含 DWM 合成的 GPU 内容
 SRCCOPY = 0x00CC0020
 CAPTUREBLT = 0x40000000
@@ -39,8 +40,12 @@ _user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
 _user32.PrintWindow.restype = wintypes.BOOL
 _user32.GetWindowDC.argtypes = [wintypes.HWND]
 _user32.GetWindowDC.restype = wintypes.HDC
+_user32.GetDC.argtypes = [wintypes.HWND]
+_user32.GetDC.restype = wintypes.HDC
 _user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 _user32.ReleaseDC.restype = ctypes.c_int
+_user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+_user32.ClientToScreen.restype = wintypes.BOOL
 _gdi32.BitBlt.argtypes = [
     wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
     wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
@@ -87,8 +92,40 @@ class BITMAPINFO(ctypes.Structure):
     ]
 
 
+def _read_client_pixels(mem: int, bmp: int, w: int, h: int) -> bytes | None:
+    """把 mem DC 里的位图读成自上而下的 BGRX 字节流;读满失败返回 None."""
+    bi = BITMAPINFO()
+    bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bi.bmiHeader.biWidth = w
+    bi.bmiHeader.biHeight = -h  # 负值 = 自上而下行序
+    bi.bmiHeader.biPlanes = 1
+    bi.bmiHeader.biBitCount = 32
+    bi.bmiHeader.biCompression = BI_RGB
+    buf = ctypes.create_string_buffer(w * h * 4)
+    got = _gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bi), DIB_RGB_COLORS)
+    if got != h:
+        return None
+    return buf.raw
+
+
+def _all_zero(data: bytes) -> bool:
+    """整帧全黑(GPU 窗口对某些 PrintWindow 组合会输出黑帧)→ 换下一条路径."""
+    return data.count(0) == len(data)
+
+
 def capture_gdi(hwnd: int) -> tuple[int, int, bytes] | None:
-    """GDI 截取窗口**客户区**,返回 (w, h, BGRA bytes) 或 None.
+    """GDI 截取窗口**客户区**,返回 (w, h, BGRX bytes) 或 None.
+
+    v1.8.5 修复选点偏移:以前用 PrintWindow(PW_RENDERFULLCONTENT) 不带
+    PW_CLIENTONLY,渲染的是**整个窗口**(含标题栏/边框)再裁到客户区尺寸,
+    图像 (0,0) 其实是窗口左上角 —— 截图选点把标题栏底边当成了客户区顶边,
+    标记点整体偏移一个边框+标题栏的距离。现在:
+
+    1. PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT) —— 客户区 + GPU 内容
+    2. 回退 PrintWindow(PW_CLIENTONLY)
+    3. 再回退 BitBlt 屏幕 DC 的**客户区屏幕位置**(ClientToScreen;被遮挡时
+       会截到遮挡物,但坐标语义永远正确)
+    每条路径都做全黑检测,黑帧(如个别 GPU 窗口不认 CLIENTONLY)自动换下一条。
 
     - PrintWindow 不要求窗口在屏幕最前,被遮挡也能截到
     - 窗口最小化时 GDI 不渲染,返回 None
@@ -121,28 +158,34 @@ def capture_gdi(hwnd: int) -> tuple[int, int, bytes] | None:
                 return None
             old = _gdi32.SelectObject(mem, bmp)
             try:
-                ok = bool(_user32.PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT))
-                if not ok:
-                    ok = bool(_user32.PrintWindow(hwnd, mem, 0))
-                if not ok:
-                    ok = bool(_gdi32.BitBlt(
-                        mem, 0, 0, w, h, hdc_window, 0, 0, SRCCOPY | CAPTUREBLT))
-                if not ok:
+                pixels: bytes | None = None
+                # 1) / 2) PrintWindow 客户区(带 GPU 内容 / 不带)
+                for flags in (PW_CLIENTONLY | PW_RENDERFULLCONTENT, PW_CLIENTONLY):
+                    if not _user32.PrintWindow(hwnd, mem, flags):
+                        continue
+                    data = _read_client_pixels(mem, bmp, w, h)
+                    if data is not None and not _all_zero(data):
+                        pixels = data
+                        break
+                # 3) 屏幕级兜底:按客户区的屏幕位置截(坐标语义正确)
+                if pixels is None:
+                    pt = wintypes.POINT(0, 0)
+                    if _user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+                        hdc_screen = _user32.GetDC(None)
+                        if hdc_screen:
+                            try:
+                                if _gdi32.BitBlt(
+                                    mem, 0, 0, w, h, hdc_screen,
+                                    pt.x, pt.y, SRCCOPY | CAPTUREBLT,
+                                ):
+                                    data = _read_client_pixels(mem, bmp, w, h)
+                                    if data is not None and not _all_zero(data):
+                                        pixels = data
+                            finally:
+                                _user32.ReleaseDC(None, hdc_screen)
+                if pixels is None:
                     return None
-
-                bi = BITMAPINFO()
-                bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-                bi.bmiHeader.biWidth = w
-                bi.bmiHeader.biHeight = -h  # 负值 = 自上而下行序
-                bi.bmiHeader.biPlanes = 1
-                bi.bmiHeader.biBitCount = 32
-                bi.bmiHeader.biCompression = BI_RGB
-
-                buf = ctypes.create_string_buffer(w * h * 4)
-                got = _gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bi), DIB_RGB_COLORS)
-                if got != h:
-                    return None
-                return (w, h, buf.raw)
+                return (w, h, pixels)
             finally:
                 _gdi32.SelectObject(mem, old)
                 _gdi32.DeleteObject(bmp)

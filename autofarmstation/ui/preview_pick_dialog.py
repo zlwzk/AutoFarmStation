@@ -62,6 +62,8 @@ class _PickCanvas(QWidget):
         self.setMinimumHeight(300)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)  # 不按键也跟踪,实时显示光标对应的客户区坐标
+        self.on_hover = None  # cb((x, y) | None)
         self.setWindowTitle("")
 
     # --- 数据 ---
@@ -80,6 +82,17 @@ class _PickCanvas(QWidget):
         return (self._img_w, self._img_h)
 
     # --- 交互 ---
+    def mouseMoveEvent(self, ev) -> None:  # noqa: N802
+        """光标悬停实时换算客户区坐标,让用户核对标记位置."""
+        if self.on_hover is None or self._pix is None:
+            return
+        got = map_to_image(ev.position().toPoint(), self.width(), self.height(),
+                           self._img_w, self._img_h)
+        try:
+            self.on_hover(got)
+        except Exception:
+            pass
+
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         if ev.button() not in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             return
@@ -163,6 +176,10 @@ class PreviewPickDialog(QDialog):
         v.addLayout(mid, stretch=1)
 
         bottom = QHBoxLayout()
+        self._coord = QLabel("光标: —")
+        self._coord.setStyleSheet("color:#8fd18f;")
+        bottom.addWidget(self._coord)
+        self._canvas.on_hover = self._on_hover
         btn_recap = QPushButton("重新截图")
         btn_recap.clicked.connect(self._recapture)
         bottom.addWidget(btn_recap)
@@ -179,6 +196,12 @@ class PreviewPickDialog(QDialog):
         self._recapture()
 
     # --- 内部 ---
+    def _on_hover(self, got: tuple[int, int] | None) -> None:
+        if got is None:
+            self._coord.setText("光标: 画面外")
+        else:
+            self._coord.setText(f"光标: 客户区 ({got[0]}, {got[1]}) px")
+
     def _recapture(self) -> None:
         res = capture_gdi(self._hwnd)
         if res is None:

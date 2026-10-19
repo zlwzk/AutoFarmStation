@@ -2,7 +2,7 @@
 
 > 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、分屏分类、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.8.4-blue)
+![banner](https://img.shields.io/badge/version-1.8.5-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -56,6 +56,9 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
   点预览图 / 聚焦仍是「设目标 + 抢前台」。不再出现「明明选了却提示未选择窗口」。
 - **分类条不卡死**(v1.8.1):选到空分组时显示「← 返回全部」链接,再点一次已选中的分类也会返回全部;
   单个分类 chip 异常不再拖垮整条分类条。连点「暂停/继续」按钮在多窗口模式下真正生效。
+- **截图选点标记位置精确**(v1.8.5):截取的是**纯客户区**(不再混入标题栏 / 边框),
+  截图尺寸 = 客户区原始像素,标记位置与实际点击位置严格 **1:1**;选点对话框底部带
+  「光标: 客户区 (x, y) px」实时读数,标记前就能核对换算是否准确。
 - **截图选点**(v1.8.4):连点器一键弹出游戏画面截图,**左键点 = 左键点位、右键点 = 右键点位**,
   可连续标记多个;不用切前台、不用全屏覆盖层,嵌入 / 被遮挡也能用,点位自动记比例坐标。
 - **嵌入画面完整显示 / 自由查看**(v1.8.4):卡片新增「视图」按钮 —— 「完整显示」按游戏原始
@@ -220,7 +223,7 @@ A:实测 `offline` 走这个协议在当前 Steam 客户端不生效(状态不�
 ## 自检与开发
 
 ```bash
-python -m scripts.selftest   # 53 项自检(v1.8.4;v1.8.3 是 52 项,v1.8.2 是 51 项,v1.8.1 是 50 项,v1.8.0 是 49 项,v1.7.0 是 47 项,v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
+python -m scripts.selftest   # 54 项自检(v1.8.5;v1.8.4 是 53 项,v1.8.3 是 52 项,v1.8.2 是 51 项,v1.8.1 是 50 项,v1.8.0 是 49 项,v1.7.0 是 47 项,v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe)
 powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(可选)
 ```

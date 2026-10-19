@@ -1710,6 +1710,102 @@ def t_v184_embed_view_and_pick_map() -> bool:
         return False
 
 
+def t_v1841_capture_client_only() -> bool:
+    """v1.8.5:capture_gdi 必须只截**客户区** —— 截图选点坐标准确的根基.
+
+    建一个白底(WHITE_BRUSH)标准边框窗口:修复前 PrintWindow 不带
+    PW_CLIENTONLY,截到的是整个窗口再裁到客户区尺寸,顶部几行是标题栏、
+    左侧几列是边框(灰,非白) → 本用例在旧代码下会失败;修复后四边内侧
+    都应是客户区白色。
+    """
+    _div("v1.8.5 capture_gdi client-only accuracy")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from autofarmstation.core import window_finder as wf
+        from autofarmstation.core.preview_capture import capture_gdi
+
+        u32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        g32 = ctypes.WinDLL("gdi32", use_last_error=True)  # type: ignore[attr-defined]
+        g32.GetStockObject.argtypes = [ctypes.c_int]
+        g32.GetStockObject.restype = wintypes.HBRUSH
+        WNDPROCTYPE = ctypes.WINFUNCTYPE(
+            wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        )
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT), ("lpfnWndProc", WNDPROCTYPE),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u32.DefWindowProcW.restype = wintypes.LPARAM
+        u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u32.RegisterClassW.restype = wintypes.WORD
+        u32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        ]
+        u32.CreateWindowExW.restype = wintypes.HWND
+        u32.DestroyWindow.argtypes = [wintypes.HWND]
+        u32.DestroyWindow.restype = wintypes.BOOL
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        proc = WNDPROCTYPE(lambda h, m, wp, lp: u32.DefWindowProcW(h, m, wp, lp))
+        hinst = k32.GetModuleHandleW(None)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = proc
+        wc.hInstance = hinst
+        wc.hbrBackground = g32.GetStockObject(0)  # WHITE_BRUSH:客户区纯白
+        wc.lpszClassName = "AfsSelftestV1841"
+        u32.RegisterClassW(ctypes.byref(wc))
+        WS_OVERLAPPEDWINDOW = 0x00CF0000
+        WS_VISIBLE = 0x10000000
+        hwnd = u32.CreateWindowExW(
+            0, "AfsSelftestV1841", "afs-v1841-white", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            20, 20, 300, 200, None, None, hinst, None,
+        )
+        assert hwnd, "建测试窗口失败"
+        try:
+            import time as _t
+            _t.sleep(0.25)  # 等 DWM 画完第一帧
+            res = capture_gdi(hwnd)
+            assert res is not None, "capture_gdi 失败"
+            w, h, pixels = res
+            cw, ch = wf.client_size(hwnd)
+            assert (w, h) == (cw, ch), f"截图尺寸 {w}x{h} != 客户区 {cw}x{ch}"
+
+            def px(x: int, y: int) -> tuple[int, int, int]:
+                i = (y * w + x) * 4
+                return (pixels[i + 2], pixels[i + 1], pixels[i])  # BGRX → RGB
+
+            samples = [
+                (w // 2, 2), (w // 2, 6),      # 顶部(旧 bug 这里是标题栏灰条)
+                (2, h // 2), (6, h // 2),      # 左侧(旧 bug 这里是边框)
+                (w - 3, h - 3),                # 右下(旧 bug 会把客户区裁掉一角)
+                (w // 2, h // 2),              # 中心
+            ]
+            for (x, y) in samples:
+                c = px(x, y)
+                assert all(v >= 240 for v in c), \
+                    f"({x},{y}) 像素 {c} 不是客户区白色 —— 截图混入了非客户区内容"
+            _ok("capture_gdi 只含客户区(四边内侧均为白底) ok")
+            return True
+        finally:
+            u32.DestroyWindow(hwnd)
+    except Exception as e:  # noqa: BLE001
+        _fail("v1841_capture_client_only", e)
+        return False
+
+
 def t_user_bats_persist() -> bool:
     """v1.6.2:用户自加的 bat 脚本必须跨「重建 BatLibrary」持久化。
 
@@ -2424,6 +2520,8 @@ def run_all() -> int:
                                         t_v183_card_signal_forward,
                                         # v1.8.4 新增(嵌入视图模式 + 截图选点)
                                         t_v184_embed_view_and_pick_map,
+                                        # v1.8.5 新增(截图只含客户区 → 选点坐标准确)
+                                        t_v1841_capture_client_only,
                                         ]
     passed = 0
     failed = 0
