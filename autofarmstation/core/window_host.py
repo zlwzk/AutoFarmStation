@@ -59,6 +59,9 @@ class _EmbedState:
     orig_rect: tuple[int, int, int, int]
     orig_minimized: bool
     ts: float
+    # v1.8.4:嵌入瞬间的游戏客户区尺寸 —— 「完整显示(保持比例)」按它算宽高比
+    natural_w: int = 0
+    natural_h: int = 0
 
 
 _states: dict[int, _EmbedState] = {}
@@ -97,6 +100,12 @@ def embed_window(hwnd: int, container_hwnd: int) -> bool:
         wf.show_window(hwnd, wf.SW_RESTORE)
         time.sleep(0.12)
 
+    # v1.8.4:任何修改之前先记下游戏客户区原始尺寸(=画面宽高比)
+    _ncrect = wintypes.RECT(0, 0, 0, 0)
+    _user32.GetClientRect(hwnd, ctypes.byref(_ncrect))
+    natural_w = max(16, int(_ncrect.right - _ncrect.left))
+    natural_h = max(16, int(_ncrect.bottom - _ncrect.top))
+
     try:
         style = _user32.GetWindowLongW(hwnd, wf.GWL_STYLE)
         ex_style = _user32.GetWindowLongW(hwnd, wf.GWL_EXSTYLE)
@@ -115,6 +124,8 @@ def embed_window(hwnd: int, container_hwnd: int) -> bool:
         orig_rect=info.rect,
         orig_minimized=info.is_minimized,
         ts=time.time(),
+        natural_w=natural_w,
+        natural_h=natural_h,
     )
 
     # 1) 去装饰(非客户区由容器提供)
@@ -147,6 +158,30 @@ def fit_to(hwnd: int, w: int, h: int) -> bool:
     if st is None or not wf._is_window(hwnd):
         return False
     return wf.move_window(hwnd, 0, 0, max(16, int(w)), max(16, int(h)))
+
+
+def place(hwnd: int, x: int, y: int, w: int, h: int) -> bool:
+    """把已嵌入的窗口摆到容器客户区的 (x, y) 处,大小 w×h(物理像素).
+
+    v1.8.4:x/y 允许为负、w/h 允许超出容器 —— 超出部分被容器裁掉,
+    这正是「自由查看」模式拖动平移 / 滚轮缩放的实现基础。
+    未嵌入的窗口直接返回 False(不允许对桌面窗口乱动)。
+    """
+    hwnd = int(hwnd)
+    with _lock:
+        st = _states.get(hwnd)
+    if st is None or not wf._is_window(hwnd):
+        return False
+    return wf.move_window(hwnd, int(x), int(y), max(16, int(w)), max(16, int(h)))
+
+
+def natural_client_size(hwnd: int) -> tuple[int, int] | None:
+    """嵌入时记录的游戏客户区原始尺寸(算画面宽高比用);未嵌入返回 None."""
+    with _lock:
+        st = _states.get(int(hwnd))
+    if st is None:
+        return None
+    return (int(st.natural_w), int(st.natural_h))
 
 
 def release_window(hwnd: int) -> bool:

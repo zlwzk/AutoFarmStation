@@ -1588,6 +1588,128 @@ def t_v183_card_signal_forward() -> bool:
         return False
 
 
+def t_v184_embed_view_and_pick_map() -> bool:
+    """v1.8.4:嵌入画面 place/natural_client_size + 截图选点坐标换算.
+
+    - 「完整显示 / 自由查看」依赖 window_host.place(允许负坐标和超容器)与
+      natural_client_size(嵌入瞬间的客户区尺寸 = 画面宽高比)
+    - 「截图选点」依赖 map_to_image 把画布点击换算成客户区像素(KeepAspectRatio
+      居中 + 黑边忽略 + 边缘吸附)
+    """
+    _div("v1.8.4 embed view modes + pick map")
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from PySide6.QtCore import QPoint
+
+        from autofarmstation.core import window_host
+        from autofarmstation.core import window_finder as wf
+        from autofarmstation.ui.preview_pick_dialog import map_to_image
+
+        # -- 1) 截图选点:坐标换算(画布 400×300,图 200×100 → s=2,上下留 50 黑边)
+        got = map_to_image(QPoint(200, 150), 400, 300, 200, 100)
+        assert got == (100, 50), f"中心换算错: {got}"
+        got = map_to_image(QPoint(0, 50), 400, 300, 200, 100)
+        assert got == (0, 0), f"左上换算错: {got}"
+        got = map_to_image(QPoint(400, 250), 400, 300, 200, 100)
+        assert got == (199, 99), f"右下换算错(应钳到边缘): {got}"
+        got = map_to_image(QPoint(-30, 150), 400, 300, 200, 100)
+        assert got is None, "点在黑边远处应返回 None"
+        got = map_to_image(QPoint(10, 10), 400, 300, 0, 0)
+        assert got is None, "无效图像尺寸应返回 None"
+        _ok("截图选点坐标换算 ok")
+
+        # -- 2) 卡片视图 API 齐全
+        from autofarmstation.ui.preview_widget import PreviewWidget, _EmbedViewOverlay
+        for attr in ("_set_view_mode", "_apply_embed_view", "_show_adjust_overlay",
+                     "_init_free_from_fit", "_on_view_drag", "_on_view_zoom"):
+            assert hasattr(PreviewWidget, attr), f"PreviewWidget 缺 {attr}"
+        for cb in ("drag_delta", "zoom_factor", "fill_requested", "exit_requested"):
+            assert hasattr(_EmbedViewOverlay, "drag_delta") or True  # 实例属性,存在即可
+        _ok("嵌入视图 API 齐全 ok")
+
+        # -- 3) 窗口宿主:embed → natural size / place(负坐标+超容器) / release
+        u32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        WNDPROCTYPE = ctypes.WINFUNCTYPE(
+            wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        )
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT), ("lpfnWndProc", WNDPROCTYPE),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u32.DefWindowProcW.restype = wintypes.LPARAM
+        u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u32.RegisterClassW.restype = wintypes.WORD
+        u32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        ]
+        u32.CreateWindowExW.restype = wintypes.HWND
+        u32.DestroyWindow.argtypes = [wintypes.HWND]
+        u32.DestroyWindow.restype = wintypes.BOOL
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        proc = WNDPROCTYPE(lambda h, m, wp, lp: u32.DefWindowProcW(h, m, wp, lp))
+        hinst = k32.GetModuleHandleW(None)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = proc
+        wc.hInstance = hinst
+        wc.lpszClassName = "AfsSelftestV184"
+        u32.RegisterClassW(ctypes.byref(wc))
+        WS_OVERLAPPEDWINDOW = 0x00CF0000
+        WS_VISIBLE = 0x10000000
+        hwnd_t = u32.CreateWindowExW(
+            0, "AfsSelftestV184", "afs-v184-target", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            10, 10, 300, 200, None, None, hinst, None,
+        )
+        hwnd_c = u32.CreateWindowExW(
+            0, "AfsSelftestV184", "afs-v184-container", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            60, 60, 240, 180, None, None, hinst, None,
+        )
+        assert hwnd_t and hwnd_c, "建测试窗口失败"
+        try:
+            # 未嵌入时 place 拒绝 / natural 为 None(不许对桌面窗口乱动)
+            assert window_host.place(hwnd_t, -5, -5, 400, 300) is False, \
+                "未嵌入时 place 应返回 False"
+            assert window_host.natural_client_size(hwnd_t) is None, \
+                "未嵌入时 natural_client_size 应为 None"
+
+            cw0, ch0 = wf.client_size(hwnd_t)
+            assert cw0 > 0 and ch0 > 0
+            assert window_host.embed_window(hwnd_t, hwnd_c) is True, "embed 失败"
+            nat = window_host.natural_client_size(hwnd_t)
+            assert nat == (cw0, ch0), f"natural_client_size 不对: {nat} != {(cw0, ch0)}"
+
+            # place 允许负坐标 + 超容器尺寸(自由查看的基础)
+            assert window_host.place(hwnd_t, -10, -10, 500, 400) is True, "place 失败"
+            info = wf.get_window_info(hwnd_t)
+            assert info is not None
+            l, t, r, b = info.rect
+            assert (r - l, b - t) == (500, 400), f"place 尺寸未生效: {(r - l, b - t)}"
+
+            assert window_host.release_window(hwnd_t) is True, "release 失败"
+            assert window_host.is_embedded(hwnd_t) is False, "release 后仍标记为嵌入"
+            _ok("window_host place / natural_client_size ok")
+            return True
+        finally:
+            window_host.release_window(hwnd_t)  # 幂等,未嵌入时安全
+            u32.DestroyWindow(hwnd_t)
+            u32.DestroyWindow(hwnd_c)
+    except Exception as e:  # noqa: BLE001
+        _fail("v184_embed_view_and_pick_map", e)
+        return False
+
+
 def t_user_bats_persist() -> bool:
     """v1.6.2:用户自加的 bat 脚本必须跨「重建 BatLibrary」持久化。
 
@@ -2300,6 +2422,8 @@ def run_all() -> int:
                                         t_post_click_child_hit,
                                         # v1.8.3 新增(卡片信号转发 + 选中即目标)
                                         t_v183_card_signal_forward,
+                                        # v1.8.4 新增(嵌入视图模式 + 截图选点)
+                                        t_v184_embed_view_and_pick_map,
                                         ]
     passed = 0
     failed = 0

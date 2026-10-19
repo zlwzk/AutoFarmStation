@@ -135,6 +135,13 @@ class ClickerPanel(QWidget):
         self._btn_add_center = QPushButton("+ 添加中心点")
         self._btn_add_center.clicked.connect(self._on_add_center)
         addb.addWidget(self._btn_add_center)
+        # v1.8.4:截图选点 —— 在软件内对游戏画面截图上直接标记位置,不用切前台
+        self._btn_pick_img = QPushButton("截图选点")
+        self._btn_pick_img.setToolTip(
+            "弹出当前游戏画面的截图,在上面点击即可标记连点位置(可标记多个点)。\n"
+            "不需要把游戏切到前台,嵌入 / 被遮挡时也能用;比「从屏幕选点」更顺手。")
+        self._btn_pick_img.clicked.connect(self._on_pick_on_image)
+        addb.addWidget(self._btn_pick_img)
         pv.addLayout(addb)
         v.addWidget(points_box)
 
@@ -377,6 +384,20 @@ class ClickerPanel(QWidget):
             cp = ClickPoint(x=cw // 2, y=ch // 2)
             cp.set_ratio(cw, ch)
             self._add_point(cp)
+
+    def _on_pick_on_image(self) -> None:
+        """v1.8.4:在游戏截图上标记连点位置(不用切到游戏前台)."""
+        self._ensure_target()
+        if not self._target_hwnd:
+            QMessageBox.warning(self, "截图选点", "请先选择目标窗口。")
+            return
+        from .preview_pick_dialog import PreviewPickDialog
+        dlg = PreviewPickDialog(self._target_hwnd, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.points:
+            for cp in dlg.points:
+                self._add_point(cp)
+            self._status.setText(styled_message(
+                f"已从截图添加 {len(dlg.points)} 个点位(自动记比例坐标)", level="ok"))
 
     def _points(self) -> list[ClickPoint]:
         out: list[ClickPoint] = []

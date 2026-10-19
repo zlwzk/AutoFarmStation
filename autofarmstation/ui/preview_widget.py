@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent
-from PySide6.QtGui import QAction, QImage, QPixmap
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPixmap, QPen
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QFrame, QSizePolicy, QCheckBox, QInputDialog, QMenu,
@@ -48,6 +48,80 @@ def group_color(name: str) -> str:
     for ch in name or "?":
         h = (h * 31 + ord(ch)) & 0xFFFFFFFF
     return _GROUP_PALETTE[h % len(_GROUP_PALETTE)]
+
+
+class _EmbedViewOverlay(QWidget):
+    """嵌入画面的「调整视图」覆盖层(v1.8.4).
+
+    游戏原窗口是原生 HWND,不盖一层的话鼠标事件全被游戏吃掉,根本没法拖动。
+    这层原生子窗口盖在游戏窗口之上接管鼠标:
+        按住拖动 = 平移画面    滚轮 = 缩放
+        双击 = 铺满并退出      Esc = 退出(保留当前画面位置)
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        # 原生子窗口才能稳稳压在游戏 HWND 之上、拿到鼠标事件
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self._press: QPoint | None = None
+        # 回调(由 PreviewWidget 注入)
+        self.drag_delta = None      # cb(dx_logical, dy_logical)
+        self.zoom_factor = None     # cb(factor)
+        self.fill_requested = None  # cb(双击 → 铺满并退出)
+        self.exit_requested = None  # cb(Esc → 退出,保留位置)
+
+    def mousePressEvent(self, ev) -> None:  # noqa: N802
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._press = ev.position().toPoint()
+
+    def mouseMoveEvent(self, ev) -> None:  # noqa: N802
+        if self._press is None:
+            return
+        cur = ev.position().toPoint()
+        d = cur - self._press
+        self._press = cur
+        if self.drag_delta is not None and (d.x() or d.y()):
+            try:
+                self.drag_delta(d.x(), d.y())
+            except Exception:
+                pass
+
+    def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
+        self._press = None
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802
+        if ev.button() == Qt.MouseButton.LeftButton and self.fill_requested is not None:
+            self.fill_requested()
+
+    def wheelEvent(self, ev) -> None:  # noqa: N802
+        steps = ev.angleDelta().y() / 120.0
+        if steps and self.zoom_factor is not None:
+            try:
+                self.zoom_factor(1.15 ** steps)
+            except Exception:
+                pass
+
+    def keyPressEvent(self, ev) -> None:  # noqa: N802
+        if ev.key() == Qt.Key.Key_Escape and self.exit_requested is not None:
+            self.exit_requested()
+
+    def paintEvent(self, ev) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(8, 10, 14, 120))
+        p.setPen(QPen(QColor("#4a9eff"), 2))
+        p.drawRect(self.rect().adjusted(1, 1, -2, -2))
+        f = p.font()
+        f.setPointSize(10)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor("#d8ecff"))
+        p.drawText(QRect(0, 8, self.width(), 44),
+                   Qt.AlignmentFlag.AlignHCenter,
+                   "拖动 = 移动画面 · 滚轮 = 缩放\n双击 = 铺满 · Esc = 完成调整")
+        p.end()
 
 
 class PreviewWidget(QFrame):
@@ -161,6 +235,23 @@ class PreviewWidget(QFrame):
         )
         self._btn_edge.clicked.connect(self._on_edge_clicked)
         title_bar.addWidget(self._btn_edge)
+
+        # v1.8.4:嵌入画面的查看方式(仅嵌入时可见)
+        self._view_mode = "fill"      # fill=铺满 / fit=完整显示(保持比例) / free=自由查看
+        self._view_zoom = 1.0         # free 模式:相对游戏原始客户区尺寸的缩放
+        self._view_off = (0, 0)       # free 模式:游戏窗口左上角在容器内的物理像素偏移
+        self._view_overlay: _EmbedViewOverlay | None = None
+        self._btn_view = QPushButton("视图")
+        self._btn_view.setFixedWidth(44)
+        self._btn_view.setToolTip(
+            "嵌入画面的查看方式:\n"
+            "· 铺满容器 —— 拉伸铺满(原默认,比例不同会变形/裁边)\n"
+            "· 完整显示 —— 保持比例缩小到正好显示整个游戏画面\n"
+            "· 自由查看 —— 拖动移动画面 / 滚轮缩放,看到游戏某一局部"
+        )
+        self._btn_view.clicked.connect(self._on_view_menu)
+        self._btn_view.setVisible(False)
+        title_bar.addWidget(self._btn_view)
 
         self._btn_close = QPushButton("✕")
         self._btn_close.setFixedWidth(28)
@@ -485,12 +576,21 @@ class PreviewWidget(QFrame):
         self._image_lab.setPixmap(QPixmap())
         self._image_lab.installEventFilter(self)
         self._btn_embed.setText("弹出")
+        # v1.8.4:嵌入后启用「视图」,默认铺满(与旧行为一致)
+        self._view_mode = "fill"
+        self._view_zoom = 1.0
+        self._view_off = (0, 0)
+        self._show_adjust_overlay(False)
+        self._btn_view.setVisible(True)
         self._refresh_status()
         return True
 
     def _release_embed(self, quiet: bool = False) -> None:
         """把窗口还原回桌面."""
         self._image_lab.removeEventFilter(self)
+        self._show_adjust_overlay(False)  # v1.8.4:弹出时收掉调整层
+        self._view_mode = "fill"
+        self._btn_view.setVisible(False)
         if window_host.release_window(self.hwnd) or self._embedded:
             self._embedded = False
             self._btn_embed.blockSignals(True)
@@ -506,15 +606,137 @@ class PreviewWidget(QFrame):
         """嵌入窗口跟随容器尺寸变化(逻辑像素 → 物理像素)."""
         if obj is self._image_lab and self._embedded and ev.type() == QEvent.Type.Resize:
             try:
-                dpr = self.devicePixelRatioF()
-                window_host.fit_to(
-                    self.hwnd,
-                    int(ev.size().width() * dpr),
-                    int(ev.size().height() * dpr),
-                )
+                # v1.8.4:按当前查看模式重摆(铺满=旧行为;fit/free 保持各自语义)
+                self._apply_embed_view()
+                if self._view_overlay is not None and self._view_overlay.isVisible():
+                    self._view_overlay.setGeometry(self._image_lab.rect())
             except Exception:
                 pass
         return super().eventFilter(obj, ev)
+
+    # === v1.8.4:嵌入画面查看模式 ===
+    def _on_view_menu(self) -> None:
+        if not self._embedded:
+            return
+        menu = QMenu(self)
+        for key, label in (
+            ("fill", "铺满容器(拉伸,可能变形)"),
+            ("fit", "完整显示(保持比例,整个画面可见)"),
+            ("free", "自由查看(拖动移动 · 滚轮缩放)"),
+        ):
+            act = QAction(("● " if self._view_mode == key else "○ ") + label, self)
+            act.triggered.connect(lambda _c=False, k=key: self._set_view_mode(k))
+            menu.addAction(act)
+        menu.exec(self._btn_view.mapToGlobal(QPoint(0, self._btn_view.height())))
+
+    def _set_view_mode(self, mode: str) -> None:
+        if not self._embedded:
+            return
+        if mode == "free":
+            if self._view_mode != "free":
+                self._init_free_from_fit()  # 从「完整显示」的缩放起步
+            self._view_mode = "free"
+            self._show_adjust_overlay(True)
+        else:
+            self._view_mode = mode
+            self._show_adjust_overlay(False)
+        self._apply_embed_view()
+        self._refresh_status()
+
+    def _dpr(self) -> float:
+        try:
+            return float(self.devicePixelRatioF()) or 1.0
+        except Exception:
+            return 1.0
+
+    def _embed_viewport(self) -> tuple[int, int]:
+        """容器(预览区)的物理像素尺寸."""
+        return (max(32, int(self._image_lab.width() * self._dpr())),
+                max(32, int(self._image_lab.height() * self._dpr())))
+
+    def _natural_size(self, cw: int, ch: int) -> tuple[int, int]:
+        nat = window_host.natural_client_size(self.hwnd)
+        nw, nh = nat if nat else (cw, ch)
+        return (max(16, int(nw)), max(16, int(nh)))
+
+    def _apply_embed_view(self) -> None:
+        """按当前查看模式摆放嵌入的游戏窗口(物理像素).
+
+        fill:铺满容器(旧行为);fit:按原始宽高比完整显示居中;
+        free:按 zoom/offset 任意摆放,超出容器部分被裁掉 = 平移缩放。
+        """
+        if not self._embedded:
+            return
+        cw, ch = self._embed_viewport()
+        nw, nh = self._natural_size(cw, ch)
+        if self._view_mode == "fit":
+            s = min(cw / nw, ch / nh)
+            w, h = max(16, int(nw * s)), max(16, int(nh * s))
+            window_host.place(self.hwnd, (cw - w) // 2, (ch - h) // 2, w, h)
+        elif self._view_mode == "free":
+            z = max(0.05, min(8.0, float(self._view_zoom)))
+            w, h = max(16, int(nw * z)), max(16, int(nh * z))
+            x = max(-(w - 48), min(int(self._view_off[0]), cw - 48))
+            y = max(-(h - 48), min(int(self._view_off[1]), ch - 48))
+            self._view_off = (x, y)
+            window_host.place(self.hwnd, x, y, w, h)
+        else:  # fill
+            window_host.place(self.hwnd, 0, 0, cw, ch)
+
+    def _init_free_from_fit(self) -> None:
+        """进入自由查看时,先按「完整显示」的缩放居中,方便用户再放大. """
+        cw, ch = self._embed_viewport()
+        nw, nh = self._natural_size(cw, ch)
+        s = min(cw / nw, ch / nh)
+        self._view_zoom = max(0.05, min(8.0, s))
+        w, h = int(nw * s), int(nh * s)
+        self._view_off = ((cw - w) // 2, (ch - h) // 2)
+
+    def _on_view_drag(self, dx: int, dy: int) -> None:
+        if self._view_mode != "free":
+            return
+        d = self._dpr()
+        ox, oy = self._view_off
+        self._view_off = (ox + int(dx * d), oy + int(dy * d))
+        self._apply_embed_view()
+
+    def _on_view_zoom(self, factor: float) -> None:
+        if self._view_mode != "free":
+            return
+        cw, ch = self._embed_viewport()
+        z0 = float(self._view_zoom)
+        z1 = max(0.05, min(8.0, z0 * factor))
+        if z1 == z0:
+            return
+        ratio = z1 / z0
+        cx, cy = cw / 2.0, ch / 2.0
+        ox, oy = self._view_off
+        self._view_zoom = z1
+        self._view_off = (int(cx - (cx - ox) * ratio), int(cy - (cy - oy) * ratio))
+        self._apply_embed_view()
+
+    def _on_view_fill(self) -> None:
+        self._view_mode = "fill"
+        self._show_adjust_overlay(False)
+        self._apply_embed_view()
+        self._refresh_status()
+
+    def _show_adjust_overlay(self, on: bool) -> None:
+        """显示/隐藏「调整视图」覆盖层(显示期间游戏不再直接吃鼠标)."""
+        if on:
+            if self._view_overlay is None:
+                ov = _EmbedViewOverlay(self._image_lab)
+                ov.drag_delta = self._on_view_drag
+                ov.zoom_factor = self._on_view_zoom
+                ov.fill_requested = self._on_view_fill
+                ov.exit_requested = lambda: self._show_adjust_overlay(False)
+                self._view_overlay = ov
+            self._view_overlay.setGeometry(self._image_lab.rect())
+            self._view_overlay.show()
+            self._view_overlay.raise_()
+            self._view_overlay.setFocus()
+        elif self._view_overlay is not None:
+            self._view_overlay.hide()
 
     # --- 内部 ---
     def _on_title_press(self, ev) -> None:
@@ -596,6 +818,12 @@ class PreviewWidget(QFrame):
         m = int((runtime % 3600) // 60)
         s = int(runtime % 60)
         prefix = "已嵌入 · " if self._embedded else ""
+        if self._embedded:
+            # v1.8.4:顺手把当前查看方式亮出来
+            mode_txt = {"fill": "铺满", "fit": "完整显示", "free": "自由查看"}.get(
+                self._view_mode, "")
+            if mode_txt:
+                prefix = f"已嵌入({mode_txt}) · "
         msg = f"{prefix}已追踪 {h:02d}:{m:02d}:{s:02d}"
         if not self._embedded:
             msg += f" · {self._fps:.1f}fps"
