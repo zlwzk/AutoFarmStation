@@ -185,6 +185,10 @@ class MainWindow(QMainWindow):
         # 跨启动的窗口快照(独立于 config):启动后弹框问是否恢复上次窗口
         self._session = Session()
         self._restore_asked = False
+        # v1.8.3:唤醒游戏后轮询等它的窗口出现,一出现就自动加回并套用上次配置
+        self._pending_items: list[dict] = []
+        self._pending_deadline: float = 0.0
+        self._pending_timer: QTimer | None = None
         QTimer.singleShot(800, self._maybe_prompt_restore_session)
         # 检查更新 — 用 cfg 里的频率(默认每小时)
         self._update_timer = QTimer(self)
@@ -819,6 +823,8 @@ class MainWindow(QMainWindow):
 
         # v1.6.2:挂机时段守护 — 把「是否允许启动」检查注入到连点器
         right._clicker_panel._start_blocked_cb = self._farm_block_reason  # type: ignore[attr-defined]
+        # v1.8.3:目标窗口兜底 —— 用户已选窗口但右侧没设目标时,自动补上
+        right.set_target_provider(self._pick_fallback_target)
 
         # 预览网格信号 → 主窗口
         left.selection_changed.connect(self._on_sync_selection_changed)
@@ -832,30 +838,12 @@ class MainWindow(QMainWindow):
         left.stop_process_requested.connect(self._on_card_stop_process)
         left.resume_process_requested.connect(self._on_card_resume_process)
         left.volume_requested.connect(self._on_card_volume)
-
-        # 每张卡片的信号(卡片会随进程增删动态创建,所以在 _sync 后补连)
-        def wire():
-            for w in left._items.values():
-                for sig, slot in (
-                    (w.focused, self._on_focus_from_preview),
-                    (w.target_requested, self._on_focus_from_preview),
-                    (w.closed, self._on_close_from_preview),
-                    (w.autoclick_toggle, self._on_autoclick_toggle_from_preview),
-                ):
-                    try:
-                        sig.disconnect(slot)
-                    except (RuntimeError, TypeError):
-                        pass
-                    sig.connect(slot)
-
-        old_sync = left._sync
-
-        def _sync_and_wire():
-            old_sync()
-            wire()
-
-        left._sync = _sync_and_wire  # type: ignore[assignment]
-        QTimer.singleShot(200, wire)
+        # v1.8.3:卡片级信号改由网格统一转发(卡片运行期动态创建,旧写法会漏连),
+        # 这里一次性连接,不再替换 left._sync 去补连。
+        left.focus_requested.connect(self._on_focus_from_preview)
+        left.target_requested.connect(self._on_focus_from_preview)
+        left.close_requested.connect(self._on_close_from_preview)
+        left.autoclick_toggle_requested.connect(self._on_autoclick_toggle_from_preview)
 
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -868,12 +856,47 @@ class MainWindow(QMainWindow):
 
     def _on_sync_selection_changed(self, hwnds: list) -> None:
         """左侧勾选变化 → 同步到右侧面板."""
-        self._right.set_sync_targets([int(h) for h in hwnds])
-        n = len(hwnds)
+        sel = [int(h) for h in hwnds]
+        self._right.set_sync_targets(sel)
+        # v1.8.3:勾选 = 用户正要操作这个窗口。若右侧当前没有目标、或目标已不在
+        # 勾选集合里,自动把第一个勾选窗口设为当前目标 —— 否则用户勾了窗口再点
+        # 「启动」/「+ 添加中心点」会被提示「请先选择目标窗口」。
+        if sel:
+            cur = int(getattr(self._right, "_target_hwnd", 0) or 0)
+            if cur not in sel:
+                info = wf.get_window_info(sel[0])
+                tp = self._pm.get(sel[0])
+                self._right.set_target(
+                    sel[0],
+                    (info.title if info else "") or (tp.title if tp else "") or str(sel[0]),
+                )
+        n = len(sel)
         if n:
             self._statusBar().showMessage(  # type: ignore[union-attr]
                 f"已选择 {n} 个窗口 · 可用「同步启动」让它们执行同一套操作", 3000)
         self._refresh_status()
+
+    def _pick_fallback_target(self) -> tuple[int, str] | None:
+        """右侧面板没设目标时的兜底候选:优先勾选窗口,其次唯一被追踪的窗口.
+
+        用于「用户明明选了窗口却提示请先选择目标窗口」的场景:与其报错,
+        不如直接采用左侧已经勾选 / 唯一存在的那个窗口。
+        """
+        cands: list[int] = []
+        try:
+            cands = [int(h) for h in self._left.selected_hwnds()]
+        except Exception:  # noqa: BLE001
+            cands = []
+        if not cands:
+            try:
+                cands = [int(tp.hwnd) for tp in self._pm.all() if int(tp.hwnd or 0)]
+            except Exception:  # noqa: BLE001
+                cands = []
+        for h in cands:
+            info = wf.get_window_info(h)
+            if info is not None:
+                return (h, info.title or str(h))
+        return None
 
     def _statusBar(self) -> QStatusBar:
         """返回状态栏(不存在则创建).
@@ -1468,11 +1491,44 @@ class MainWindow(QMainWindow):
             return
         pairs = Session.match(saved_items, visible)
         if not pairs:
-            # 上次有窗口但现在一个都没找到 → 自动清掉,不再打扰
-            self._session.clear()
-            self._statusBar().showMessage(  # type: ignore[union-attr]
-                "上次的窗口已不在桌面上,无需恢复", 4000,
+            # v1.8.3:以前这里直接静默清空 —— 如果关软件时游戏也一起关了(或游戏
+            # 窗口此刻不在桌面上),用户就再也看不到「恢复上一次进程」的提示。
+            # 改为:只要还存着可用的启动信息(尤其 Steam 游戏),就问一次是否
+            # 自动拉起游戏并恢复上次的挂机配置。
+            launchable = [it for it in saved_items if Session.launch_info_of(it)]
+            if not launchable:
+                self._session.clear()
+                self._statusBar().showMessage(  # type: ignore[union-attr]
+                    "上次的窗口已不在桌面上,也没有可自动启动的记录,无需恢复", 4000,
+                )
+                return
+            steam_n = sum(
+                1 for it in launchable if (it.get("launch") or {}).get("steam_appid")
             )
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("恢复上次的进程")
+            box.setText(
+                f"检测到上次追踪的 {len(launchable)} 个窗口当前都没启动"
+                + (
+                    f"(其中 {steam_n} 个是 Steam 游戏,会自动先启动 Steam 客户端)。\n"
+                    if steam_n else "。\n"
+                )
+                + "\n是否自动把它们启动起来,并恢复上次的连点 / 宏配置?"
+            )
+            yes0 = box.addButton("启动并恢复", QMessageBox.ButtonRole.YesRole)
+            no0 = box.addButton("暂不", QMessageBox.ButtonRole.NoRole)
+            never0 = box.addButton("不再提示", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(yes0)
+            box.exec()
+            clicked0 = box.clickedButton()
+            if clicked0 is yes0:
+                self._wake_missed(saved_items, [])
+            elif clicked0 is never0:
+                self._cfg.set("ui.restore_session_ask", False)
+                self._cfg.save()
+                self._session.clear()
+            # 「暂不」保留文件,下次启动仍会问
             return
         # 弹框询问
         matched = len(pairs)
@@ -1570,6 +1626,18 @@ class MainWindow(QMainWindow):
             + (f"(其中 {steam_n} 个 Steam 游戏会先启动 Steam 客户端)" if steam_n else ""),
             8000,
         )
+        # v1.8.3:唤醒之后要真的把窗口加回来。记下待绑定的条目并开始轮询,
+        # 游戏窗口一出现就自动添加 + 套用上次配置(以前只弹个提示,窗口不会回来)。
+        self._pending_items = [
+            s for s in missed if Session.launch_info_of(s) is not None
+        ]
+        self._pending_deadline = time.time() + float(
+            self._cfg.get("launch.wake_bind_timeout_sec", 180)
+        )
+        if self._pending_timer is None:
+            self._pending_timer = QTimer(self)
+            self._pending_timer.timeout.connect(self._poll_pending_bind)
+        self._pending_timer.start(2500)
         timeout = float(self._cfg.get("launch.steam_timeout_sec", 90))
         for li in todo:
             launch_async(
@@ -1586,8 +1654,49 @@ class MainWindow(QMainWindow):
         )
         if ok:
             self._log.info("已唤醒 %s:%s", li.describe(), msg)
+            # 立刻探一次,窗口已经出来就不用等下一个轮询周期
+            if self._pending_items:
+                QTimer.singleShot(3000, self._poll_pending_bind)
         else:
             self._log.warning("唤醒 %s 失败:%s", li.describe(), msg)
+
+    def _poll_pending_bind(self) -> None:
+        """轮询等待被唤醒游戏的窗口出现,一出现就自动加回并套用上次配置.
+
+        v1.8.3:没有这一步,「自动启动 Steam 游戏」启动完窗口也不会被追踪,
+        用户看到的就是「游戏起来了但软件里没有它」。
+        """
+        if not self._pending_items:
+            self._stop_pending_bind()
+            return
+        if time.time() > self._pending_deadline:
+            left_n = len(self._pending_items)
+            self._stop_pending_bind()
+            self._statusBar().showMessage(  # type: ignore[union-attr]
+                f"等待 {left_n} 个游戏窗口出现超时,可手动添加(启动的进程仍在运行)", 6000,
+            )
+            return
+        try:
+            visible = [
+                w for w in wf.list_visible_windows()
+                if __app_name_cn__ not in (w.title or "")
+            ]
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("轮询可见窗口失败: %s", e)
+            return
+        pairs = Session.match(self._pending_items, visible)
+        if not pairs:
+            return
+        self._do_restore_session(pairs)
+        hit = {id(s) for _s, _w in pairs}
+        self._pending_items = [s for s in self._pending_items if id(s) not in hit]
+        if not self._pending_items:
+            self._stop_pending_bind()
+
+    def _stop_pending_bind(self) -> None:
+        self._pending_items = []
+        if self._pending_timer is not None:
+            self._pending_timer.stop()
 
     # --- Steam 状态 ---
     def _on_restore_steam(self) -> None:

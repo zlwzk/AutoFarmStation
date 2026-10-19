@@ -49,6 +49,8 @@ class ClickerPanel(QWidget):
         self._clicker: AutoClicker | None = None
         self._target_hwnd = 0
         self._stats = None  # 由 main 注入
+        # v1.8.3:目标窗口兜底回调(由 ActionPanel.set_target_provider 注入)
+        self._target_provider = None  # type: ignore[assignment]
         # v1.6.2:启动前回调(挂机时段守护会用到);返回 None=放行,返回 str=拒绝并显示
         self._start_blocked_cb = None  # type: ignore[assignment]
         # v1.6.2:从设置 → 默认连点参数 取值,未传就 fallback 到硬编码默认
@@ -185,6 +187,27 @@ class ClickerPanel(QWidget):
         self._target_lab.setText(f"[{hwnd}] {title}")
         self._status.setText(styled_message(f"已选择目标: {title}", level="info"))
 
+    def _ensure_target(self) -> None:
+        """目标窗口未设置 / 已失效时,用兜底回调自动补一个可用窗口.
+
+        v1.8.3:用户明明在左侧选了窗口,但右侧目标为空时不该直接报错 ——
+        自动采用勾选窗口 / 唯一被追踪窗口,让「启动」等按钮直接可用。
+        """
+        if self._target_hwnd and wf.get_window_info(self._target_hwnd) is not None:
+            return
+        fn = getattr(self, "_target_provider", None)
+        if fn is None:
+            return
+        try:
+            cand = fn()
+        except Exception:  # noqa: BLE001
+            cand = None
+        if cand:
+            try:
+                self.set_target(int(cand[0]), str(cand[1]))
+            except Exception:  # noqa: BLE001
+                pass
+
     def set_stats(self, stats) -> None:
         self._stats = stats
 
@@ -217,8 +240,12 @@ class ClickerPanel(QWidget):
 
     # --- 启停 ---
     def _on_start(self) -> None:
+        self._ensure_target()  # v1.8.3:未设目标时自动采用已勾选 / 唯一窗口
         if not self._target_hwnd:
-            QMessageBox.warning(self, "连点器", "请先在左侧选择目标窗口。")
+            QMessageBox.warning(
+                self, "连点器",
+                "请先在左侧选中要挂机的窗口 —— 点卡片的「聚焦」按钮,或勾选卡片左侧的选框。",
+            )
             return
         # v1.6.2:挂机时段守护 — 时段外不允许启动,给明确提示
         if self._start_blocked_cb is not None:
@@ -324,6 +351,7 @@ class ClickerPanel(QWidget):
 
     # --- 点位 ---
     def _on_pick_clicked(self) -> None:
+        self._ensure_target()  # v1.8.3
         if not self._target_hwnd:
             QMessageBox.warning(self, "选点", "请先选择目标窗口。")
             return
@@ -340,6 +368,7 @@ class ClickerPanel(QWidget):
             self._add_point(cp)
 
     def _on_add_center(self) -> None:
+        self._ensure_target()  # v1.8.3
         if not self._target_hwnd:
             QMessageBox.warning(self, "中心点", "请先选择目标窗口。")
             return
@@ -1146,6 +1175,8 @@ class ActionPanel(QWidget):
         self._hub = hub or AutomationHub(stats=stats)
         self._target_hwnd = 0
         self._sync_targets: list[int] = []
+        # v1.8.3:目标窗口兜底回调(由 MainWindow 注入;见 set_target_provider)
+        self._target_provider = None  # type: ignore[assignment]
         # v1.6.2:读 cfg.defaults.clicker_* 给面板里的连点器初始化,
         # 这样设置 → 默认连点参数才有真效果。
         # 兼容旧调用方:不传 cfg 也不报错,落到硬编码默认值(行为与 v1.6.1 一致)。
@@ -1230,6 +1261,20 @@ class ActionPanel(QWidget):
             self._ctrl_panel,
         ):
             w.set_target(hwnd, title)
+
+    def set_target_provider(self, fn) -> None:
+        """v1.8.3:注入「目标窗口兜底」回调,返回 (hwnd, title) 或 None.
+
+        用户在左侧勾选了窗口、但没点「聚焦」时,右侧面板目标可能还是空的。
+        各面板在执行「启动 / 选点 / 添加中心点」前会回调它,自动补一个可用目标,
+        避免明明选了窗口却被提示「请先选择目标窗口」。
+        """
+        self._target_provider = fn
+        for w in (self._clicker_panel, self._key_panel):
+            try:
+                w._target_provider = fn  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
 
     def stop_all(self) -> None:
         self._clicker_panel.stop_all()

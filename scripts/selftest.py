@@ -1487,6 +1487,107 @@ def t_post_click_child_hit() -> bool:
         return False
 
 
+def t_v183_card_signal_forward() -> bool:
+    """v1.8.3:卡片级信号必须经网格转发,且「替换后的 _sync」对新卡片仍生效.
+
+    修「选中窗口后右侧仍显示未选择目标窗口」:旧写法把 self._sync 缓存进
+    pm.on_change,主窗口之后替换 left._sync(补连卡片信号)就对运行期新添加的
+    窗口失效 —— 新卡片漏连 target_requested,勾选/选中窗口后右侧目标仍是空的。
+    """
+    _div("v1.8.3 card signal forwarding")
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from PySide6.QtWidgets import QApplication
+
+        _app = QApplication.instance() or QApplication([])
+        from autofarmstation.core.process_manager import ProcessManager
+        from autofarmstation.ui.preview_grid import PreviewGrid
+
+        # 1) 网格级信号齐全(卡片信号统一由网格转发,动态新增也不会漏连)
+        for name in (
+            "focus_requested", "target_requested",
+            "close_requested", "autoclick_toggle_requested",
+        ):
+            assert hasattr(PreviewGrid, name), f"PreviewGrid 缺信号 {name}"
+
+        # 2) 造一个真实顶层窗口 → add 后网格应建卡片,卡片信号转发为网格信号
+        u32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        WNDPROCTYPE = ctypes.WINFUNCTYPE(
+            wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        )
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT), ("lpfnWndProc", WNDPROCTYPE),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u32.DefWindowProcW.restype = wintypes.LPARAM
+        u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u32.RegisterClassW.restype = wintypes.WORD
+        u32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        ]
+        u32.CreateWindowExW.restype = wintypes.HWND
+        u32.DestroyWindow.argtypes = [wintypes.HWND]
+        u32.DestroyWindow.restype = wintypes.BOOL
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        proc = WNDPROCTYPE(lambda h, m, wp, lp: u32.DefWindowProcW(h, m, wp, lp))
+        hinst = k32.GetModuleHandleW(None)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = proc
+        wc.hInstance = hinst
+        wc.lpszClassName = "AfsSelftestV183"
+        u32.RegisterClassW(ctypes.byref(wc))
+        WS_OVERLAPPEDWINDOW = 0x00CF0000
+        WS_VISIBLE = 0x10000000
+        hwnd = u32.CreateWindowExW(
+            0, "AfsSelftestV183", "afs-v183-card", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0, 0, 320, 240, None, None, hinst, None,
+        )
+        assert hwnd, "建测试窗口失败"
+        try:
+            pm = ProcessManager()
+            grid = PreviewGrid(pm)
+            fired: list[int] = []
+            grid.target_requested.connect(lambda h: fired.append(int(h)))
+            assert pm.add_by_hwnd(hwnd) is not None, "add_by_hwnd 失败"
+            card = grid.card(hwnd)
+            assert card is not None, "加窗口后网格没建卡片"
+            card.target_requested.emit(hwnd)  # type: ignore[attr-defined]
+            assert fired == [hwnd], f"卡片 target_requested 没转发到网格: {fired}"
+
+            # 3) 主窗口「替换 _sync 补连」的写法必须对新窗口仍生效
+            #    (旧代码把绑定方法缓存进 pm.on_change,替换后就失效)
+            hits = {"n": 0}
+            real = grid._sync
+
+            def _patched() -> None:
+                hits["n"] += 1
+                real()
+
+            grid._sync = _patched  # type: ignore[assignment]
+            pm._notify()  # type: ignore[attr-defined]
+            assert hits["n"] >= 1, "替换后的 _sync 没有被 pm 回调调用"
+            _ok("卡片信号转发 + _sync 替换对新窗口生效 ok")
+            return True
+        finally:
+            u32.DestroyWindow(hwnd)
+    except Exception as e:  # noqa: BLE001
+        _fail("v183_card_signal_forward", e)
+        return False
+
+
 def t_user_bats_persist() -> bool:
     """v1.6.2:用户自加的 bat 脚本必须跨「重建 BatLibrary」持久化。
 
@@ -2197,6 +2298,8 @@ def run_all() -> int:
                                         t_hub_pause_clicker,
                                         # v1.8.2 新增(后台连点命中子窗口)
                                         t_post_click_child_hit,
+                                        # v1.8.3 新增(卡片信号转发 + 选中即目标)
+                                        t_v183_card_signal_forward,
                                         ]
     passed = 0
     failed = 0

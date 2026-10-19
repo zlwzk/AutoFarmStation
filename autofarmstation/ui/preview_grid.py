@@ -35,6 +35,11 @@ class PreviewGrid(QWidget):
     volume_requested = Signal(int)          # hwnd → 打开单窗口音量面板
     group_start_requested = Signal(list)    # v1.7.0 对当前分类下的整组窗口启动
     group_stop_requested = Signal(list)     # v1.7.0 对当前分类下的整组窗口停止
+    # v1.8.3:卡片级信号统一转发(卡片是运行期动态创建的,由网格转发才不会漏连)
+    focus_requested = Signal(int)              # hwnd 卡片「聚焦」/点预览图
+    target_requested = Signal(int)             # hwnd 卡片标题左键 / 勾选 → 设为右侧目标
+    close_requested = Signal(int)              # hwnd 卡片「×」
+    autoclick_toggle_requested = Signal(int)   # hwnd 卡片「连点 / 停止」
 
     def __init__(
         self,
@@ -180,8 +185,12 @@ class PreviewGrid(QWidget):
         self._empty_label.linkActivated.connect(lambda _l: self._on_filter_chip(None))
         self._layout.addWidget(self._empty_label, 0, 0)
 
-        self._pm.on_change(self._sync)
-        QTimer.singleShot(100, self._sync)
+        # v1.8.3:这里必须用 lambda 包一层。之前直接传 self._sync 会把这个
+        # 绑定方法缓存进 pm.on_change,主窗口之后替换 left._sync(补连卡片信号)
+        # 就对「运行期新添加的窗口」失效 —— 新卡片漏连 target_requested,
+        # 表现为勾选/选中窗口后右侧仍显示「未选择目标窗口」。
+        self._pm.on_change(lambda: self._sync())
+        QTimer.singleShot(100, lambda: self._sync())
 
         # 状态刷新(每 1.2s):把 AutomationHub 的运行状态回填到卡片
         self._status_timer = QTimer(self)
@@ -424,6 +433,11 @@ class PreviewGrid(QWidget):
                 w.resume_process.connect(self.resume_process_requested.emit)
                 w.volume_requested.connect(self.volume_requested.emit)
                 w.group_changed.connect(self._on_group_changed)  # v1.7.0
+                # v1.8.3:卡片级信号在创建时就连到网格级信号,动态新增也不漏连
+                w.focused.connect(self.focus_requested.emit)
+                w.target_requested.connect(self.target_requested.emit)
+                w.closed.connect(self.close_requested.emit)
+                w.autoclick_toggle.connect(self.autoclick_toggle_requested.emit)
                 self._items[it.hwnd] = w
             else:
                 # 已存在的卡片:别名 / 强调色可能在别处改过,顺手刷新

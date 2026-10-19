@@ -2,7 +2,7 @@
 
 > 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、分屏分类、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.8.2-blue)
+![banner](https://img.shields.io/badge/version-1.8.3-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -56,6 +56,12 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
   点预览图 / 聚焦仍是「设目标 + 抢前台」。不再出现「明明选了却提示未选择窗口」。
 - **分类条不卡死**(v1.8.1):选到空分组时显示「← 返回全部」链接,再点一次已选中的分类也会返回全部;
   单个分类 chip 异常不再拖垮整条分类条。连点「暂停/继续」按钮在多窗口模式下真正生效。
+- **选中窗口就能连点**(v1.8.3):卡片信号改由预览网格统一转发,运行期新添加的窗口也自动接上
+  「设为目标」信号;勾选窗口即自动成为右侧目标,启动 / 选点 / 添加中心点前还会自动兜底
+  取一个可用窗口 —— 不再出现「明明选中了窗口却提示未选择目标窗口」。
+- **关闭重开自动恢复上次挂机**(v1.8.3):启动时若上次的窗口都没在,会主动问「是否自动拉起
+  上次的游戏并恢复配置」;Steam 游戏会先启动 Steam 客户端,唤醒后轮询等窗口出现,
+  一出现就自动加回并套用上次的连点 / 宏配置。
 - **后台连点命中子窗口**(v1.8.2):post/auto 模式投递前按坐标命中最深层可见子窗口并转换坐标,
   CEF 页游 / 安卓模拟器 / 部分 Unity 游戏「选对了窗口但后台点了没反应」的问题就此解决;
   无子窗口的普通游戏行为不变,最小化 / 被遮挡窗口照常可用。
@@ -209,7 +215,7 @@ A:实测 `offline` 走这个协议在当前 Steam 客户端不生效(状态不�
 ## 自检与开发
 
 ```bash
-python -m scripts.selftest   # 51 项自检(v1.8.2;v1.8.1 是 50 项,v1.8.0 是 49 项,v1.7.0 是 47 项,v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
+python -m scripts.selftest   # 52 项自检(v1.8.3;v1.8.2 是 51 项,v1.8.1 是 50 项,v1.8.0 是 49 项,v1.7.0 是 47 项,v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe)
 powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(可选)
 ```
