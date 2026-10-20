@@ -2543,6 +2543,100 @@ def t_v186_eco_mode_persist() -> bool:
         return False
 
 
+def t_v187_tags() -> bool:
+    """v1.8.7:窗口标签 set_tags / tags_of / all_tags,去重去空去 # 前缀."""
+    _div("v1.8.7 标签读写")
+    try:
+        from autofarmstation.core.process_manager import ProcessManager, TrackedProcess
+
+        pm = ProcessManager()
+        pm._items[5678] = TrackedProcess(
+            hwnd=5678, pid=1234, name="a.exe", title="A", exe="C:\\a.exe")
+        assert pm.set_tags(5678, [" 主力号 ", "#每日", "每日", "", "活动"]) is True
+        assert pm.tags_of(5678) == ["主力号", "每日", "活动"], pm.tags_of(5678)
+        assert pm.all_tags() == ["主力号", "活动", "每日"] or set(pm.all_tags()) == {"主力号", "每日", "活动"}
+        assert pm.hwnds_with_tag("每日") == [5678]
+        # 清空
+        pm.set_tags(5678, [])
+        assert pm.tags_of(5678) == []
+        # 不存在的窗口不崩
+        assert pm.set_tags(999, ["x"]) is False
+        assert pm.tags_of(999) == []
+        # to_dict 必须带上 tags
+        it = pm.get(5678)
+        it.tags = ["a", "b"]
+        assert it.to_dict().get("tags") == ["a", "b"]
+        _ok("标签去重/清空/持久化字段正确")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v187_tags", e)
+        return False
+
+
+def t_v187_pick_helpers() -> bool:
+    """v1.8.7:截图选点坐标换算 + 最近点选中 + 尺寸变化重算比例."""
+    _div("v1.8.7 截图选点换算 / 命中 / 重算")
+    try:
+        from PySide6.QtCore import QPoint
+
+        from autofarmstation.core.autoclicker import ClickPoint
+        from autofarmstation.ui.preview_pick_dialog import (
+            map_to_image, nearest_point, rebase_points,
+        )
+
+        # 1000x500 的图放进 500x500 画布:s=0.5,上下留黑边 125px
+        assert map_to_image(QPoint(250, 250), 500, 500, 1000, 500) == (500, 250)
+        assert map_to_image(QPoint(0, 125), 500, 500, 1000, 500) == (0, 0)
+        assert map_to_image(QPoint(499, 374), 500, 500, 1000, 500) == (998, 498)
+        # 黑边里(超出 8px 容差)→ None
+        assert map_to_image(QPoint(250, 60), 500, 500, 1000, 500) is None
+        # 无效尺寸不崩
+        assert map_to_image(QPoint(1, 1), 0, 0, 0, 0) is None
+
+        pts = [ClickPoint(x=500, y=250), ClickPoint(x=100, y=100)]
+        # 画布坐标 (250,250) 就是第 0 个点位
+        assert nearest_point(QPoint(252, 248), 500, 500, 1000, 500, pts) == 0
+        assert nearest_point(QPoint(480, 480), 500, 500, 1000, 500, pts) == -1
+
+        # 窗口从 1000x500 变成 500x250 → 比例坐标保持,像素坐标减半
+        cp = ClickPoint(x=500, y=250)
+        cp.set_ratio(1000, 500)
+        rebase_points([cp], 500, 250)
+        assert (cp.x, cp.y) == (250, 125), (cp.x, cp.y)
+        _ok("换算 / 命中 / 重算比例正确")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v187_pick_helpers", e)
+        return False
+
+
+def t_v187_tag_ui_wiring() -> bool:
+    """v1.8.7:标签分类入口、标签筛选条、截图选点整体替换是否接好."""
+    _div("v1.8.7 标签 UI / 截图选点接线")
+    try:
+        from autofarmstation.ui import preview_grid, preview_widget, action_panel, tag_dialog
+
+        # 对话框:标签拆分规则
+        assert tag_dialog.split_tags("a, b，c;d、e  f") == ["a", "b", "c", "d", "e", "f"]
+        assert tag_dialog.split_tags("#主力号，主力号") == ["主力号"]
+
+        for name in ("_on_edit_tags", "_update_tags_badge", "_on_badge_press"):
+            assert hasattr(preview_widget.PreviewWidget, name), name
+        assert hasattr(preview_grid.PreviewGrid, "_refresh_tag_bar")
+        assert hasattr(preview_grid.PreviewGrid, "_on_tag_chip")
+        for name in ("_apply_points", "_persist_clicker_config"):
+            assert hasattr(action_panel.ClickerPanel, name), name
+        # 截图选点对话框支持带入已有点位
+        import inspect
+        from autofarmstation.ui.preview_pick_dialog import PreviewPickDialog
+        assert "initial_points" in inspect.signature(PreviewPickDialog.__init__).parameters
+        _ok("标签入口 / 筛选条 / 截图选点替换逻辑均在位")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v187_tag_ui_wiring", e)
+        return False
+
+
 # === 入口 ===
 def run_all() -> int:
     t0 = time.time()
@@ -2590,6 +2684,10 @@ def run_all() -> int:
                                         t_v186_power_saver,
                                         t_v186_action_panel_imports,
                                         t_v186_eco_mode_persist,
+                                        # v1.8.7 新增(标签分类 + 截图选点完善)
+                                        t_v187_tags,
+                                        t_v187_pick_helpers,
+                                        t_v187_tag_ui_wiring,
                                         ]
     passed = 0
     failed = 0

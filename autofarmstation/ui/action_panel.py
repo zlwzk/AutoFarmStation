@@ -258,10 +258,10 @@ class ClickerPanel(QWidget):
         self._on_stop()
 
     # --- 配置构建(供单窗口 / 同步两用) ---
-    def build_config(self) -> AutoClickerConfig | None:
-        """从界面读取当前配置;无有效点位时返回 None."""
+    def build_config(self, *, allow_empty: bool = False) -> AutoClickerConfig | None:
+        """从界面读取当前配置;无有效点位时返回 None(allow_empty=True 时也返回空配置)."""
         pts = self._points()
-        if not pts:
+        if not pts and not allow_empty:
             return None
         cw, ch = wf.client_size(self._target_hwnd) if self._target_hwnd else (0, 0)
         return AutoClickerConfig(
@@ -407,6 +407,7 @@ class ClickerPanel(QWidget):
                     "读不到窗口客户区尺寸,该点位只能按像素记录"
                     "(窗口缩放后可能打偏)", level="warn"))
             self._add_point(cp)
+            self._persist_clicker_config()
 
     def _on_add_center(self) -> None:
         self._ensure_target()  # v1.8.3
@@ -418,20 +419,48 @@ class ClickerPanel(QWidget):
             cp = ClickPoint(x=cw // 2, y=ch // 2)
             cp.set_ratio(cw, ch)
             self._add_point(cp)
+            self._persist_clicker_config()
 
     def _on_pick_on_image(self) -> None:
-        """v1.8.4:在游戏截图上标记连点位置(不用切到游戏前台)."""
+        """在游戏截图上标记 / 编辑连点位置(不用切到游戏前台).
+
+        v1.8.7:对话框带入当前已有点位并允许微调,确定后**整体替换**点位列表 ——
+        以前是每打开一次就在旧点位后面再叠一份,重复点位很难分辨。
+        """
         self._ensure_target()
         if not self._target_hwnd:
             QMessageBox.warning(self, "截图选点", "请先选择目标窗口。")
             return
         from .preview_pick_dialog import PreviewPickDialog
-        dlg = PreviewPickDialog(self._target_hwnd, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.points:
-            for cp in dlg.points:
-                self._add_point(cp)
-            self._status.setText(styled_message(
-                f"已从截图添加 {len(dlg.points)} 个点位(自动记比例坐标)", level="ok"))
+        dlg = PreviewPickDialog(self._target_hwnd, self, initial_points=self._points())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_points(dlg.points)
+        self._persist_clicker_config()
+        self._status.setText(styled_message(
+            f"截图选点完成:当前共 {len(dlg.points)} 个点位(已自动记比例坐标并保存)",
+            level="ok"))
+
+    def _apply_points(self, pts: list[ClickPoint]) -> None:
+        """用给定点位整体替换列表(截图选点返回的编辑结果)."""
+        self._points_list.clear()
+        for cp in pts:
+            self._add_point(cp)
+
+    def _persist_clicker_config(self, *, allow_empty: bool = False) -> None:
+        """把面板当前点位/参数立刻存进 hub,避免切窗口后配置丢失.
+
+        只保存、不启动;``allow_empty=True`` 用于「清空 / 删光点位」时同步清掉
+        hub 里的旧配置,否则切走再切回来旧点位会复活。
+        """
+        if self._hub is None or not self._target_hwnd:
+            return
+        try:
+            cfg = self.build_config(allow_empty=allow_empty)
+            if cfg is not None:
+                self._hub.set_clicker_config(self._target_hwnd, cfg)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _points(self) -> list[ClickPoint]:
         out: list[ClickPoint] = []
@@ -472,9 +501,11 @@ class ClickerPanel(QWidget):
     def _on_del_point(self) -> None:
         for it in self._points_list.selectedItems():
             self._points_list.takeItem(self._points_list.row(it))
+        self._persist_clicker_config(allow_empty=True)
 
     def _on_clear_points(self) -> None:
         self._points_list.clear()
+        self._persist_clicker_config(allow_empty=True)
 
     def _reload_points(self) -> None:
         pts = self._points()

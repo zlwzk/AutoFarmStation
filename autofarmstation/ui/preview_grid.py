@@ -160,6 +160,28 @@ class PreviewGrid(QWidget):
 
         outer.addWidget(gbar)
 
+        # ---------- v1.8.7 标签筛选条(有标签时才显示) ----------
+        self._tag_filter: str | None = None  # None=不限;其他=只显示带该标签的窗口
+        self._tag_bar = QWidget()
+        self._tag_bar.setStyleSheet("background:#232323; border-bottom:1px solid #3c3c3c;")
+        tl = QHBoxLayout(self._tag_bar)
+        tl.setContentsMargins(8, 3, 8, 3)
+        tl.setSpacing(4)
+        tlab = QLabel("标签:")
+        tlab.setStyleSheet("color:#999; font-size:11px;")
+        tl.addWidget(tlab)
+        self._tag_chip_layout = QHBoxLayout()
+        self._tag_chip_layout.setSpacing(4)
+        tl.addLayout(self._tag_chip_layout)
+        tl.addStretch()
+        self._btn_tag_clear = QPushButton("清除标签筛选")
+        self._btn_tag_clear.setFixedHeight(20)
+        self._btn_tag_clear.setToolTip("取消标签筛选,只看分类")
+        self._btn_tag_clear.clicked.connect(lambda: self._on_tag_chip(None))
+        tl.addWidget(self._btn_tag_clear)
+        self._tag_bar.setVisible(False)
+        outer.addWidget(self._tag_bar)
+
         # ---------- 滚动网格 ----------
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -260,11 +282,19 @@ class PreviewGrid(QWidget):
         item = self._pm.get(int(hwnd))
         return (item.group if item else "") or ""
 
+    def _tags_of(self, hwnd: int) -> list[str]:
+        try:
+            return self._pm.tags_of(int(hwnd))
+        except Exception:  # noqa: BLE001
+            return []
+
     def _passes_filter(self, hwnd: int) -> bool:
-        """None=全部;""=未分组;其他=只显示该组."""
-        if self._filter is None:
-            return True
-        return self._group_of(hwnd) == self._filter
+        """分类 + 标签双重筛选,两者同时满足才显示."""
+        if self._filter is not None and self._group_of(hwnd) != self._filter:
+            return False
+        if self._tag_filter is not None and self._tag_filter not in self._tags_of(hwnd):
+            return False
+        return True
 
     def refresh_group_bar(self) -> None:
         """按当前进程数据重建分类条(组名 chip + 数量)."""
@@ -313,7 +343,55 @@ class PreviewGrid(QWidget):
         has_filter = self._filter is not None
         self._btn_group_start.setEnabled(has_filter and n_all > 0)
         self._btn_group_stop.setEnabled(has_filter and n_all > 0)
+        self._refresh_tag_bar()
         self._apply_filter()
+
+    def _refresh_tag_bar(self) -> None:
+        """重建标签筛选条;没有标签时整条隐藏."""
+        while self._tag_chip_layout.count():
+            it = self._tag_chip_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        try:
+            tags = self._pm.all_tags()
+        except Exception:  # noqa: BLE001
+            tags = []
+        # 已选的标签不存在了 → 取消筛选
+        if self._tag_filter is not None and self._tag_filter not in tags:
+            self._tag_filter = None
+        if not tags:
+            self._tag_bar.setVisible(False)
+            self._btn_tag_clear.setVisible(False)
+            return
+        for t in tags:
+            cnt = sum(1 for h in self._items if t in self._tags_of(h))
+            try:
+                btn = QToolButton()
+                btn.setText(f"#{t} {cnt}")
+                btn.setCheckable(True)
+                btn.setChecked(self._tag_filter == t)
+                btn.setStyleSheet(
+                    "QToolButton { color:#b7cbb7; border:1px solid #4a5a4a; border-radius:8px;"
+                    "padding:1px 8px; font-size:11px; background:transparent; }"
+                    "QToolButton:hover { border-color:#7fbf8a; }"
+                    "QToolButton:checked { color:#d8f0dd; border-color:#5aa85a;"
+                    "background:rgba(90,168,90,0.16); font-weight:bold; }"
+                )
+                btn.clicked.connect(lambda _c=False, v=t: self._on_tag_chip(v))
+                self._tag_chip_layout.addWidget(btn)
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).exception("标签筛选 chip 创建失败: %r", t)
+        self._btn_tag_clear.setVisible(self._tag_filter is not None)
+        self._tag_bar.setVisible(True)
+
+    def _on_tag_chip(self, value: str | None) -> None:
+        # 再点一次当前标签 = 取消标签筛选
+        if value is not None and self._tag_filter == value:
+            self._tag_filter = None
+        else:
+            self._tag_filter = value
+        self.refresh_group_bar()
 
     def _on_filter_chip(self, value: str | None) -> None:
         # 再点一次当前已选中的分类 = 返回「全部」(空分组时这就是最直觉的「返回上一级」)
@@ -357,12 +435,12 @@ class PreviewGrid(QWidget):
 
     def _update_sel_label(self) -> None:
         n = len(self.selected_hwnds())
-        # 过滤状态下分母只算当前分类里的窗口,数量更直观
-        if self._filter is None:
+        # 过滤状态下分母只算当前筛选结果里的窗口,数量更直观
+        if self._filter is None and self._tag_filter is None:
             total = len(self._items)
         else:
             total = sum(1 for h in self._items if self._passes_filter(h))
-        suffix = f"(分类内 {total})" if self._filter is not None else f" / {total}"
+        suffix = f"(筛选内 {total})" if (self._filter is not None or self._tag_filter is not None) else f" / {total}"
         self._sel_lab.setText(f"已选 {n}{suffix}")
         has = n > 0
         for b in (self._btn_sync_start, self._btn_sync_stop, self._btn_broadcast):

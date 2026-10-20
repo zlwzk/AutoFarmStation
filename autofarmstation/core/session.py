@@ -110,6 +110,7 @@ class Session:
                     "added_at": float(tp.added_at or 0.0),
                     "launch": launch,
                     "group": tp.group or "",  # v1.7.0 分屏分类
+                    "tags": list(tp.tags or []),  # v1.8.7 窗口标签
                 }
             )
         payload = {

@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPixmap, QPen
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
-    QFrame, QSizePolicy, QCheckBox, QInputDialog, QMenu,
+    QFrame, QSizePolicy, QCheckBox, QInputDialog, QMenu, QDialog,
 )
 
 from ..core.preview_capture import PreviewCapture, PreviewFrame
@@ -207,11 +207,31 @@ class PreviewWidget(QFrame):
         # v1.7.0 分屏分类徽标(「需点击」/「纯挂时长」/自定义)
         self._group_badge = QLabel("")
         self._group_badge.setVisible(False)
+        self._group_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._group_badge.mousePressEvent = self._on_badge_press  # type: ignore[assignment]
         self._group_badge.setStyleSheet(
             "color:#4a9eff; border:1px solid #4a9eff; border-radius:6px;"
             "padding:0 5px; font-size:10px; background:rgba(74,158,255,0.12);"
         )
         title_bar.addWidget(self._group_badge)
+
+        # v1.8.7 标签徽标(#标签,点一下可编辑)
+        self._tags_badge = QLabel("")
+        self._tags_badge.setVisible(False)
+        self._tags_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tags_badge.setStyleSheet(
+            "color:#9fd6a8; border:1px solid #4a8f5a; border-radius:6px;"
+            "padding:0 5px; font-size:10px; background:rgba(90,168,90,0.12);"
+        )
+        self._tags_badge.mousePressEvent = self._on_badge_press  # type: ignore[assignment]
+        title_bar.addWidget(self._tags_badge)
+
+        # v1.8.7 标签与分类设置入口(显式按钮,不用去翻右键菜单)
+        self._btn_tag = QPushButton("🏷")
+        self._btn_tag.setFixedWidth(28)
+        self._btn_tag.setToolTip("设置这个窗口的「分类」和「标签」(可多选),多开时方便区分和筛选")
+        self._btn_tag.clicked.connect(self._on_edit_tags)
+        title_bar.addWidget(self._btn_tag)
 
         self._btn_embed = QPushButton("嵌入")
         self._btn_embed.setCheckable(True)
@@ -414,7 +434,8 @@ class PreviewWidget(QFrame):
                 f"color:{c}; border:1px solid {c}; border-radius:6px;"
                 f"padding:0 5px; font-size:10px;"
             )
-            self._group_badge.setToolTip(f"分组:{g}\n(右键标题 → 分组 可修改)")
+            self._group_badge.setToolTip(f"分类:{g}\n点击可修改分类和标签")
+            self._group_badge.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _apply_style(self) -> None:
         """边框:选中 > 自定义强调色 > 默认;悬停统一高亮."""
@@ -432,6 +453,12 @@ class PreviewWidget(QFrame):
         if self._pm is None:
             return
         menu = QMenu(self)
+        # v1.8.7:标签与分类统一入口(分类 + 多个标签一次设完)
+        act_tag = QAction("🏷 标签与分类...", self)
+        act_tag.triggered.connect(self._on_edit_tags)
+        menu.addAction(act_tag)
+        menu.addSeparator()
+
         act_rename = QAction("重命名(别名)...", self)
         act_rename.triggered.connect(self._on_rename)
         menu.addAction(act_rename)
@@ -494,6 +521,71 @@ class PreviewWidget(QFrame):
         menu.addAction(act_eco)
 
         menu.exec(self._title_lab.mapToGlobal(pos))
+
+    # --- v1.8.7 标签与分类 ---
+    def _on_badge_press(self, ev) -> None:  # noqa: N802
+        """点标签徽标 = 打开标签与分类设置."""
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self._on_edit_tags()
+
+    def _on_edit_tags(self) -> None:
+        """打开「标签与分类」对话框,设置当前窗口的分类和标签."""
+        if self._pm is None:
+            return
+        try:
+            item = self._pm.get(self.hwnd)
+        except Exception:  # noqa: BLE001
+            item = None
+        if item is None:
+            return
+        from .tag_dialog import TagGroupDialog
+
+        alias = getattr(item, "alias", "") or ""
+        label = f"[{item.pid}] {alias or sanitize(item.title)}"
+        dlg = TagGroupDialog(
+            group=item.group,
+            tags=list(item.tags),
+            known_groups=self._pm.all_groups(),
+            known_tags=self._pm.all_tags(),
+            window_label=label,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self._pm.set_group(self.hwnd, dlg.group())
+            self._pm.set_tags(self.hwnd, dlg.tags())
+            self._update_group_badge()
+            self._update_tags_badge(force=True)
+            # 让网格重建筛选条(可能新增了分类 / 标签)
+            self.group_changed.emit()
+            self._refresh_status()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _update_tags_badge(self, *, force: bool = False) -> None:
+        """把该窗口的标签显示成 #a #b(最多 3 个,其余折叠成 +N)."""
+        if self._pm is None:
+            self._tags_badge.setVisible(False)
+            return
+        try:
+            tags = self._pm.tags_of(self.hwnd)
+        except Exception:  # noqa: BLE001
+            tags = []
+        shown = ("|".join(tags),)
+        if not force and getattr(self, "_tags_shown", None) == shown:
+            return
+        self._tags_shown = shown
+        if not tags:
+            self._tags_badge.setVisible(False)
+            self._tags_badge.setText("")
+            return
+        head = " ".join(f"#{t}" for t in tags[:3])
+        if len(tags) > 3:
+            head += f" +{len(tags) - 3}"
+        self._tags_badge.setText(head)
+        self._tags_badge.setToolTip("标签:" + "、".join(tags) + "\n点击可编辑")
+        self._tags_badge.setVisible(True)
 
     def _on_eco_toggled(self, on: bool) -> None:
         if self._pm is None:
@@ -814,6 +906,7 @@ class PreviewWidget(QFrame):
 
     def _refresh_status(self) -> None:
         self._update_group_badge()  # v1.7.0 分组标签跟着进程数据走
+        self._update_tags_badge()   # v1.8.7 标签徽标跟着进程数据走
         info = wf.get_window_info(self.hwnd)
         if info is None:
             self._title_lab.setText("[已失效]")

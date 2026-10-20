@@ -1579,6 +1579,12 @@ class MainWindow(QMainWindow):
                 self._pm.set_group(int(w.hwnd), str(s.get("group") or "") if isinstance(s, dict) else "")
             except Exception:  # noqa: BLE001
                 pass
+            # v1.8.7:恢复窗口标签
+            try:
+                if isinstance(s, dict) and s.get("tags"):
+                    self._pm.set_tags(int(w.hwnd), list(s.get("tags") or []))
+            except Exception:  # noqa: BLE001
+                pass
             cfg = (s.get("config") or {}) if isinstance(s, dict) else {}
             if cfg:
                 new_configs[str(int(w.hwnd))] = cfg

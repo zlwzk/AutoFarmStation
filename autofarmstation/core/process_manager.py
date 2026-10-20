@@ -304,6 +304,39 @@ class ProcessManager:
         item.group = str(group or "").strip()
         return True
 
+    def set_tags(self, hwnd: int, tags: list[str]) -> bool:
+        """v1.8.7 设置窗口标签(去重、去空、去掉 # 前缀,最多 12 个)."""
+        with self._lock:
+            item = self._items.get(int(hwnd))
+        if item is None:
+            return False
+        out: list[str] = []
+        for t in tags or []:
+            s = str(t).strip().lstrip("#").strip()
+            if s and s not in out:
+                out.append(s)
+            if len(out) >= 12:
+                break
+        item.tags = out
+        return True
+
+    def tags_of(self, hwnd: int) -> list[str]:
+        with self._lock:
+            item = self._items.get(int(hwnd))
+        return list(item.tags) if item else []
+
+    def all_tags(self) -> list[str]:
+        """当前已使用的标签(去重排序),供对话框做快捷选项."""
+        with self._lock:
+            names: set[str] = set()
+            for it in self._items.values():
+                names.update(it.tags)
+        return sorted(names)
+
+    def hwnds_with_tag(self, tag: str) -> list[int]:
+        with self._lock:
+            return [h for h, it in self._items.items() if tag in it.tags]
+
     def set_eco_mode(self, hwnd: int, on: bool) -> bool:
         """v1.8.6 记录某窗口的省电降帧开关,并对当前进程立即生效."""
         from . import power_saver
