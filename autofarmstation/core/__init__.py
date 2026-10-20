@@ -33,6 +33,7 @@ from .steam_overlay import (
     restore_backup as steam_overlay_restore,
 )
 from . import audio
+from . import power_saver
 from .game_launcher import (
     LaunchInfo,
     detect_launch_info,
@@ -95,6 +96,7 @@ __all__ = [
     "BatLibrary", "BatEntry", "BatArg",
     "steam_overlay_describe", "steam_overlay_set", "steam_overlay_restore",
     "audio",
+    "power_saver",
     "LaunchInfo", "detect_launch_info", "launch_game", "launch_game_async",
     "kill_process", "is_process_alive", "ensure_steam_running",
     "find_appid_by_exe", "steam_libraries", "parse_vdf",

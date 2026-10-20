@@ -5,6 +5,13 @@ v1.6.1 起:在导入 Qt 之前就把进程声明为「Per-Monitor DPI Aware」(W
 依次回退 SetProcessDpiAwarenessContext V2 / SetProcessDPIAware,全部失败就
 按系统默认(普通 Win7 兼容)。
 
+v1.8.6 起:三处修复与优化 —— ①**截图选点真正可用**:v1.8.5 及之前在截图对话框点「确定」
+会因 QDialog 未导入而 NameError,点位永远加不进列表,现在补上导入;②**连点器配置随窗口走**:
+切换目标窗口时自动把该窗口已保存的点位/间隔/发送方式回填到面板(以前切走再切回来面板空了,
+再点「启动」误报「请至少添加一个点击点位」),兜底执行路径也改为按界面选的发送方式构造;
+③**省电降帧(EcoQoS)**:卡片右键标题新增「省电降帧」,把游戏进程设为能效模式 + 低于正常
+优先级,嵌入/后台挂机时 CPU 占用明显下降(游戏帧率随之降低,挂机场景可接受),开关随窗口
+持久化、进程重启后自动重开,要手动玩时取消勾选即可。
 v1.8.5 起:修复「截图选点的标记位置不准」—— 根因是截图用了
 PrintWindow(PW_RENDERFULLCONTENT) 却不带 PW_CLIENTONLY,渲染的是**整个窗口**
 (含标题栏和边框)再裁到客户区尺寸,图像原点其实是窗口左上角而不是客户区左上角,
@@ -59,7 +66,7 @@ from __future__ import annotations
 import ctypes
 import os
 
-__version__ = "1.8.5"
+__version__ = "1.8.6"
 __app_name__ = "AutoFarmStation"
 __app_name_cn__ = "多开挂机大师"
 __author_handle__ = "zlwzk"

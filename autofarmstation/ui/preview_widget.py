@@ -476,7 +476,34 @@ class PreviewWidget(QFrame):
         act_new_g.triggered.connect(self._on_new_group)
         sub_g.addAction(act_new_g)
 
+        # v1.8.6:省电降帧(EcoQoS)—— 把游戏进程设为能效模式+低优先级,
+        # 嵌入/后台挂机时显著降低 CPU 占用(游戏帧率会随之降低)。
+        menu.addSeparator()
+        act_eco = QAction("省电降帧(降低 CPU 占用)", self)
+        act_eco.setCheckable(True)
+        try:
+            act_eco.setChecked(self._pm.eco_mode(self.hwnd))
+        except Exception:  # noqa: BLE001
+            pass
+        act_eco.setToolTip(
+            "把该游戏进程设为能效模式(EcoQoS)+ 低于正常的优先级:\n"
+            "CPU 占用明显下降,软件多开不卡;代价是游戏帧率降低。\n"
+            "适合「放在软件里挂着」的窗口;要手动玩时关掉即可。"
+        )
+        act_eco.triggered.connect(self._on_eco_toggled)
+        menu.addAction(act_eco)
+
         menu.exec(self._title_lab.mapToGlobal(pos))
+
+    def _on_eco_toggled(self, on: bool) -> None:
+        if self._pm is None:
+            return
+        try:
+            ok = self._pm.set_eco_mode(self.hwnd, bool(on))
+            if ok:
+                self._refresh_status()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_rename(self) -> None:
         info = wf.get_window_info(self.hwnd)

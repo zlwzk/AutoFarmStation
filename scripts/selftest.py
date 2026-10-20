@@ -2479,6 +2479,70 @@ def t_updater_apply_pending_cleans_missing() -> bool:
         return False
 
 
+def t_v186_power_saver() -> bool:
+    """v1.8.6:power_saver.set_eco 对无效 pid 静默返回 False,不抛异常."""
+    _div("v1.8.6 power_saver.set_eco 无效 pid 容错")
+    try:
+        from autofarmstation.core import power_saver
+
+        # 无效 pid:0 / 负数 / 不存在的 pid —— 一律静默 False,不崩
+        for bad_pid in (0, -1, 99999999):
+            ok = power_saver.set_eco(bad_pid, True)
+            assert ok is False, f"pid={bad_pid} 应返回 False"
+            ok = power_saver.set_eco(bad_pid, False)
+            assert ok is False, f"pid={bad_pid} 应返回 False"
+        _ok("power_saver.set_eco(无效 pid) 静默 False,不抛异常")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v186_power_saver", e)
+        return False
+
+
+def t_v186_action_panel_imports() -> bool:
+    """v1.8.6:action_panel 可导入且 QDialog 可用(截图选点 NameError 回归).
+
+    v1.8.5 及之前 `_on_pick_on_image` 里用 QDialog.DialogCode.Accepted,
+    但导入列表漏了 QDialog —— 点「确定」瞬间 NameError,点位永远加不进。
+    """
+    _div("v1.8.6 action_panel 导入 + QDialog 可用")
+    try:
+        from autofarmstation.ui import action_panel
+        from PySide6.QtWidgets import QDialog
+
+        assert hasattr(action_panel, "QDialog"), "action_panel 必须导入 QDialog"
+        assert action_panel.QDialog is QDialog
+        # set_target 回填方法存在
+        assert hasattr(action_panel.ClickerPanel, "_apply_clicker_config")
+        _ok("action_panel.QDialog 已导入;_apply_clicker_config 存在")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v186_action_panel_imports", e)
+        return False
+
+
+def t_v186_eco_mode_persist() -> bool:
+    """v1.8.6:TrackedProcess.eco_mode 随 to_dict/from_dict 持久化."""
+    _div("v1.8.6 eco_mode 序列化 / 反序列化")
+    try:
+        from autofarmstation.core.process_manager import TrackedProcess
+
+        it = TrackedProcess(hwnd=1, pid=2, name="a.exe", title="A", exe="")
+        it.eco_mode = True
+        d = it.to_dict()
+        assert d.get("eco_mode") is True, "to_dict 必须带 eco_mode"
+        it2 = TrackedProcess.from_dict(d)
+        assert it2.eco_mode is True, "from_dict 必须还原 eco_mode"
+        # 老配置没有 eco_mode 字段 → 默认 False,不炸
+        d.pop("eco_mode")
+        it3 = TrackedProcess.from_dict(d)
+        assert it3.eco_mode is False
+        _ok("eco_mode 持久化 + 老配置兼容")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v186_eco_mode_persist", e)
+        return False
+
+
 # === 入口 ===
 def run_all() -> int:
     t0 = time.time()
@@ -2522,6 +2586,10 @@ def run_all() -> int:
                                         t_v184_embed_view_and_pick_map,
                                         # v1.8.5 新增(截图只含客户区 → 选点坐标准确)
                                         t_v1841_capture_client_only,
+                                        # v1.8.6 新增(截图选点 QDialog 回归 + 省电降帧)
+                                        t_v186_power_saver,
+                                        t_v186_action_panel_imports,
+                                        t_v186_eco_mode_persist,
                                         ]
     passed = 0
     failed = 0

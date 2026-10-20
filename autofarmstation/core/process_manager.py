@@ -33,6 +33,7 @@ class TrackedProcess:
     alias: str = ""  # 用户给这个窗口起的别名(多开时靠它分辨)
     color: str = ""  # 卡片强调色(十六进制,空 = 不强调)
     group: str = ""  # v1.7.0 分屏分类标签:「需点击」/「纯挂时长」/自定义;空 = 未分组
+    eco_mode: bool = False  # v1.8.6 省电降帧(EcoQoS):把游戏进程设为能效模式+低优先级
     # === v1.6.1 聚焦时的窗口几何偏好(每窗口独立,默认不缩不放) ===
     margin_left: int = 0  # 左边距(像素)
     margin_top: int = 0
@@ -79,6 +80,7 @@ class TrackedProcess:
             alias=str(d.get("alias", "") or ""),
             color=str(d.get("color", "") or ""),
             group=str(d.get("group", "") or ""),  # v1.7.0 分屏分类
+            eco_mode=bool(d.get("eco_mode", False)),  # v1.8.6 省电降帧
             margin_left=int(d.get("margin_left", 0) or 0),
             margin_top=int(d.get("margin_top", 0) or 0),
             margin_right=int(d.get("margin_right", 0) or 0),
@@ -269,6 +271,13 @@ class ProcessManager:
             else:
                 if (not item.alive) or info.title != item.title or info.pid != item.pid:
                     changed_any = True
+                # v1.8.6:进程重启(pid 变化)后,若记录为省电模式则自动重开
+                if item.eco_mode and info.pid != item.pid:
+                    try:
+                        from . import power_saver
+                        power_saver.set_eco(info.pid, True)
+                    except Exception:  # noqa: BLE001
+                        pass
                 item.alive = True
                 item.pid = info.pid
                 item.title = info.title
@@ -294,6 +303,24 @@ class ProcessManager:
             return False
         item.group = str(group or "").strip()
         return True
+
+    def set_eco_mode(self, hwnd: int, on: bool) -> bool:
+        """v1.8.6 记录某窗口的省电降帧开关,并对当前进程立即生效."""
+        from . import power_saver
+        with self._lock:
+            item = self._items.get(int(hwnd))
+        if item is None:
+            return False
+        item.eco_mode = bool(on)
+        if item.pid:
+            power_saver.set_eco(item.pid, on)
+        self._notify()
+        return True
+
+    def eco_mode(self, hwnd: int) -> bool:
+        with self._lock:
+            item = self._items.get(int(hwnd))
+        return bool(item and item.eco_mode)
 
     def all_groups(self) -> list[str]:
         """当前已使用的分组名(按名称排序,去空)."""

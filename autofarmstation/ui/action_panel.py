@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QTabWidget, QGroupBox, QPushButton, QLabel, QListWidget, QListWidgetItem,
     QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QLineEdit, QPlainTextEdit,
-    QFileDialog, QMessageBox, QSizePolicy, QInputDialog,
+    QFileDialog, QMessageBox, QSizePolicy, QInputDialog, QDialog,
 )
 
 from ..core import (
@@ -190,9 +190,42 @@ class ClickerPanel(QWidget):
         self._timer.start(300)
 
     def set_target(self, hwnd: int, title: str) -> None:
-        self._target_hwnd = int(hwnd)
+        hwnd = int(hwnd)
+        # v1.8.6:切换目标窗口时,把该窗口已保存的连点配置回填到面板。
+        # 之前只更新 hwnd+标签:给窗口 A 配好点位→切到 B→切回 A,面板点位空了
+        # (hub 里还在),再点「启动」误报「请至少添加一个点击点位」。
+        # 仅在目标 hwnd 变化时加载,避免覆盖用户正在编辑的未保存内容。
+        hwnd_changed = hwnd != self._target_hwnd
+        self._target_hwnd = hwnd
         self._target_lab.setText(f"[{hwnd}] {title}")
         self._status.setText(styled_message(f"已选择目标: {title}", level="info"))
+        if hwnd_changed and self._hub is not None and hwnd:
+            try:
+                cfg = self._hub.clicker_config(hwnd)
+            except Exception:  # noqa: BLE001
+                cfg = None
+            if cfg is not None:
+                self._apply_clicker_config(cfg)
+
+    def _apply_clicker_config(self, cfg: AutoClickerConfig) -> None:
+        """把一份已保存的连点配置回填到面板控件(切换目标窗口时调用)."""
+        try:
+            self._interval.setValue(int(cfg.interval_ms))
+            self._jitter.setValue(int(cfg.jitter_pct))
+            self._jitter_px.setValue(int(getattr(cfg, "jitter_px", 0)))
+            self._total.setValue(int(cfg.total_clicks))
+            self._run_minutes.setValue(int(getattr(cfg, "run_minutes", 0)))
+            self._loop.setChecked(bool(cfg.loop))
+            mode_idx = {"auto": 0, "post": 1, "send": 2}.get(
+                str(getattr(cfg, "mode", "auto")).lower(), 0)
+            self._mode.setCurrentIndex(mode_idx)
+            self._points_list.clear()
+            for cp in cfg.points:
+                self._add_point(cp)
+            self._status.setText(styled_message(
+                f"已载入该窗口保存的 {len(cfg.points)} 个点位", level="info"))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _ensure_target(self) -> None:
         """目标窗口未设置 / 已失效时,用兜底回调自动补一个可用窗口.
@@ -279,7 +312,8 @@ class ClickerPanel(QWidget):
             return
 
         # 兜底:不使用 hub 时退化为本地实例
-        self._clicker = AutoClicker(cfg, sender=InputSender(default_mode="post"))
+        mode = str(getattr(cfg, "mode", "auto")).lower()
+        self._clicker = AutoClicker(cfg, sender=InputSender(default_mode=mode))
 
         def _on_click(count, point):
             if self._stats:
