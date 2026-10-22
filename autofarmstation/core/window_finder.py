@@ -337,16 +337,53 @@ def set_foreground(hwnd: int) -> bool:
 
 
 def client_origin(hwnd: int) -> tuple[int, int]:
-    """返回客户区左上角在屏幕坐标系的 (x, y)."""
+    """返回客户区左上角在屏幕坐标系的 (x, y);窗口失效返回 (0, 0)。
+
+    注意契约:这里**保持返回 tuple**,因为 23 个调用方都在直接解包
+    ``ox, oy = client_origin(...)``,改成返回 None 会立刻引爆一串 TypeError。
+    需要判断窗口是否有效的调用方,请先调 ``_is_window(hwnd)`` 或用
+    ``client_origin_checked(hwnd)``(失效时返回 None)。
+    """
+    if not _is_window(hwnd):
+        return (0, 0)
     pt = wintypes.POINT(0, 0)
-    _user32.ClientToScreen(hwnd, ctypes.byref(pt))
+    if not _user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+        return (0, 0)
+    return (pt.x, pt.y)
+
+
+def client_origin_checked(hwnd: int) -> tuple[int, int] | None:
+    """客户区原点,窗口失效时明确返回 None(给需要区分的调用方用)."""
+    if not _is_window(hwnd):
+        return None
+    pt = wintypes.POINT(0, 0)
+    if not _user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+        return None
     return (pt.x, pt.y)
 
 
 def client_size(hwnd: int) -> tuple[int, int]:
-    """返回客户区尺寸 (w, h)."""
+    """返回客户区尺寸 (w, h);窗口失效返回 (0, 0)。
+
+    同 ``client_origin``:保持 tuple 契约不变(调用方在直接解包),
+    但内部加了 ``_is_window`` 前置校验,避免对已销毁句柄调 GetClientRect。
+    需要「无效就中止」的调用方请用 ``client_size_checked``。
+    """
+    if not _is_window(hwnd):
+        return (0, 0)
     rect = wintypes.RECT(0, 0, 0, 0)
-    _user32.GetClientRect(hwnd, ctypes.byref(rect))
+    if not _user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return (0, 0)
+    return (max(0, rect.right - rect.left), max(0, rect.bottom - rect.top))
+
+
+def client_size_checked(hwnd: int) -> tuple[int, int] | None:
+    """客户区尺寸,窗口失效时明确返回 None(给需要区分的调用方用)."""
+    if not _is_window(hwnd):
+        return None
+    rect = wintypes.RECT(0, 0, 0, 0)
+    if not _user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
     return (max(0, rect.right - rect.left), max(0, rect.bottom - rect.top))
 
 
@@ -390,9 +427,7 @@ def set_window_pos(
     cw = -1 if w is None else int(w)
     ch = -1 if h is None else int(h)
     f = flags
-    if x is None:
-        f |= SWP_NOMOVE
-    if y is None:
+    if x is None or y is None:
         f |= SWP_NOMOVE
     if w is None or h is None:
         f |= SWP_NOSIZE
@@ -512,8 +547,26 @@ def post_mouse_move(hwnd: int, x: int, y: int) -> bool:
     return bool(_user32.PostMessageW(t, WM_MOUSEMOVE, 0, _makelparam(cx, cy)))
 
 
-def post_key(hwnd: int, vk: int, *, down: bool = True) -> bool:
-    """发送按键消息(虚拟键码 + 扫描码 lParam,bit30/31 按 down/up 置位)."""
+WM_CHAR = 0x0102
+
+
+def post_key(hwnd: int, vk: int, *, down: bool = True,
+             char_msg: bool = False) -> bool:
+    """发送按键消息.
+
+    ``char_msg=False``(默认):虚拟键码 + 扫描码 lParam,bit30/31 按 down/up 置位。
+      ``_key_lparam`` 会填上扫描码,因为很多游戏引擎(Unity / 直接读 scan code
+      的框架)会丢掉 lParam=0 的 WM_KEYDOWN。
+
+    ``char_msg=True``:按 WM_CHAR 发,wParam 直接是字符码。用来输入文本
+      (中文、符号、原样大小写),不需要拆 Shift 组合。
+    """
+    if char_msg:
+        code = int(vk) & 0xFFFF
+        msg = WM_CHAR
+        # WM_CHAR 的 lParam 语义与 KEYDOWN 相同(bit30/31 表示重复/抬起)
+        lp = _key_lparam(code, up=not down)
+        return bool(_user32.PostMessageW(hwnd, msg, code, lp))
     msg = WM_KEYDOWN if down else WM_KEYUP
     lp = _key_lparam(vk, up=not down)
     return bool(_user32.PostMessageW(hwnd, msg, int(vk) & 0xFFFF, lp))
