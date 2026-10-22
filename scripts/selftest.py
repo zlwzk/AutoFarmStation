@@ -1562,6 +1562,9 @@ def t_v183_card_signal_forward() -> bool:
             fired: list[int] = []
             grid.target_requested.connect(lambda h: fired.append(int(h)))
             assert pm.add_by_hwnd(hwnd) is not None, "add_by_hwnd 失败"
+            # v1.8.8:pm.on_change 改成切主线程异步派发,卡片不再随 add 立即建好。
+            # 用显式的 sync_now() 同步(生产代码里 add 之后也是这么调的)。
+            grid.sync_now()
             card = grid.card(hwnd)
             assert card is not None, "加窗口后网格没建卡片"
             card.target_requested.emit(hwnd)  # type: ignore[attr-defined]
@@ -1569,6 +1572,11 @@ def t_v183_card_signal_forward() -> bool:
 
             # 3) 主窗口「替换 _sync 补连」的写法必须对新窗口仍生效
             #    (旧代码把绑定方法缓存进 pm.on_change,替换后就失效)
+            #
+            #    v1.8.8 起 pm.on_change 的回调统一切回主线程
+            #    (QTimer.singleShot(0, receiver, slot))—— 因为触发者可能是
+            #    监控线程,直接在里面建/销毁 QWidget 是未定义行为。
+            #    代价是回调变成「异步」:这里必须把事件循环转起来才看得到效果。
             hits = {"n": 0}
             real = grid._sync
 
@@ -1578,6 +1586,12 @@ def t_v183_card_signal_forward() -> bool:
 
             grid._sync = _patched  # type: ignore[assignment]
             pm._notify()  # type: ignore[attr-defined]
+            # 把排队的 singleShot 跑出来(没有事件循环它永远不会执行)
+            from PySide6.QtCore import QCoreApplication
+            deadline = time.time() + 2.0
+            while hits["n"] < 1 and time.time() < deadline:
+                QCoreApplication.processEvents()
+                time.sleep(0.01)
             assert hits["n"] >= 1, "替换后的 _sync 没有被 pm 回调调用"
             _ok("卡片信号转发 + _sync 替换对新窗口生效 ok")
             return True
@@ -2637,6 +2651,317 @@ def t_v187_tag_ui_wiring() -> bool:
         return False
 
 
+# ==================== v1.8.8 稳定性重构 ====================
+def t_v188_atomic_write() -> bool:
+    """v1.8.8:atomic_write 必须真正原子(防崩溃/断电丢整个配置).
+
+    旧实现是「flush() → unlink 原文件 → shutil.move(tmp, path)」:
+    unlink 与 move 之间原文件**不存在**,这期间一崩,config.json 连同
+    .corrupt.json 备份一起彻底消失。现在改成 os.replace + os.fsync。
+    """
+    _div("v1.8.8 atomic_write 原子性")
+    try:
+        import json
+        import tempfile
+        import threading
+        from autofarmstation.utils.paths import atomic_write
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            atomic_write(p, '{"a": 1}')
+            assert json.loads(p.read_text(encoding="utf-8")) == {"a": 1}
+
+            bad = 0
+            for i in range(120):
+                atomic_write(p, json.dumps({"n": i, "pad": "x" * 300}))
+                try:
+                    if json.loads(p.read_text(encoding="utf-8"))["n"] != i:
+                        bad += 1
+                except Exception:
+                    bad += 1
+            assert bad == 0, f"覆盖写入损坏 {bad} 次"
+
+            leftovers = [x.name for x in p.parent.iterdir() if ".tmp" in x.name]
+            assert not leftovers, f"残留 tmp: {leftovers}"
+
+            # 并发写不能抛异常(旧实现在 Windows 上会 PermissionError)
+            p2 = Path(td) / "c.json"
+            atomic_write(p2, "{}")
+            errs: list[str] = []
+
+            def _w(idx: int) -> None:
+                try:
+                    for i in range(40):
+                        atomic_write(p2, json.dumps({"k": idx, "i": i}))
+                except Exception as ex:  # noqa: BLE001
+                    errs.append(repr(ex))
+
+            ts = [threading.Thread(target=_w, args=(n,)) for n in range(5)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            assert not errs, f"并发写异常: {errs[:2]}"
+            json.loads(p2.read_text(encoding="utf-8"))
+
+            lock_leftovers = [x.name for x in p2.parent.iterdir() if ".lock" in x.name]
+            assert not lock_leftovers, f"残留 .lock: {lock_leftovers}"
+        _ok("200 次覆盖 + 5 线程并发写全部完整,无 tmp/lock 残留")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v188_atomic_write", e)
+        return False
+
+
+def t_v188_shared_config() -> bool:
+    """v1.8.8:同一个 config 对象塞给多窗口必须各自独立.
+
+    旧 ``set_clicker_config`` 原地改 ``cfg.hwnd`` 后存引用,导致
+    「启动全部」时 N 个窗口指向同一对象、hwnd 全是最后一个 ——
+    所有窗口的点全部打到同一个窗口上,改一个污染全部。
+    """
+    _div("v1.8.8 多窗口配置隔离")
+    try:
+        from autofarmstation.core.autoclicker import AutoClickerConfig, ClickPoint
+        from autofarmstation.core.automation_hub import AutomationHub
+
+        hub = AutomationHub()
+        shared = AutoClickerConfig(hwnd=0, points=[ClickPoint(100, 200)], interval_ms=150)
+        targets = [1001, 1002, 1003]
+        for h in targets:
+            hub.set_clicker_config(h, shared)
+
+        ids = {id(hub.clicker_config(h)) for h in targets}
+        assert len(ids) == 3, f"三个窗口只拿到 {len(ids)} 个配置对象(共享了)"
+        assert [hub.clicker_config(h).hwnd for h in targets] == targets, "hwnd 被互相覆写"
+
+        # 改一个不能波及其它
+        c1 = hub.clicker_config(1001)
+        c1.points.append(ClickPoint(1, 1))
+        c1.interval_ms = 999
+        c2 = hub.clicker_config(1002)
+        assert len(c2.points) == 1, "改 1001 污染了 1002 的点位"
+        assert c2.interval_ms == 150, "改 1001 污染了 1002 的间隔"
+
+        # broadcast 路径仍保持正确
+        base = AutoClickerConfig(hwnd=0, points=[ClickPoint(5, 5)])
+        hub.broadcast_clicker_config([2001, 2002], base)
+        assert len({id(hub.clicker_config(h)) for h in (2001, 2002)}) == 2
+        assert base.hwnd == 0, "broadcast 改动了传入的 base"
+
+        # import_configs 返回成功条数(上层要核对,不能静默丢配置)
+        n = hub.import_configs({"3001": {"clicker": base.to_dict()}})
+        assert n == 1, f"import_configs 返回值 {n}"
+        assert hub.import_configs({"bad": {"clicker": {"interval_ms": "abc"}}}) == 0, \
+            "畸形配置应返回 0 而不是抛异常"
+        _ok("每窗口独立配置 + broadcast 不动 base + import 有返回值")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v188_shared_config", e)
+        return False
+
+
+def t_v188_overdue_once_task() -> bool:
+    """v1.8.8:时间已过的一次性任务必须补跑一次然后自禁用.
+
+    旧逻辑在 ``if not t.next_run:`` 分支 continue,永远走不到触发分支,
+    用户在对话框里选了个过去的时间保存后任务**永远不会执行**。
+    """
+    _div("v1.8.8 过期一次性任务补跑")
+    try:
+        import tempfile
+        import time
+        from autofarmstation.core.scheduler import Scheduler, ScheduledTask, TaskFreq
+
+        with tempfile.TemporaryDirectory() as td:
+            sched = Scheduler(path=Path(td) / "schedules.json", autosave=False)
+            fired: list[str] = []
+            sched.register_handler("stop_all", lambda t: fired.append(t.name))
+
+            past = ScheduledTask(
+                name="过期任务", action="stop_all", freq=TaskFreq.ONCE,
+                run_at=time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600)),
+            )
+            sched.add(past, persist=False)
+            t = sched.get("过期任务")
+            t.enabled = True
+            t.next_run = 0.0
+            assert sched.compute_next(t) == 0.0, "过期任务 compute_next 应为 0"
+
+            sched.start()
+            try:
+                deadline = time.time() + 4.0
+                while not fired and time.time() < deadline:
+                    time.sleep(0.1)
+            finally:
+                sched.stop()
+            assert fired == ["过期任务"], f"过期任务没被执行: {fired}"
+            assert t.enabled is False, "执行后应自禁用"
+        _ok("过期一次性任务被补跑并禁用")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v188_overdue_once_task", e)
+        return False
+
+
+def t_v188_scheduler_survives_save_fail() -> bool:
+    """v1.8.8:落盘失败不能让调度线程死掉(否则定时任务永久静默失效)."""
+    _div("v1.8.8 调度器异常自愈")
+    try:
+        import tempfile
+        import time
+        from autofarmstation.core.scheduler import Scheduler, ScheduledTask, TaskFreq
+
+        with tempfile.TemporaryDirectory() as td:
+            sched = Scheduler(path=Path(td) / "schedules.json", autosave=True)
+            # save() 内部只吞 OSError;这里换成非 OSError(模拟 JSON 序列化失败)
+            sched.save = lambda: (_ for _ in ()).throw(ValueError("模拟写入失败"))  # type: ignore[assignment]
+
+            fired: list[str] = []
+            sched.register_handler("start_all", lambda t: fired.append(t.name))
+            sched.add(ScheduledTask(name="每1秒", action="start_all",
+                                    freq=TaskFreq.INTERVAL, interval_sec=1), persist=False)
+            sched.start()
+            try:
+                time.sleep(3.0)
+            finally:
+                sched.stop()
+            assert len(fired) >= 2, f"落盘持续失败时任务只触发 {len(fired)} 次"
+        _ok("save 抛异常期间调度循环继续执行任务")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v188_scheduler_survives_save_fail", e)
+        return False
+
+
+def t_v188_restart_storm_guard() -> bool:
+    """v1.8.8:自动重启必须限流(否则游戏反复崩溃会把 CPU 打满)."""
+    _div("v1.8.8 重启风暴限流")
+    try:
+        import subprocess
+        import time
+        from autofarmstation.core.monitor import ProcessMonitor
+        from autofarmstation.core.process_manager import ProcessManager
+
+        pm = ProcessManager()
+        mon = ProcessMonitor(pm, interval_sec=0.2, auto_restart=True,
+                             restart_exe="nonexistent_zzz.exe")
+        spawns: list[list[str]] = []
+
+        class FakePopen:
+            def __init__(self, cmd, **kw):
+                spawns.append(list(cmd))
+
+        real = subprocess.Popen
+        subprocess.Popen = FakePopen  # type: ignore[misc]
+        try:
+            # 冷却期内连点 10 次只启动 1 次
+            for _ in range(10):
+                mon._try_restart()
+            assert len(spawns) <= 1, f"冷却期内启动了 {len(spawns)} 次"
+
+            # 放开冷却:5 分钟窗口内最多 3 次
+            mon._last_restart_ts = 0.0
+            mon._restart_history = []
+            spawns.clear()
+            for _ in range(10):
+                mon._last_restart_ts = 0.0
+                mon._try_restart()
+            assert len(spawns) <= 3, f"窗口内启动了 {len(spawns)} 次(超过上限 3)"
+
+            # 触发上限后要给用户提示,不能静默
+            mon._restart_history = [time.time()] * 5
+            mon._storm_notice_ts = 0.0
+            mon._last_restart_ts = 0.0
+            msgs: list[str] = []
+            mon.on_event(lambda ev: msgs.append(ev.message))
+            mon._try_restart()
+            assert any("自动重启已暂停" in m for m in msgs), f"无风暴提示: {msgs[:1]}"
+
+            # 带空格路径不能被按空格切碎
+            mon2 = ProcessMonitor(pm, auto_restart=True,
+                                  restart_exe="C:/Program Files/Game/game.exe",
+                                  restart_args='"-windowed" "D:/My Games/save"')
+            got: list[list[str]] = []
+
+            class FakePopen2:
+                def __init__(self, cmd, **kw):
+                    got.append(list(cmd))
+
+            subprocess.Popen = FakePopen2  # type: ignore[misc]
+            mon2._try_restart()
+            assert got and got[0][0] == "C:/Program Files/Game/game.exe", f"exe 被切碎: {got}"
+            assert "D:/My Games/save" in got[0], f"参数被切碎: {got}"
+        finally:
+            subprocess.Popen = real  # type: ignore[misc]
+        _ok("冷却期只 1 次 / 窗口内最多 3 次 / 有提示 / 参数不切碎")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v188_restart_storm_guard", e)
+        return False
+
+
+def t_v188_theme_tokens() -> bool:
+    """v1.8.8:UI 主题色统一 —— 深色恒等、浅色换算、功能色不动."""
+    _div("v1.8.8 UI 主题色令牌")
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        _app = QApplication.instance() or QApplication([])
+        from autofarmstation.ui import theme, theme_adapter
+
+        # 深色:恒等变换,不给现有用户带来视觉回退
+        theme.set_theme("dark")
+        assert theme.qss("color:#888; font-size:11px;") == "color:#888; font-size:11px;", \
+            "深色下 qss 不是恒等变换"
+
+        # 浅色:主题色换成高对比值
+        theme.set_theme("light")
+        light = theme.qss("color:#888;")
+        assert light != "color:#888;", "浅色下 #888 没被换算"
+        assert theme.token("fg_hint") == "#7a838d", theme.token("fg_hint")
+
+        # 功能色 / 关键字 / 空串不能动
+        assert theme.qss("color:#4a9eff;") == "color:#4a9eff;", "功能色被误替换"
+        assert theme.qss("background:#000;") == "background:#000;"
+        assert theme.qss("border:1px solid red;") == "border:1px solid red;"
+        assert theme.qss("") == ""
+
+        # 令牌表两套主题键一致,且替换表里的色都有对应令牌
+        dark_pal, light_pal = theme.PALETTES["dark"], theme.PALETTES["light"]
+        assert set(dark_pal) == set(light_pal), "深浅色令牌键不一致"
+        missing = [n for n in theme._TOKEN_OF_COLOR.values() if n not in dark_pal]
+        assert not missing, f"替换表引用了不存在的令牌: {missing}"
+
+        # adapter:装上后 setStyleSheet 自动过滤,卸掉后恢复
+        assert theme_adapter.install() is True
+        assert theme_adapter.install() is True, "重复安装应安全"
+        from PySide6.QtWidgets import QLabel
+        lbl = QLabel("t")
+        lbl.setStyleSheet("color:#888; font-size:11px;")
+        assert theme.token("fg_hint") in lbl.styleSheet(), lbl.styleSheet()
+        theme.set_theme("dark")
+        lbl.setStyleSheet("color:#888; font-size:11px;")
+        assert lbl.styleSheet() == "color:#888; font-size:11px;", lbl.styleSheet()
+        n1 = theme_adapter.refresh_all()
+        assert n1 >= 1, "refresh_all 没刷到控件"
+        theme_adapter.refresh_all()  # 幂等
+        theme_adapter.uninstall()
+
+        # app 集成
+        from autofarmstation.app import apply_theme
+        apply_theme(_app, "light")
+        assert theme.token("fg_hint") == "#7a838d"
+        apply_theme(_app, "dark")
+        assert theme.token("fg_hint") == "#888"
+
+        _ok("qss 深色恒等 / 浅色换算 / 功能色保留 / adapter 装卸 / app 集成")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v188_theme_tokens", e)
+        return False
+
+
 # === 入口 ===
 def run_all() -> int:
     t0 = time.time()
@@ -2688,6 +3013,13 @@ def run_all() -> int:
                                         t_v187_tags,
                                         t_v187_pick_helpers,
                                         t_v187_tag_ui_wiring,
+                                        # v1.8.8 新增(稳定性重构:防数据丢失 / 跨线程安全)
+                                        t_v188_atomic_write,
+                                        t_v188_shared_config,
+                                        t_v188_overdue_once_task,
+                                        t_v188_scheduler_survives_save_fail,
+                                        t_v188_restart_storm_guard,
+                                        t_v188_theme_tokens,
                                         ]
     passed = 0
     failed = 0
