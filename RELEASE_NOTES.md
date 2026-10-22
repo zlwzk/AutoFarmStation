@@ -1,3 +1,67 @@
+# AutoFarmStation v1.8.10 · 清掉 ROADMAP 里全部 8 条审计缺口
+
+v1.8.9 交付时在「已知未修」里列了 8 条审计证实的缺口。这一版**全部修完并加回归测试**，
+自检 66 → 72 项。所有改动都是「不做就留着坑」的类型。
+
+---
+
+## 崩溃类
+
+| # | 缺口 | 用户可感知后果 | 修法 |
+|---|------|---------------|------|
+| A6 | `preview_capture` 帧尺寸无上限 | `GetClientRect` 报异常尺寸时 `w*h*4` ≈ 4.3GB → **OOM 崩在截图线程**,用户只看到预览突然全黑 + 软件没了 | 加 `_MAX_FRAME_BYTES`(128MB) + `_MAX_FRAME_SIDE`(16384),异常尺寸直接返回 None 不分配 |
+| A8 | 键盘宏的修饰键不保证释放 | 宏跑崩之后 **Shift/Ctrl 永远卡在按下态**,用户所有输入都变形,只能重启 | 全局 `_pressed` 记账 + `release_all_pressed()`;`key_press` 改 try/finally;宏线程 finally + 退出 + atexit 三层兜底 |
+| A1 | `window_host` 嵌入失败回滚不完整 | 嵌入失败后窗口以「无边框 + 尺寸 0」挂在容器里,**既点不到游戏也退不出嵌入态** | 完整 `_rollback()`(style + ex_style + FRAMECHANGED + 回原位置);`SetWindowPos` 返回值校验;还原改用 `GetDesktopWindow()` 而非 NULL |
+
+## 数据安全
+
+| # | 缺口 | 后果 | 修法 |
+|---|------|------|------|
+| A4 | 备份还原无事务 | 导入中途失败,**原配置已被覆盖且回不去** | 两阶段提交:先全解到 `.restore-tmp` → 全成功才逐个 `os.replace` → 任一步失败**回滚已提交的文件**;解压分块 + 64MB 上限;JSON 预校验 |
+
+## 功能正确性
+
+| # | 缺口 | 后果 | 修法 |
+|---|------|------|------|
+| A3 | EcoQoS 退出不批量还原 + 原优先级未记录 | 取消省电一律设 NORMAL,**HIGH/ABOVE_NORMAL 的游戏被永久降级** | 记 `_orig_priority[pid]` 精确还原;新增 `restore_all()` 接进退出流程 |
+| A5 | 更新下载在 GUI 线程同步跑 | 点「立即更新」后**界面冻结到下载完**,进度条不刷新、取消点不动 | `_DownloadWorker(QThread)` + `Signal` 回传进度;等待期间界面仍可响应 |
+| A2 | 嵌入 DPI 双坐标系错配 | 跨显示器拖动出黑边;DPI-unaware 老游戏被系统放大**发糊** | 新增 `game_dpi`/`game_scale`/`monitor_dpi`/`is_dpi_blurry`;按 DPI 比值换算;`screenChanged` 跨屏重算;发糊时给**可操作提示** |
+| A7 | `_frame_pending` 闭包持整帧像素 | 主线程忙时攒多帧,**10 个 4K 窗口峰值几百 MB** | 单槽「最新帧覆盖」:每卡片最多持 1 帧,预览永远是最新画面 |
+
+## 顺带
+
+- 键盘宏新增 **`modifiers` 字段**(`["ctrl","shift"]`),支持真组合键;老配置自动兼容。
+- `InputSender.key_combo()` 把修饰键整组当原子操作,反序释放。
+- `atomic_write` 测试 200 → 60 次(保留 fsync),加**性能护栏**(单次 < 100ms)。
+
+## 测试
+
+```
+python -m scripts.selftest          # 72/72 通过
+python -u scripts/smoke_gui.py 6    # 主窗口拉起 + 线程范式 + 干净退出
+```
+
+新增 6 项: `t_v1810_frame_limits` / `t_v1810_key_release` / `t_v1810_eco_restore` /
+`t_v1810_backup_transaction` / `t_v1810_dpi_helpers` / `t_v1810_download_threaded`。
+
+---
+
+# AutoFarmStation v1.8.9 · UI 主题色统一
+
+修掉「框架是浅色、提示文字还是深色底才看得见的灰」的割裂感。
+
+- 新增 `ui/theme.py`:深浅两套**语义色令牌** + `qss()` 换算。
+- 新增 `ui/theme_adapter.py`:给 `QWidget.setStyleSheet` 装主题过滤。
+  **深色主题下是恒等变换**(零视觉回退),浅色主题下才把 `#888`/`#e08080` 等
+  26 个硬编码色换成高对比值;分组徽标等功能色不动。
+- `app.apply_theme` 同步令牌表并重刷已设样式的控件。
+
+> 为什么不用脚本批量改 90 多处 `setStyleSheet`?试过两次:第一次 92/93 处不在
+> f-string 里会把 `{_tok('x')}` 字面量显示到界面上;第二次在跨行调用上配错括号
+> 直接 SyntaxError。两次都靠 `py_compile` + 回滚挡住,最后改用运行时装裁。
+
+---
+
 # AutoFarmStation v1.8.8 · 稳定性重构：防数据丢失 + 跨线程安全
 
 这一版不追新功能，专心补**会让用户数据丢失或行为错误的深层缺陷**。所有条目都带回归测试，
