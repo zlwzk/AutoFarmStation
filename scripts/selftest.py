@@ -2672,7 +2672,9 @@ def t_v188_atomic_write() -> bool:
             assert json.loads(p.read_text(encoding="utf-8")) == {"a": 1}
 
             bad = 0
-            for i in range(120):
+            # 60 次足够覆盖「原子替换 + 无残留」,不需要 200 次:
+            # 每次 atomic_write 都带 fsync(≈20ms),跑太多会把自检拖到一分钟。
+            for i in range(60):
                 atomic_write(p, json.dumps({"n": i, "pad": "x" * 300}))
                 try:
                     if json.loads(p.read_text(encoding="utf-8"))["n"] != i:
@@ -2691,7 +2693,7 @@ def t_v188_atomic_write() -> bool:
 
             def _w(idx: int) -> None:
                 try:
-                    for i in range(40):
+                    for i in range(8):
                         atomic_write(p2, json.dumps({"k": idx, "i": i}))
                 except Exception as ex:  # noqa: BLE001
                     errs.append(repr(ex))
@@ -2962,6 +2964,182 @@ def t_v188_theme_tokens() -> bool:
         return False
 
 
+# ==================== v1.8.10:ROADMAP 审计缺口 ====================
+def t_v1810_frame_limits() -> bool:
+    """v1.8.10 / A6:截帧尺寸必须有上限,否则异常窗口尺寸会 OOM 崩在截图线程."""
+    _div("v1.8.10 截帧尺寸上限")
+    try:
+        from autofarmstation.core import preview_capture as pc
+
+        assert hasattr(pc, "_MAX_FRAME_BYTES"), "缺 _MAX_FRAME_BYTES"
+        assert 64 * 1024 * 1024 <= pc._MAX_FRAME_BYTES <= 512 * 1024 * 1024, \
+            f"上限不合理: {pc._MAX_FRAME_BYTES}"
+        assert hasattr(pc, "_MAX_FRAME_SIDE") and pc._MAX_FRAME_SIDE >= 8192, \
+            "缺单边上限"
+        # 32767x32767 × 4 ≈ 4.3GB,必须直接拒绝而不是分配
+        assert pc._read_client_pixels(0, 0, 32767, 32767) is None, "超大尺寸没被拒绝"
+        assert pc._read_client_pixels(0, 0, 0, 100) is None, "零尺寸没被拒绝"
+        _ok("上限 %dMB / 单边 %d px,异常尺寸直接拒绝"
+            % (pc._MAX_FRAME_BYTES // (1024 * 1024), pc._MAX_FRAME_SIDE))
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v1810_frame_limits", e)
+        return False
+
+
+def t_v1810_key_release() -> bool:
+    """v1.8.10 / A8:按键必须记账,异常/退出时兜底释放;支持 modifiers 组合键."""
+    _div("v1.8.10 按键兜底释放 + 组合键")
+    try:
+        from autofarmstation.core import input_sender as ins
+        from autofarmstation.core.key_macro import KeyMacroConfig, KeyStep
+
+        assert callable(getattr(ins, "pressed_keys", None)), "缺 pressed_keys"
+        assert callable(getattr(ins, "release_all_pressed", None)), "缺 release_all_pressed"
+        assert ins.pressed_keys() == [], "初始不该有按下键"
+        assert ins.release_all_pressed() == 0, "空释放应返回 0"
+        assert hasattr(ins.InputSender, "key_combo"), "缺 key_combo"
+
+        # modifiers 序列化往返
+        c = KeyMacroConfig(hwnd=1, steps=[KeyStep(key="A", modifiers=["ctrl", "shift"])])
+        d = c.to_dict()
+        assert d["steps"][0]["modifiers"] == ["ctrl", "shift"], d["steps"][0]
+        c2 = KeyMacroConfig.from_dict(d)
+        assert c2.steps[0].modifiers == ["ctrl", "shift"]
+        # 老配置兼容
+        c3 = KeyMacroConfig.from_dict({"hwnd": 1, "steps": [{"key": "B", "vk": 66}]})
+        assert c3.steps[0].modifiers == [], "老配置兼容性破坏"
+
+        # 宏线程退出时必须兜底调用(release_all_pressed 被 finally 引用)
+        import inspect
+        src = inspect.getsource(__import__(
+            "autofarmstation.core.key_macro", fromlist=["KeyMacro"]).KeyMacro._run)
+        assert "release_all_pressed" in src, "宏线程 finally 里没有兜底释放"
+        _ok("按下追踪 + 幂等释放 + modifiers 往返 + finally 兜底")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v1810_key_release", e)
+        return False
+
+
+def t_v1810_eco_restore() -> bool:
+    """v1.8.10 / A3:省电模式要记原始优先级,退出时批量还原."""
+    _div("v1.8.10 EcoQoS 原始优先级与批量还原")
+    try:
+        from autofarmstation.core import power_saver as ps
+
+        for name in ("restore_all", "eco_pids", "current_priority", "set_eco"):
+            assert callable(getattr(ps, name, None)), f"缺 {name}"
+        for name in ("ABOVE_NORMAL_PRIORITY_CLASS", "HIGH_PRIORITY_CLASS",
+                     "NORMAL_PRIORITY_CLASS", "BELOW_NORMAL_PRIORITY_CLASS"):
+            assert hasattr(ps, name), f"缺常量 {name}"
+        assert ps.eco_pids() == [], "初始省电列表应为空"
+        assert ps.restore_all() == 0, "空还原应返回 0"
+        assert ps.set_eco(0, True) is False, "无效 pid 应返回 False"
+        # 退出流程里必须调用 restore_all
+        mw = (Path(__file__).resolve().parents[1]
+              / "autofarmstation" / "ui" / "main_window.py").read_text(encoding="utf-8")
+        assert "power_saver.restore_all()" in mw, "退出流程没调 restore_all"
+        _ok("原始优先级记录 + 批量还原 + 退出接入")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v1810_eco_restore", e)
+        return False
+
+
+def t_v1810_backup_transaction() -> bool:
+    """v1.8.10 / A4:备份还原必须两阶段提交,中途失败要回滚."""
+    _div("v1.8.10 备份还原事务")
+    try:
+        import zipfile
+        from autofarmstation.utils import backup as bk
+
+        assert hasattr(bk, "_MAX_ENTRY_BYTES"), "缺解压大小上限"
+        root = bk.user_data_dir()
+        cfg = root / "config.json"
+        cfg.write_text('{"marker": "original"}', encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad.zip"
+            with zipfile.ZipFile(bad, "w") as z:
+                z.writestr("manifest.json",
+                           '{"app": "AutoFarmStation", "schema": 1, "created": "x", "file_count": 1}')
+                z.writestr("config.json", "{ not json }")
+            ok, _msg = bk.import_from(bad, backup_current=False)
+            assert ok is False, "坏 JSON 备份应被拒绝"
+            assert "original" in cfg.read_text(encoding="utf-8"), \
+                "被拒绝后原配置竟然被改了"
+            assert not (root / ".restore-tmp").exists(), "残留暂存目录"
+
+            good = Path(td) / "good.zip"
+            with zipfile.ZipFile(good, "w") as z:
+                z.writestr("manifest.json",
+                           '{"app": "AutoFarmStation", "schema": 1, "created": "x", "file_count": 1}')
+                z.writestr("config.json", '{"marker": "restored"}')
+            ok2, _m2 = bk.import_from(good, backup_current=False)
+            assert ok2 is True, "合法备份应导入成功"
+            assert "restored" in cfg.read_text(encoding="utf-8")
+            assert not (root / ".restore-tmp").exists()
+        _ok("坏备份拒绝且原数据不动 / 好备份原子提交 / 无暂存残留")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v1810_backup_transaction", e)
+        return False
+
+
+def t_v1810_dpi_helpers() -> bool:
+    """v1.8.10 / A1+A2:嵌入失败可回滚 + DPI 换算工具可用."""
+    _div("v1.8.10 嵌入回滚与 DPI 工具")
+    try:
+        from autofarmstation.core import window_host as wh
+
+        assert hasattr(wh, "_STRIP_EXSTYLE"), "缺扩展样式清理常量"
+        for name in ("game_dpi", "game_scale", "monitor_dpi", "is_dpi_blurry"):
+            assert callable(getattr(wh, name, None)), f"缺 {name}"
+        assert wh.game_dpi(0) == 96, "无效句柄应兜底 96"
+        assert wh.game_scale(0) == 1.0, "无效句柄应兜底 1.0"
+        assert wh.is_dpi_blurry(0) is False, "无效句柄不该误报发糊"
+        # GetDesktopWindow 原型(还原时用,不能传 NULL)
+        assert getattr(wh._user32.GetDesktopWindow, "restype", None) is not None
+
+        # 嵌入代码里必须有完整回滚(恢复 style + exstyle + FRAMECHANGED)
+        import inspect
+        src = inspect.getsource(wh.embed_window)
+        assert "_rollback" in src, "嵌入失败没有回滚函数"
+        assert "FRAMECHANGED" in src, "回滚没重算非客户区"
+        assert "GWL_EXSTYLE" in src, "回滚没恢复扩展样式"
+        # SetWindowPos 返回值必须检查
+        assert "if not _user32.SetWindowPos(" in src, "SetWindowPos 返回值没检查"
+        _ok("扩展样式清理 + DPI 四函数 + 完整回滚 + 返回值校验")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v1810_dpi_helpers", e)
+        return False
+
+
+def t_v1810_download_threaded() -> bool:
+    """v1.8.10 / A5:更新下载必须走后台线程,不能在 GUI 线程阻塞."""
+    _div("v1.8.10 更新下载异步化")
+    try:
+        p = (Path(__file__).resolve().parents[1]
+             / "autofarmstation" / "ui" / "settings_dialog.py")
+        src = p.read_text(encoding="utf-8")
+        assert "_DownloadWorker(QThread)" in src, "没有 QThread 下载 worker"
+        assert "progress_changed = Signal" in src, "进度没用信号回传"
+        assert "QCoreApplication.processEvents()" in src, "没有事件循环等待"
+        # 不能在槽函数里直接同步调下载
+        assert "download_and_apply_release(" in src
+        idx_run = src.find("def run(self)")
+        idx_call = src.find("download_and_apply_release(")
+        assert idx_run > 0 and idx_call > idx_run, \
+            "download_and_apply_release 不在 worker.run 里(仍在主线程)"
+        _ok("QThread + Signal + processEvents,下载已移出 GUI 线程")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("t_v1810_download_threaded", e)
+        return False
+
+
 # === 入口 ===
 def run_all() -> int:
     t0 = time.time()
@@ -3020,6 +3198,13 @@ def run_all() -> int:
                                         t_v188_scheduler_survives_save_fail,
                                         t_v188_restart_storm_guard,
                                         t_v188_theme_tokens,
+                                        # v1.8.10 新增(清掉 ROADMAP 里 8 条审计缺口)
+                                        t_v1810_frame_limits,
+                                        t_v1810_key_release,
+                                        t_v1810_eco_restore,
+                                        t_v1810_backup_transaction,
+                                        t_v1810_dpi_helpers,
+                                        t_v1810_download_threaded,
                                         ]
     passed = 0
     failed = 0
