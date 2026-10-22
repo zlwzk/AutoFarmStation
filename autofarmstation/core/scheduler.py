@@ -339,7 +339,12 @@ class Scheduler:
 
     # --- 下次触发时刻 ---
     def compute_next(self, task: ScheduledTask, now: float | None = None) -> float:
-        """计算下次触发的时间戳(0 = 不再触发)."""
+        """计算下次触发的时间戳(0 = 不再触发).
+
+        注意:过期的一次性任务返回 **0.0** 表示「时间点已过」,
+        调用方(``_loop``)必须区分「0 = 已过期该补跑」和「0 = 彻底不触发」,
+        否则用户选了一个过去的时间点保存后,任务永远不会执行。
+        """
         now = time.time() if now is None else float(now)
         if task.freq is TaskFreq.INTERVAL:
             return now + max(1, int(task.interval_sec))
@@ -382,40 +387,83 @@ class Scheduler:
 
     # --- 内部 ---
     def _loop(self) -> None:
+        """调度主循环.
+
+        这个线程一旦退出,所有定时任务就**永久失效**且界面上毫无提示
+        (用户只会觉得「定时任务怎么不跑了」)。所以循环体里任何一步都不许
+        把异常抛出去:落盘失败、单个任务算错时间,全都只记录然后继续跑。
+        """
         while not self._stop.is_set():
-            now = time.time()
-            with self._lock:
-                tasks = [self._tasks[k] for k in self._order if k in self._tasks]
-            dirty = False
-            for t in tasks:
-                if not t.enabled:
-                    continue
-                if not t.next_run:
-                    t.next_run = self.compute_next(t, now)
-                    dirty = True
-                    continue
-                if now >= t.next_run:
-                    if int(t.delay_sec) > 0:
-                        # 延时执行:到点后再等 delay_sec 秒才真正动手。
-                        # 用两条任务就能串出流程,例如
-                        # 「22:00 启动全部」+「22:00 延时 30s 开始连点」。
-                        self._log.info("定时任务延时 %d 秒执行: %s",
-                                       int(t.delay_sec), sanitize(t.name))
-                        timer = threading.Timer(
-                            float(t.delay_sec), self._invoke_safe, args=(t,))
-                        timer.daemon = True
-                        timer.start()
-                    else:
-                        self._invoke(t)
-                    if t.freq is TaskFreq.ONCE:
-                        t.enabled = False
-                        t.next_run = 0.0
-                    else:
-                        t.next_run = self.compute_next(t, now)
-                    dirty = True
-            if dirty and self._autosave:
-                self.save()
+            try:
+                now = time.time()
+                with self._lock:
+                    tasks = [self._tasks[k] for k in self._order if k in self._tasks]
+                dirty = False
+                for t in tasks:
+                    try:
+                        if not t.enabled:
+                            continue
+                        if not t.next_run:
+                            # next_run 为空:算一次。对一次性任务来说,
+                            # compute_next 返回 0 说明「时间点已过」——
+                            # 这时必须**立即补跑一次**再禁用,否则用户在对话框里
+                            # 选了个过去的时间保存后,任务永远不执行
+                            # (旧逻辑在这里 continue,直接跳过触发分支)。
+                            t.next_run = self.compute_next(t, now)
+                            dirty = True
+                            if t.next_run == 0.0:
+                                if t.freq is TaskFreq.ONCE:
+                                    self._log.info(
+                                        "一次性任务时间已过,立即执行并禁用: %s",
+                                        sanitize(t.name))
+                                    self._invoke(t)
+                                    t.enabled = False
+                                    t.next_run = 0.0
+                                # 其它频率算不出下一次(配置不完整)就跳过
+                            continue
+                        if now >= t.next_run:
+                            if int(t.delay_sec) > 0:
+                                # 延时执行:到点后再等 delay_sec 秒才真正动手。
+                                # 用两条任务就能串出流程,例如
+                                # 「22:00 启动全部」+「22:00 延时 30s 开始连点」。
+                                self._log.info("定时任务延时 %d 秒执行: %s",
+                                               int(t.delay_sec), sanitize(t.name))
+                                timer = threading.Timer(
+                                    float(t.delay_sec), self._invoke_safe, args=(t,))
+                                timer.daemon = True
+                                timer.start()
+                            else:
+                                self._invoke(t)
+                            if t.freq is TaskFreq.ONCE:
+                                t.enabled = False
+                                t.next_run = 0.0
+                            else:
+                                t.next_run = self.compute_next(t, now)
+                            dirty = True
+                    except Exception as e:  # noqa: BLE001
+                        # 单个任务出问题不能拖垮整个调度器
+                        self._log.exception(
+                            "定时任务处理失败(%s),已跳过该任务: %s",
+                            sanitize(getattr(t, "name", "?")), e,
+                        )
+                        try:
+                            # 至少把 next_run 推远,避免同一任务每轮都炸
+                            t.next_run = self.compute_next(t, now)
+                        except Exception:  # noqa: BLE001
+                            t.next_run = now + 60.0
+                if dirty and self._autosave:
+                    self._safe_save()
+            except Exception as e:  # noqa: BLE001
+                # 兜底:循环体整体出问题也只记录,绝不让线程退出
+                self._log.exception("调度循环异常(已拦截,循环继续): %s", e)
             self._stop.wait(timeout=1.0)
+
+    def _safe_save(self) -> None:
+        """落盘失败只记日志 —— 调度线程不能因为写不了盘就死掉."""
+        try:
+            self.save()
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("定时任务保存失败(调度继续运行): %s", e)
 
     def _invoke_safe(self, t: ScheduledTask) -> None:
         """延时线程的入口:自己吞掉异常,免得线程把堆栈打到控制台."""
