@@ -28,6 +28,11 @@ WS_MAXIMIZEBOX = 0x00010000
 _STRIP_STYLE = (
     wf.WS_CAPTION | wf.WS_THICKFRAME | wf.WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
 )
+# 扩展样式也要清:带 DLGMODALFRAME / STATICEDGE 的窗口去掉 WS_CAPTION 之后
+# 仍会残留一圈立体边框,嵌进容器看着像「有个奇怪的框」
+WS_EX_DLGMODALFRAME = 0x00000001
+WS_EX_STATICEDGE = 0x00020000
+_STRIP_EXSTYLE = WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE
 
 SWP_FRAMECHANGED = 0x0020
 SWP_NOZORDER = 0x0004
@@ -43,6 +48,90 @@ _user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.GetWindowLongW.restype = ctypes.c_long
 _user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
 _user32.SetWindowLongW.restype = ctypes.c_long
+# 还原时父窗口要显式指回桌面:SetParent(hwnd, NULL) 在 MSDN 上不保证等价
+_user32.GetDesktopWindow.argtypes = []
+_user32.GetDesktopWindow.restype = wintypes.HWND
+
+# === DPI 相关 ===
+# 为什么需要:本进程是 Per-Monitor Aware V2,Qt 的 devicePixelRatioF() 给的是
+# **卡片所在显示器**的缩放;而 MoveWindow 对游戏窗口的坐标,是按**游戏自己线程
+# 的 DPI 感知**解释的。两者不一致时:
+#   * 游戏是 PMv2 且在同一屏 → 传物理像素正确;
+#   * 游戏 DPI-unaware 在 150% 屏 → 系统按 96DPI 渲染再放大,画面发糊;
+#   * 卡片拖到另一块不同缩放的屏 → 旧尺寸不重算,出黑边。
+# 所以要把「游戏自己的 DPI」读出来参与换算。
+try:
+    _user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+    _user32.GetDpiForWindow.restype = wintypes.UINT
+except Exception:  # noqa: BLE001
+    pass
+
+try:
+    _shcore = ctypes.WinDLL("shcore", use_last_error=True)  # type: ignore[attr-defined]
+    _shcore.GetDpiForMonitor.argtypes = [
+        wintypes.HMONITOR, ctypes.c_int,
+        ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT),
+    ]
+    _shcore.GetDpiForMonitor.restype = ctypes.c_long
+except Exception:  # noqa: BLE001
+    _shcore = None  # type: ignore[assignment]
+
+DEFAULT_DPI = 96
+
+
+def game_dpi(hwnd: int) -> int:
+    """读窗口所在显示器 / 该窗口线程的 DPI(96 的倍数).失败返回 96."""
+    hwnd = int(hwnd)
+    if not hwnd:
+        return DEFAULT_DPI
+    try:
+        fn = getattr(_user32, "GetDpiForWindow", None)
+        if fn is not None:
+            dpi = int(fn(hwnd))
+            if dpi > 0:
+                return dpi
+    except Exception:  # noqa: BLE001
+        pass
+    return DEFAULT_DPI
+
+
+def game_scale(hwnd: int) -> float:
+    """该窗口的 DPI 缩放系数(1.0 = 100%)."""
+    try:
+        return max(0.5, min(4.0, game_dpi(hwnd) / float(DEFAULT_DPI)))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def monitor_dpi(hwnd: int) -> int:
+    """窗口所在**显示器**的 DPI.失败退回 game_dpi."""
+    try:
+        mon = _user32.MonitorFromWindow(int(hwnd), 2)  # MONITOR_DEFAULTTONEAREST
+        if mon and _shcore is not None:
+            dx = wintypes.UINT(0)
+            dy = wintypes.UINT(0)
+            hr = _shcore.GetDpiForMonitor(mon, 0, ctypes.byref(dx), ctypes.byref(dy))
+            if hr == 0 and int(dx.value) > 0:
+                return int(dx.value)
+    except Exception:  # noqa: BLE001
+        pass
+    return game_dpi(hwnd)
+
+
+def is_dpi_blurry(hwnd: int) -> bool:
+    """高 DPI 屏 + DPI 不感知的游戏 = 画面会被系统放大发糊.
+
+    这不是本软件能单方面修好的(取决于目标游戏是否声明了 DPI 感知),
+    但可以**告诉用户怎么处理**:右键 game.exe → 属性 → 兼容性 →
+    更改高 DPI 设置 → 勾「替代高 DPI 缩放行为」→ 选「应用程序」。
+    """
+    try:
+        gd = game_dpi(hwnd)
+        md = monitor_dpi(hwnd)
+        # 显示器的 DPI 明显高于窗口 DPI → 窗口没跟上,会被系统缩放
+        return md >= 120 and gd + 24 < md
+    except Exception:  # noqa: BLE001
+        return False
 
 _lock = threading.RLock()
 
@@ -129,21 +218,57 @@ def embed_window(hwnd: int, container_hwnd: int) -> bool:
     )
 
     # 1) 去装饰(非客户区由容器提供)
-    _user32.SetWindowLongW(hwnd, wf.GWL_STYLE, style & ~_STRIP_STYLE)
+    #    从这里开始任何一步失败都必须**完整回滚**,否则窗口会以
+    #    「无边框 + 尺寸 0」挂在容器里:用户看到一片空白,既点不到游戏,
+    #    也退不出嵌入态(只能杀进程)。旧实现只恢复 GWL_STYLE、
+    #    不恢复 ex_style、不发 SWP_FRAMECHANGED —— 视觉上仍是无边框。
+    def _rollback() -> None:
+        try:
+            _user32.SetParent(hwnd, orig_parent or _user32.GetDesktopWindow())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _user32.SetWindowLongW(hwnd, wf.GWL_STYLE, style)
+            _user32.SetWindowLongW(hwnd, wf.GWL_EXSTYLE, ex_style)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            # FRAMECHANGED 会让系统重算非客户区,边框才回得来
+            _user32.SetWindowPos(
+                hwnd, 0,
+                info.rect[0], info.rect[1], info.rect[2], info.rect[3],
+                SWP_NOZORDER | SWP_FRAMECHANGED | wf.SWP_SHOWWINDOW,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        _user32.SetWindowLongW(hwnd, wf.GWL_STYLE, style & ~_STRIP_STYLE)
+        _user32.SetWindowLongW(hwnd, wf.GWL_EXSTYLE, ex_style & ~_STRIP_EXSTYLE)
+    except Exception:  # noqa: BLE001
+        _rollback()
+        return False
+
     # 2) 换父(跨进程)
     if not _user32.SetParent(hwnd, container_hwnd):
-        # 失败要回滚样式
-        _user32.SetWindowLongW(hwnd, wf.GWL_STYLE, style)
+        _rollback()
         return False
+
     # 3) 铺满容器 + 立即重算非客户区
-    rect = wintypes.RECT(0, 0, 0, 0)
-    _user32.GetClientRect(container_hwnd, ctypes.byref(rect))
-    w = max(16, rect.right - rect.left)
-    h = max(16, rect.bottom - rect.top)
-    _user32.SetWindowPos(
-        hwnd, 0, 0, 0, w, h,
-        SWP_NOZORDER | SWP_FRAMECHANGED | wf.SWP_SHOWWINDOW,
-    )
+    try:
+        rect = wintypes.RECT(0, 0, 0, 0)
+        _user32.GetClientRect(container_hwnd, ctypes.byref(rect))
+        w = max(16, rect.right - rect.left)
+        h = max(16, rect.bottom - rect.top)
+        if not _user32.SetWindowPos(
+            hwnd, 0, 0, 0, w, h,
+            SWP_NOZORDER | SWP_FRAMECHANGED | wf.SWP_SHOWWINDOW,
+        ):
+            _rollback()
+            return False
+    except Exception:  # noqa: BLE001
+        _rollback()
+        return False
 
     with _lock:
         _states[hwnd] = state
@@ -194,12 +319,16 @@ def release_window(hwnd: int) -> bool:
     if not wf._is_window(hwnd):
         return False  # 窗口没了,无需还原
     try:
-        # 1) 先换回原父(0 = 桌面)
-        _user32.SetParent(hwnd, state.orig_parent or None)
-        # 2) 恢复样式
+        # 顺序很重要:先恢复样式(含清掉 SetParent 自动加的 WS_CHILD),
+        # 再发 FRAMECHANGED 让系统重算非客户区,最后换父 + 回原位。
+        # 旧实现「先换父、再恢复样式」会闪一下「桌面子窗口 + 无边框」。
         _user32.SetWindowLongW(hwnd, wf.GWL_STYLE, state.orig_style)
         _user32.SetWindowLongW(hwnd, wf.GWL_EXSTYLE, state.orig_ex_style)
-        # 3) 回原位置原大小
+        # 1) 换回原父。0 在 MSDN 上不等于「桌面」,要显式给 GetDesktopWindow()
+        target_parent = state.orig_parent or int(_user32.GetDesktopWindow() or 0)
+        if target_parent:
+            _user32.SetParent(hwnd, target_parent)
+        # 2) 回原位置原大小 + 重算非客户区(边框才回来)
         l, t, r, b = state.orig_rect
         _user32.SetWindowPos(
             hwnd, 0, l, t, max(16, r - l), max(16, b - t),
