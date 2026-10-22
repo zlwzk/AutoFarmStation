@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time
 
-from PySide6.QtCore import QTime, Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QThread, QTime, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
@@ -761,11 +762,43 @@ class SettingsDialog(QDialog):
         progress.setValue(0)
         progress.show()
 
-        # 5) 真正下载(阻塞 + 进度回调)
+        # 5) 真正下载
+        #    必须在后台线程跑:下载是同步阻塞的(urlopen timeout=60),
+        #    直接在这里调会把 GUI 冻住 —— 进度条不刷新、取消按钮点不动,
+        #    用户以为软件卡死。这里用 QThread + 信号把进度送回主线程。
         from ..utils.updater import download_and_apply_release, ApplyResult
         apply_result: ApplyResult = ApplyResult(ok=False)
 
-        def _progress(recv: int, total: int) -> None:
+        class _DownloadWorker(QThread):
+            """后台下载线程:进度 / 取消 / 结果都通过信号回主线程."""
+
+            progress_changed = Signal(int, int)   # (已收字节, 总字节; 0=未知)
+            finished_result = Signal(object)      # ApplyResult
+
+            def __init__(self, info_, parent_=None) -> None:
+                super().__init__(parent_)
+                self._info = info_
+                self._cancelled = False
+
+            def cancel(self) -> None:
+                self._cancelled = True
+
+            def run(self) -> None:  # noqa: D102
+                try:
+                    result = download_and_apply_release(
+                        self._info,
+                        progress_cb=lambda recv, total: self.progress_changed.emit(
+                            int(recv), int(total)),
+                        cancel_cb=lambda: self._cancelled,
+                        log=None,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    result = ApplyResult(ok=False, error=f"更新失败:{e}")
+                self.finished_result.emit(result)
+
+        worker = _DownloadWorker(info, self)
+
+        def _on_progress(recv: int, total: int) -> None:
             if total <= 0:
                 progress.setLabelText(f"正在下载 v{info.latest_version} ...")
                 progress.setRange(0, 0)  # 不确定大小 → 转圈
@@ -778,20 +811,31 @@ class SettingsDialog(QDialog):
                     f"正在下载 v{info.latest_version} ... {mb:.1f}/{tot_mb:.1f} MB"
                 )
 
-        def _cancel() -> bool:
-            return progress.wasCanceled()
+        loop_done = {"v": False}
 
-        try:
-            apply_result = download_and_apply_release(
-                info,
-                progress_cb=_progress,
-                cancel_cb=_cancel,
-                log=getattr(self.parent(), "_log", None) if self.parent() else None,
-            )
-        except Exception as e:  # noqa: BLE001
-            apply_result = ApplyResult(ok=False, error=f"更新失败:{e}")
-        finally:
-            progress.close()
+        def _on_finished(result) -> None:
+            nonlocal apply_result
+            apply_result = result
+            loop_done["v"] = True
+
+        worker.progress_changed.connect(_on_progress)
+        worker.finished_result.connect(_on_finished)
+        progress.canceled.connect(worker.cancel)
+        worker.start()
+
+        # 用局部事件循环等下载结束:期间界面仍能响应(能拖动、能点取消)
+        while not loop_done["v"]:
+            QCoreApplication.processEvents()
+            if not worker.isRunning() and not loop_done["v"]:
+                # 线程已退出但结果信号还没投递,再转一圈就拿到
+                QCoreApplication.processEvents()
+                break
+            if progress.wasCanceled():
+                worker.cancel()
+            time.sleep(0.02)
+
+        worker.wait(3000)
+        progress.close()
 
         if not apply_result.ok:
             QMessageBox.warning(
