@@ -75,6 +75,13 @@ class ProcessMonitor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._on_event: list[Callable[[MonitorEvent], None]] = []
+        # 自动重启限流:防止「游戏一启动就崩」把机器打成重启风暴
+        self._restart_history: list[float] = []   # 最近的重启时间戳
+        self._restart_window = 300.0              # 统计窗口(秒)
+        self._restart_max = 3                     # 窗口内最多重启几次
+        self._restart_min_gap = 10.0              # 两次重启的最小间隔(秒)
+        self._last_restart_ts = 0.0
+        self._storm_notice_ts = 0.0
 
     def on_event(self, cb: Callable[[MonitorEvent], None]) -> None:
         self._on_event.append(cb)
@@ -189,17 +196,51 @@ class ProcessMonitor:
             self._stop.wait(timeout=self._interval)
 
     def _try_restart(self) -> None:
+        """重启失效的游戏进程.
+
+        加两道闸,否则「游戏一启动就崩」会把这里变成重启风暴:
+        CPU 被打满,日志刷爆,用户机器直接卡死。
+          * 5 分钟窗口内最多重启 3 次;
+          * 两次重启之间至少间隔 10 秒(指数退避的简化版)。
+        """
         if not self._restart_exe:
             return
+        now = time.time()
+        # 退避:刚重启过就等一会儿,别连环点火
+        if now - self._last_restart_ts < self._restart_min_gap:
+            return
+        # 限流:清掉窗口外的旧记录,数一数窗口内重启了几次
+        self._restart_history = [t for t in self._restart_history
+                                 if now - t < self._restart_window]
+        if len(self._restart_history) >= self._restart_max:
+            # 已经在风暴里了:这次不重启,只告诉用户一声(带冷却,别刷屏)
+            if now - self._storm_notice_ts > 60.0:
+                self._storm_notice_ts = now
+                self._emit(MonitorEvent(
+                    hwnd=0, pid=0, status=MonitorStatus.ERROR,
+                    message=(f"自动重启已暂停:{self._restart_window // 60} 分钟内重启 "
+                             f"{self._restart_max} 次仍未稳定,请手动检查游戏"),
+                    ts=now,
+                ))
+            return
+
+        # 参数按空格切会把带空格的路径切碎;用 shlex 更稳,
+        # 解析失败就按整个字符串当一个参数(宁可少传也不错切)。
+        extra: list[str] = []
+        if self._restart_args:
+            try:
+                import shlex
+                extra = shlex.split(self._restart_args, posix=True)
+            except ValueError:
+                extra = [self._restart_args]
         try:
-            subprocess.Popen(
-                [self._restart_exe] + (self._restart_args.split() if self._restart_args else []),
-                close_fds=False,
-            )
+            subprocess.Popen([self._restart_exe] + extra, close_fds=False)
+            self._restart_history.append(now)
+            self._last_restart_ts = now
         except Exception as e:  # noqa: BLE001
             self._emit(MonitorEvent(
                 hwnd=0, pid=0, status=MonitorStatus.ERROR,
-                message=f"重启失败:{e}", ts=time.time(),
+                message=f"重启失败:{e}", ts=now,
             ))
 
     def _emit(self, ev: MonitorEvent) -> None:
