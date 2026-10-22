@@ -25,6 +25,11 @@ class KeyStep:
     hold_ms: int = 50  # 按下持续时间
     delay_before_ms: int = 0  # 在这一步之前额外等待
     note: str = ""
+    # 修饰键组合,如 ["ctrl"] / ["shift", "alt"]。
+    # 按下的顺序:先按所有 modifiers → 按键 → 反序抬起 modifiers。
+    # 有了它才能表达「Ctrl+A」「Shift+点击」这类操作,而且中途失败也不会
+    # 留下按住的 Shift(整组在 finally 里反序释放)。
+    modifiers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -46,6 +51,7 @@ class KeyMacroConfig:
                     "hold_ms": s.hold_ms,
                     "delay_before_ms": s.delay_before_ms,
                     "note": s.note,
+                    "modifiers": list(s.modifiers),
                 }
                 for s in self.steps
             ],
@@ -63,6 +69,8 @@ class KeyMacroConfig:
                 hold_ms=int(raw.get("hold_ms", 50)),
                 delay_before_ms=int(raw.get("delay_before_ms", 0)),
                 note=str(raw.get("note", "")),
+                # 老配置没有这个字段,默认空列表 = 无修饰键,行为不变
+                modifiers=[str(m) for m in (raw.get("modifiers") or []) if str(m).strip()],
             )
             for raw in (d.get("steps", []) or [])
         ]
@@ -85,7 +93,7 @@ class KeyMacro:
         logger: logging.Logger | None = None,
     ) -> None:
         self.config = config
-        # 解析 vk
+        # 解析 vk:主键
         for s in config.steps:
             if s.key and not s.vk:
                 try:
@@ -218,7 +226,14 @@ class KeyMacro:
                     if s.delay_before_ms:
                         self._sleep(s.delay_before_ms)
                     try:
-                        self._sender.key_press(s.vk, hwnd=self.config.hwnd, hold_ms=s.hold_ms)
+                        mods = self._resolve_modifiers(s.modifiers)
+                        if mods:
+                            # 组合键整组原子:失败也不会留下按住的修饰键
+                            self._sender.key_combo(
+                                mods, s.vk, hwnd=self.config.hwnd, hold_ms=s.hold_ms)
+                        else:
+                            self._sender.key_press(
+                                s.vk, hwnd=self.config.hwnd, hold_ms=s.hold_ms)
                     except Exception as e:  # noqa: BLE001
                         self._log.warning("按键失败 %s: %s", s.key, e)
                     with self._lock:
@@ -239,4 +254,24 @@ class KeyMacro:
                 if not self.config.loop and round_idx >= 1:
                     return
         finally:
+            # 线程以任何方式退出(正常 / 异常 / 窗口失效)都兜底抬起按下的键。
+            # 不做这一步,宏跑崩之后 Shift/Ctrl 会永远卡住,用户所有输入都变形。
+            try:
+                from .input_sender import release_all_pressed
+
+                n = release_all_pressed()
+                if n:
+                    self._log.info("键盘宏退出:兜底释放 %d 个仍在按下的键", n)
+            except Exception as e:  # noqa: BLE001
+                self._log.debug("兜底释放按键失败: %s", e)
             self._log.debug("键盘宏线程退出")
+
+    def _resolve_modifiers(self, names: list[str]) -> list[int]:
+        """把 ['ctrl','shift'] 解析成 vk 列表;无法识别的名字忽略."""
+        out: list[int] = []
+        for n in names or []:
+            try:
+                out.append(parse_vk(n))
+            except Exception:  # noqa: BLE001
+                self._log.warning("未知修饰键 %r,已忽略", n)
+        return out
