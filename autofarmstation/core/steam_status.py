@@ -246,6 +246,9 @@ class SteamStatusController:
         self._applied = False  # 当前是否已把状态改成挂机状态
         self._previous_state: str | None = None  # 挂机前的状态(用于还原)
         self._last_attempt = float("-inf")  # 上次尝试进入挂机的时刻(节流用)
+        # 切换意图的单调代号:排队中的旧意图过期后直接丢弃,
+        # 避免「停止挂机」之后队列里的「设为挂机态」又跑一遍
+        self._generation = 0
 
     # ---------- 配置 ----------
     def _cfg_get(self, key: str, default: Any) -> Any:
@@ -331,13 +334,22 @@ class SteamStatusController:
             if self._busy:
                 return False
             self._busy = True
+            self._generation += 1
+            gen = self._generation
         text = note or f"Steam 状态切换为「{state_label(state)}」"
         threading.Thread(
-            target=self._worker, args=(state, text), daemon=True, name="SteamStatus",
+            target=self._worker, args=(state, text, gen), daemon=True, name="SteamStatus",
         ).start()
         return True
 
-    def _worker(self, state: str, note: str) -> None:
+    def _worker(self, state: str, note: str, gen: int = 0) -> None:
+        # 过期的意图不执行:期间已经有更新的切换请求了
+        with self._lock:
+            stale = gen != self._generation
+        if stale:
+            with self._lock:
+                self._busy = False
+            return
         try:
             ok, detail = self.apply_state(state)
         except Exception as e:  # noqa: BLE001
@@ -413,6 +425,14 @@ class SteamStatusController:
             return
         self._clear_once("skip")
         prev = self.current_state()
+        # 当前已经就是挂机态时,不要把挂机态当成「挂机前的状态」存下来 ——
+        # 否则还原时会去设成挂机态,用户原本的状态(online/away)就永久丢了。
+        if prev is not None and prev == self.farm_state:
+            self._notify(
+                f"Steam 状态已是「{state_label(prev)}」,不重复切换,也不记录为挂机前状态"
+            )
+            self._applied = False
+            return
         self._previous_state = prev
         self._applied = True
         target = self.farm_state
@@ -446,29 +466,38 @@ class SteamStatusController:
 
     def _worker_async(self, state: str, note: str) -> None:
         with self._lock:
+            # 单调递增的「意图代号」:每次发起新切换就 +1。
+            # 排队中的旧任务开跑前比对代号,过期就直接丢弃 ——
+            # 否则「停止挂机」之后,队列里排着的「设为挂机态」还会执行,
+            # 把 Steam 反而留在挂机状态。
+            self._generation += 1
+            gen = self._generation
             if self._busy:
                 # 上一次切换还没完,排队等它结束后再跑
                 threading.Thread(
-                    target=self._delayed_worker, args=(state, note), daemon=True,
+                    target=self._delayed_worker, args=(state, note, gen), daemon=True,
                     name="SteamStatusQ",
                 ).start()
                 return
             self._busy = True
         threading.Thread(
-            target=self._worker, args=(state, note), daemon=True, name="SteamStatus",
+            target=self._worker, args=(state, note, gen), daemon=True, name="SteamStatus",
         ).start()
 
-    def _delayed_worker(self, state: str, note: str) -> None:
+    def _delayed_worker(self, state: str, note: str, gen: int) -> None:
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             with self._lock:
                 if not self._busy:
+                    # 等待期间又来了新意图 → 这次排队作废
+                    if gen != self._generation:
+                        return
                     self._busy = True
                     break
             time.sleep(0.2)
         else:
             return
-        self._worker(state, note)
+        self._worker(state, note, gen)
 
     def restore_if_needed(self, *, reason: str = "手动还原") -> bool:
         """如果当前处于「挂机状态」,还原成挂机前的状态."""
