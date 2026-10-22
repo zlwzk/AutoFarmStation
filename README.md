@@ -2,7 +2,7 @@
 
 > 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、分屏分类、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.8.9-blue)
+![banner](https://img.shields.io/badge/version-1.8.10-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -238,7 +238,7 @@ A:实测 `offline` 走这个协议在当前 Steam 客户端不生效(状态不�
 ## 自检与开发
 
 ```bash
-python -m scripts.selftest   # 65 项自检(v1.8.8;v1.8.7 是 60 项,v1.8.6 是 57 项,v1.8.5 是 54 项,v1.8.4 是 53 项,v1.8.3 是 52 项,v1.8.2 是 51 项,v1.8.1 是 50 项,v1.8.0 是 49 项,v1.7.0 是 47 项,v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
+python -m scripts.selftest   # 72 项自检(v1.8.10;v1.8.8 是 66 项;v1.8.7 是 60 项,v1.8.6 是 57 项,v1.8.5 是 54 项,v1.8.4 是 53 项,v1.8.3 是 52 项,v1.8.2 是 51 项,v1.8.1 是 50 项,v1.8.0 是 49 项,v1.7.0 是 47 项,v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
 python -u scripts/smoke_gui.py 6   # GUI 冒烟:真实拉起主窗口,验证线程范式与干净退出(v1.8.8 新增)
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe)
 powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(可选)
