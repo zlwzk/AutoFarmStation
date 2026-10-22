@@ -211,13 +211,37 @@ class PreviewGrid(QWidget):
         # 绑定方法缓存进 pm.on_change,主窗口之后替换 left._sync(补连卡片信号)
         # 就对「运行期新添加的窗口」失效 —— 新卡片漏连 target_requested,
         # 表现为勾选/选中窗口后右侧仍显示「未选择目标窗口」。
-        self._pm.on_change(lambda: self._sync())
+        #
+        # v1.8.8:_sync 里会 new/deleteLater QWidget、重建分类条按钮,
+        # 而 pm.on_change 的触发者是**监控线程**(monitor._loop → refresh →
+        # _notify)。在非 GUI 线程创建/销毁 Qt 控件是未定义行为,同时会和在
+        # GUI 线程跑的 _refresh_statuses/_relayout 撞迭代 _items dict
+        # (RuntimeError: dictionary changed size during iteration)。
+        # 所以这里也统一切回主线程,和 _on_frame / _on_monitor_event 一个范式。
+        self._pm.on_change(lambda: self._post_sync())
         QTimer.singleShot(100, lambda: self._sync())
 
         # 状态刷新(每 1.2s):把 AutomationHub 的运行状态回填到卡片
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._refresh_statuses)
         self._status_timer.start(1200)
+
+    def _post_sync(self) -> None:
+        """把 _sync 切到主线程执行(带接收者,控件销毁后不会变野回调)."""
+        try:
+            QTimer.singleShot(0, self, self._sync)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def sync_now(self) -> None:
+        """立即同步一次卡片(供「刚 add 完就要用卡片」的调用方).
+
+        ``_post_sync`` 把 _sync 排进事件队列,好处是不在监控线程里摸 Qt;
+        代价是「add_by_hwnd() 之后马上 grid.card(hwnd)」会拿到 None,
+        因为卡片还没建。对这类调用方提供这个显式的同步入口 ——
+        由调用方保证自己此时就在 GUI 线程上。
+        """
+        self._sync()
 
     # ---------- 对外 ----------
     def set_fps(self, fps: float) -> None:
