@@ -22,11 +22,16 @@ pycaw 不可用时所有函数返回 None / False,不抛异常 —— 音量功�
 from __future__ import annotations
 
 import logging
+import threading
 
 _log = logging.getLogger("autofarmstation.audio")
 
-# COM 初始化(每个使用线程都要一次;重复调用是计数式,安全)
-_com_ready = False
+# COM 初始化是**每线程**的:CoInitialize 在哪个线程调用,就只对那个线程生效。
+# 之前这里用一个进程级 flag,GUI 线程初始化之后,调度线程 / 监控线程再调
+# 音量就会跳过 CoInitialize → comtypes 抛错 → 被 except 吞掉 →
+# 「定时任务调音量」静默失效,而 UI 上还显示操作成功。
+# 所以必须按线程记状态。
+_com_local = threading.local()
 
 
 def available() -> bool:
@@ -39,16 +44,16 @@ def available() -> bool:
 
 
 def _ensure_com() -> None:
-    global _com_ready
-    if _com_ready:
+    """确保**当前线程**初始化过 COM(重复调用是计数式,安全)."""
+    if getattr(_com_local, "ready", False):
         return
     try:
         import comtypes
 
         comtypes.CoInitialize()
-    except Exception:  # noqa: BLE001
-        pass
-    _com_ready = True
+        _com_local.ready = True
+    except Exception as e:  # noqa: BLE001
+        _log.debug("COM 初始化失败(音量功能可能不可用): %s", e)
 
 
 def _clamp(v: float) -> float:
