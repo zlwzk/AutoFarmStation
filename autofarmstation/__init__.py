@@ -76,7 +76,7 @@ from __future__ import annotations
 import ctypes
 import os
 
-__version__ = "1.8.7"
+__version__ = "1.8.9"
 __app_name__ = "AutoFarmStation"
 __app_name_cn__ = "多开挂机大师"
 __author_handle__ = "zlwzk"
