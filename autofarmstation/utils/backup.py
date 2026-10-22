@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -135,10 +137,20 @@ def _safe_target(root: Path, rel: str) -> Path | None:
     return target
 
 
+# 单个文件解压上限。备份里都是 JSON / 小文件,超过这个数一定不是正常备份,
+# 继续 read() 会把内存吃爆(恶意或损坏的 zip 能塞一个几 GB 的条目)。
+_MAX_ENTRY_BYTES = 64 * 1024 * 1024
+
+
 def import_from(src: Path | str, *, backup_current: bool = True) -> tuple[bool, str]:
     """从备份恢复.返回 (是否成功, 提示语).
 
-    默认先给当前数据做一份整体备份放到 ``backups/``,导入失败时数据不会更糟。
+    两阶段提交:
+      1. 先把 zip 里所有文件解到 ``<数据目录>/.restore-tmp/``;
+      2. 全部成功才逐个 move 到最终位置;任何一步失败就把已 move 的回滚。
+
+    旧实现是「边解边覆盖」:第 5 个文件失败时,前 4 个已经被换掉了 ——
+    原配置回不去,而 docstring 还写着「导入失败时数据不会更糟」。
     """
     src = Path(src)
     root = user_data_dir()
@@ -153,32 +165,87 @@ def import_from(src: Path | str, *, backup_current: bool = True) -> tuple[bool, 
         if ok:
             saved = str(bdir)
 
+    stage = root / ".restore-tmp"
+    # 清掉上次异常中断留下的暂存目录
     try:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return (False, f"无法创建暂存目录:{e}")
+
+    staged: list[tuple[Path, Path]] = []  # (暂存文件, 最终目标)
+    try:
+        # ---------- 阶段 1:全部解到暂存区 ----------
         with zipfile.ZipFile(src) as z:
-            names = [n for n in z.namelist() if not n.endswith("/")]
-            written = 0
-            for name in names:
-                if name == MANIFEST:
+            for name in z.namelist():
+                if name.endswith("/") or name == MANIFEST:
                     continue
                 target = _safe_target(root, name)
                 if target is None:
                     continue
-                target.parent.mkdir(parents=True, exist_ok=True)
+                rel = target.relative_to(root.resolve())
+                tmp = stage / rel
+                tmp.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(name) as fh:
-                    data = fh.read()
-                # 原子写入,避免中途失败留下半截配置
-                tmp = target.with_suffix(target.suffix + ".tmp")
+                    # 分块读 + 上限,避免异常条目把内存打爆
+                    chunks: list[bytes] = []
+                    total = 0
+                    while True:
+                        chunk = fh.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > _MAX_ENTRY_BYTES:
+                            raise OSError(
+                                f"备份内文件过大(>{_MAX_ENTRY_BYTES // (1024*1024)}MB):{name}")
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                # 提前校验 JSON 类文件,别等到重启才发现导入了一份坏配置
+                if target.suffix.lower() == ".json":
+                    try:
+                        json.loads(data.decode("utf-8"))
+                    except Exception as e:  # noqa: BLE001
+                        raise OSError(f"备份内 {name} 不是合法 JSON:{e}")
                 tmp.write_bytes(data)
-                if target.exists():
-                    target.unlink()
-                tmp.replace(target)
-                written += 1
-    except (OSError, zipfile.BadZipFile) as e:
-        return (False, f"导入失败:{e}")
+                staged.append((tmp, target))
+    except (OSError, zipfile.BadZipFile, UnicodeDecodeError) as e:
+        shutil.rmtree(stage, ignore_errors=True)
+        return (False, f"导入失败(未改动任何现有数据):{e}")
 
-    if written == 0:
+    if not staged:
+        shutil.rmtree(stage, ignore_errors=True)
         return (False, "备份里没有任何可识别的文件,已中止。")
-    msg = f"已恢复 {written} 个文件。\n重启软件后全部生效。"
+
+    # ---------- 阶段 2:逐个提交,失败回滚 ----------
+    committed: list[tuple[Path, bytes | None]] = []  # (目标, 原内容或 None=原本不存在)
+    try:
+        for tmp, target in staged:
+            old: bytes | None = None
+            if target.exists():
+                try:
+                    old = target.read_bytes()
+                except OSError:
+                    old = None
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # os.replace 在 Windows 上是原子的,不需要先 unlink
+            os.replace(str(tmp), str(target))
+            committed.append((target, old))
+    except OSError as e:
+        # 回滚:把已经换上去的恢复成原内容(原本不存在的删掉)
+        for target, old in reversed(committed):
+            try:
+                if old is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.write_bytes(old)
+            except OSError:
+                continue
+        shutil.rmtree(stage, ignore_errors=True)
+        return (False, f"导入中途失败,已回滚到导入前状态:{e}")
+
+    shutil.rmtree(stage, ignore_errors=True)
+    msg = f"已恢复 {len(committed)} 个文件。\n重启软件后全部生效。"
     if saved:
         msg += f"\n\n导入前的原数据已备份到:\n{saved}"
     return (True, msg)
