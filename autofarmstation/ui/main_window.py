@@ -49,6 +49,13 @@ class GlobalHotkeyWatcher:
         self._listener = None
         self._callbacks: dict[str, callable] = {}
         self._lock = threading.Lock()
+        # 回调要切回哪个对象的主线程执行(由 MainWindow 注入自己)。
+        # 带接收者的 QTimer.singleShot 在窗口销毁后不会变成野回调。
+        self._receiver_getter: callable | None = None
+
+    def set_receiver(self, getter: callable) -> None:
+        """注入「取回调接收者(通常是主窗口)」的函数."""
+        self._receiver_getter = getter
 
     def register(self, name: str, cb) -> None:
         with self._lock:
@@ -81,12 +88,32 @@ class GlobalHotkeyWatcher:
         self._listener = None
 
     def _fire(self, name: str) -> None:
+        """热键触发.
+
+        这个函数跑在 **pynput 的钩子线程**上,不是 GUI 线程。回调里会读
+        QSpinBox/QComboBox、迭代 ``_items`` dict、调 ``hub.start_many``
+        (可能起线程)—— 全都在错误线程上做。后果是:
+          * dict 迭代时被 GUI 线程改动 → RuntimeError;
+          * 热键线程与 GUI 线程同时进 start_many → 同一窗口两个连点器,
+            点击频率翻倍;
+          * 读到半更新状态的控件,启动参数和界面不一致。
+
+        所以统一切回主线程再执行,和 ``_on_monitor_event`` 一个范式。
+        ``QTimer.singleShot(0, receiver, slot)`` 带接收者,窗口销毁后不会
+        变成野回调。
+        """
         cb = self._callbacks.get(name)
-        if cb:
-            try:
-                cb()
-            except Exception as e:
-                self._log.warning("热键回调出错: %s", e)
+        if not cb:
+            return
+        receiver = self._receiver_getter() if self._receiver_getter else None
+        try:
+            if receiver is not None:
+                QTimer.singleShot(0, receiver, cb)
+            else:
+                QTimer.singleShot(0, cb)
+        except Exception as e:  # noqa: BLE001
+            # 切线程失败也别在钩子线程里直接跑(那正是要避免的)
+            self._log.warning("热键回调切主线程失败(%s): %s", name, e)
 
 
 class MainWindow(QMainWindow):
@@ -138,25 +165,47 @@ class MainWindow(QMainWindow):
 
         # 全局热键
         self._hotkeys = GlobalHotkeyWatcher(logger=self._log)
+        # 热键跑在 pynput 钩子线程:所有回调都切回本窗口的主线程再执行,
+        # 避免跨线程读 Qt 控件 / 迭代 dict / 起重复连点器
+        self._hotkeys.set_receiver(lambda: self)
         self._hotkeys.register("start_all", self._on_hotkey_start_all)
         self._hotkeys.register("stop_all", self._on_hotkey_stop_all)
         self._hotkeys.register("panic", self._on_hotkey_panic)
         self._hotkeys.start()
 
         # 调度 handlers
-        self._sched.register_handler("start_all", lambda t: self._on_hotkey_start_all())
-        self._sched.register_handler("stop_all", lambda t: self._on_hotkey_stop_all())
-        self._sched.register_handler("launch_games", lambda t: self._launch_games_scheduled(t))
-        self._sched.register_handler("kill_games", lambda t: self._kill_games_scheduled(t))
-        self._sched.register_handler("start_clicker", lambda t: self._clicker_scheduled(t, True))
-        self._sched.register_handler("stop_clicker", lambda t: self._clicker_scheduled(t, False))
-        self._sched.register_handler("play_macro", lambda t: self._play_macro_scheduled(t))
+        # 这些回调全部跑在 **Scheduler 自己的工作线程**上,不是 GUI 线程。
+        # 直接在里面摸 Qt(弹确认框、close()、读控件)会踩两个坑:
+        #   * QMessageBox / closeEvent 跨线程 = 未定义行为,可能直接崩;
+        #   * 「退出本软件」在调度线程调 self.close() → closeEvent 里
+        #     self._sched.stop() 要 join 的正是当前线程 → RuntimeError,
+        #     被 except 吞掉后,后面 stop_all / steam.shutdown / 结束游戏 /
+        #     还原嵌入窗口**全部不执行**。
+        # 所以统一切回主线程再跑(带接收者,窗口销毁不会变野回调)。
+        self._sched.register_handler(
+            "start_all", lambda t: self._post_to_ui(self._on_hotkey_start_all))
+        self._sched.register_handler(
+            "stop_all", lambda t: self._post_to_ui(self._on_hotkey_stop_all))
+        self._sched.register_handler(
+            "launch_games", lambda t: self._post_to_ui(self._launch_games_scheduled, t))
+        self._sched.register_handler(
+            "kill_games", lambda t: self._post_to_ui(self._kill_games_scheduled, t))
+        self._sched.register_handler(
+            "start_clicker", lambda t: self._post_to_ui(self._clicker_scheduled, t, True))
+        self._sched.register_handler(
+            "stop_clicker", lambda t: self._post_to_ui(self._clicker_scheduled, t, False))
+        self._sched.register_handler(
+            "play_macro", lambda t: self._post_to_ui(self._play_macro_scheduled, t))
         # 音量动作只作用于「已加入本软件的窗口」,绝不碰系统总音量 ——
         # 定时「静音」不该顺手把用户的 QQ / 视频也静掉。
-        self._sched.register_handler("volume_low", lambda t: self._group_volume_set(0.2))
-        self._sched.register_handler("volume_mute", lambda t: self._group_mute_set(True))
-        self._sched.register_handler("volume_restore", lambda t: self._group_volume_restore())
-        self._sched.register_handler("shutdown_app", lambda t: self.close())
+        self._sched.register_handler(
+            "volume_low", lambda t: self._post_to_ui(self._group_volume_set, 0.2))
+        self._sched.register_handler(
+            "volume_mute", lambda t: self._post_to_ui(self._group_mute_set, True))
+        self._sched.register_handler(
+            "volume_restore", lambda t: self._post_to_ui(self._group_volume_restore))
+        self._sched.register_handler(
+            "shutdown_app", lambda t: self._post_to_ui(self.close))
         self._sched.start()
         self._monitor.start()
 
@@ -165,6 +214,8 @@ class MainWindow(QMainWindow):
         # 音量快照:pid → (音量, 静音)。定时任务「静音/降音量」前先记一份,
         # 「恢复音量」时还原成各自操作前的值,而不是一刀切 100%。
         self._volume_backup: dict[int, tuple[float, bool]] = {}
+        # v1.8.8:音量快照会被 GUI 线程和调度线程(定时音量动作)同时读写,加锁
+        self._volume_lock = threading.Lock()
 
         # UI
         self.setWindowTitle(f"{__app_name_cn__} v{__version__}")
@@ -467,6 +518,7 @@ class MainWindow(QMainWindow):
             pass
         self._restart_hist.pop(int(old_hwnd), None)
         tp = self._pm.add_by_hwnd(win.hwnd)
+        self._left.sync_now()  # v1.8.8:卡片立即建好,别等事件循环
         if tp is None:
             return
         if old_alias or old_color:
@@ -607,6 +659,17 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._handle_monitor_event(ev))
         except Exception:  # noqa: BLE001
             pass
+
+    def _post_to_ui(self, fn, *args) -> None:
+        """把一个调用切回主线程执行(定时任务 handler 用).
+
+        ``QTimer.singleShot(0, self, fn)`` 带接收者:主窗口销毁后待执行的
+        回调会随之失效,不会变成野调用。
+        """
+        try:
+            QTimer.singleShot(0, self, lambda: fn(*args))
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("切主线程执行失败: %s", e)
 
     def _handle_monitor_event(self, ev: MonitorEvent) -> None:
         item = self._pm.get(int(ev.hwnd))
@@ -935,6 +998,7 @@ class MainWindow(QMainWindow):
                 sels = [dlg.selected]
             for w in sels:
                 tp = self._pm.add_by_hwnd(w.hwnd)
+                self._left.sync_now()  # v1.8.8:卡片立即建好,别等事件循环
                 if tp:
                     # 自动匹配预设
                     auto_preset = self._presets.find_match(
@@ -1017,6 +1081,9 @@ class MainWindow(QMainWindow):
                 )
             self._remember_launch(int(tp.hwnd), int(tp.pid), tp.title)
             self._apply_default_session_volume(int(tp.hwnd))
+        # v1.8.8:pm.on_change 已改成切主线程异步派发,这里显式同步一次,
+        # 保证「按 PID/按名添加」之后卡片立刻可见(不等事件循环)
+        self._left.sync_now()
         self._save_state()
         self._statusBar().showMessage(
             f"已添加 {len(added)} 个窗口", 3000,
@@ -1039,8 +1106,24 @@ class MainWindow(QMainWindow):
             self._save_state()
 
     def _on_pm_change(self) -> None:
-        self._save_state()
-        self._refresh_status()
+        """进程列表变化的回调 —— 触发者是**监控线程**,不是 GUI 线程.
+
+        里面 ``_save_state()`` 要做全窗口枚举 + psutil 取启动信息 +
+        cfg.save + session.save(磁盘 IO),``_refresh_status()`` 要摸 Qt。
+        在监控线程里直接跑会把掉线检测从 3 秒拖到十几秒,并且跨线程碰控件。
+        统一切回主线程(带接收者)。
+        """
+        try:
+            QTimer.singleShot(0, self, self._handle_pm_change)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handle_pm_change(self) -> None:
+        try:
+            self._save_state()
+            self._refresh_status()
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("处理进程变化失败: %s", e)
 
     def _on_focus_from_preview(self, hwnd: int) -> None:
         """把 hwnd 设为右侧面板目标。窗口信息取不到(失效/刚重开)时用追踪里的标题兜底,
@@ -1117,11 +1200,19 @@ class MainWindow(QMainWindow):
             pass
         self._left.refresh_cards()
 
-    def _group_volume_set(self, v: float) -> int:
-        """把所有「已加入窗口」的会话音量设为 v(不动系统总音量)."""
+    def _group_volume_set(self, v: float, *, snapshot: bool = True) -> int:
+        """把所有「已加入窗口」的会话音量设为 v(不动系统总音量).
+
+        降音量之前也要拍快照:之前只有静音拍,导致「先调低音量、再点还原」
+        时走的是无快照分支,被一刀切推成 100% —— 用户原来 30% 的音量
+        就这么没了。现在两条改动路径都记快照,还原才说得上「回到操作前」。
+        """
         if not audio.available():
             return 0
         pids = self._tracked_pids()
+        with self._volume_lock:
+            if snapshot and not self._volume_backup:
+                self._volume_backup = audio.snapshot_for_pids(pids)
         n = audio.set_volume_for_pids(pids, float(v))
         self._statusBar().showMessage(  # type: ignore[union-attr]
             f"已加入窗口音量 → {int(round(float(v) * 100))}%({n}/{len(pids)} 个窗口)", 4000,
@@ -1133,8 +1224,9 @@ class MainWindow(QMainWindow):
         if not audio.available():
             return 0
         pids = self._tracked_pids()
-        if on and snapshot and not self._volume_backup:
-            self._volume_backup = audio.snapshot_for_pids(pids)
+        with self._volume_lock:
+            if on and snapshot and not self._volume_backup:
+                self._volume_backup = audio.snapshot_for_pids(pids)
         n = audio.set_mute_for_pids(pids, bool(on))
         tail = "(没生效的是此刻没在发声的窗口)" if n < len(pids) else ""
         self._statusBar().showMessage(  # type: ignore[union-attr]
@@ -1143,21 +1235,26 @@ class MainWindow(QMainWindow):
         return n
 
     def _group_volume_restore(self) -> None:
-        """还原「静音 / 降音量」之前的音量;没有快照就退回取消静音 + 100%."""
+        """还原「静音 / 降音量」之前的音量.
+
+        没有快照时不再一刀切推 100%(那会把用户自己调的音量抹掉),
+        只取消静音,并把当前实际音量如实报出来。
+        """
         if not audio.available():
             return
-        if self._volume_backup:
-            n = audio.restore_for_pids(self._volume_backup)
+        with self._volume_lock:
+            backup = self._volume_backup
             self._volume_backup = {}
+        if backup:
+            n = audio.restore_for_pids(backup)
             self._statusBar().showMessage(  # type: ignore[union-attr]
                 f"已还原 {n} 个窗口到操作前的音量", 4000,
             )
             return
         pids = self._tracked_pids()
         n = audio.set_mute_for_pids(pids, False)
-        audio.set_volume_for_pids(pids, 1.0)
         self._statusBar().showMessage(  # type: ignore[union-attr]
-            f"已取消静音并恢复 100%({n}/{len(pids)} 个窗口)", 4000,
+            f"已取消静音({n}/{len(pids)} 个窗口);没有操作前快照,音量保持现状", 4000,
         )
 
     def _apply_default_session_volume(self, hwnd: int) -> None:
@@ -1329,16 +1426,37 @@ class MainWindow(QMainWindow):
                         f"挂机时段外:已停止 {len(running)} 个窗口", 4000,
                     )
         else:
-            # 回到时段:如果之前是 pause,清空暂停列表(让用户决定要不要重启,
-            # 不自动重启避免「不明窗口突然开始动」的惊吓)
+            # 回到时段:如果之前是 pause,把当时停掉的窗口重新拉起来。
+            # README 里写的是「回到时段自动恢复」——之前这里只弹一句提示
+            # 就把 _farm_paused 清空了,等于承诺了却没实现(用户凌晨回到时段
+            # 发现挂机没自己动,还得一个个点启动)。
             if self._farm_paused:
-                self._log.info(
-                    "回到挂机时段:之前暂停的 %d 个窗口可手动重新启动",
-                    len(self._farm_paused),
-                )
-                self._statusBar().showMessage(  # type: ignore[union-attr]
-                    f"回到挂机时段:{len(self._farm_paused)} 个之前暂停的窗口待启动", 4000,
-                )
+                resume = sorted(int(h) for h in self._farm_paused)
+                if self._farm_guard.action() == "pause":
+                    # 只恢复还活着的窗口(期间可能被用户手动关掉/移除了)
+                    alive = [h for h in resume if self._pm.get(h) is not None]
+                    if alive:
+                        try:
+                            res = self._hub.start_many(alive)
+                            self._log.info(
+                                "回到挂机时段:自动恢复 %d 个窗口的自动化", len(alive))
+                            self._statusBar().showMessage(  # type: ignore[union-attr]
+                                f"回到挂机时段:已自动恢复 {len(alive)} 个窗口", 5000,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            self._log.warning("回到时段自动恢复失败: %s", e)
+                            self._statusBar().showMessage(  # type: ignore[union-attr]
+                                f"回到挂机时段:自动恢复失败({e}),请手动启动", 6000,
+                            )
+                    skipped = len(resume) - len(alive)
+                    if skipped:
+                        self._log.info(
+                            "回到挂机时段:%d 个窗口已不在追踪列表,跳过", skipped)
+                else:
+                    # action=stop:语义就是「只停不自动恢复」,提示一下即可
+                    self._statusBar().showMessage(  # type: ignore[union-attr]
+                        f"回到挂机时段:之前停止的 {len(resume)} 个窗口需手动启动", 5000,
+                    )
             self._farm_paused.clear()
 
     def _on_hotkey_start_all(self) -> None:
@@ -1569,6 +1687,7 @@ class MainWindow(QMainWindow):
         new_configs: dict[str, dict] = {}
         for s, w in pairs:
             tp = self._pm.add_by_hwnd(w.hwnd)
+            self._left.sync_now()  # v1.8.8:卡片立即建好,别等事件循环
             if tp is None:
                 continue
             added += 1
