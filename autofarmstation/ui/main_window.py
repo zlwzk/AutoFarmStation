@@ -336,6 +336,24 @@ class MainWindow(QMainWindow):
             window_host.release_all()
         except Exception:
             pass
+        # 退出时把还在省电模式的游戏还原(优先级 + EcoQoS)。
+        # 不做这一步,被降频的游戏会一直停在 BELOW_NORMAL,用户下次开游戏
+        # 发现「怎么这么卡」却找不到原因。
+        try:
+            from ..core import power_saver
+            n_eco = power_saver.restore_all()
+            if n_eco:
+                self._log.info("退出时还原了 %d 个游戏的省电模式", n_eco)
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("还原省电模式失败: %s", e)
+        # 兜底抬起可能还卡在按下态的按键(宏线程异常退出时)
+        try:
+            from ..core.input_sender import release_all_pressed
+            n_keys = release_all_pressed()
+            if n_keys:
+                self._log.info("退出时释放了 %d 个仍在按下的键", n_keys)
+        except Exception:
+            pass
         # 关闭被追踪的游戏进程(可在设置里关掉)
         if close_games and pids:
             n = self._kill_pids(pids, reason="退出软件")
