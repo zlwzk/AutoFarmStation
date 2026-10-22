@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QPoint, QRect
@@ -162,6 +163,12 @@ class PreviewWidget(QFrame):
         self._status_extra = ""
         self._embedded = False
         self._frame_pending = False  # 截图渲染节流标记(见 _on_frame)
+        # 待渲染的**最新一帧**(单槽:新帧覆盖旧帧,内存有界)
+        self._pending_frame: PreviewFrame | None = None
+        # DPI 发糊提示只提示一次
+        self._dpi_hint_shown = False
+        # 卡片级日志(嵌入 DPI / 跨屏等提示用)
+        self._log = logging.getLogger("autofarmstation.preview")
         self._show_volume = bool(show_volume)
         self._show_resource = bool(show_resource)
         self._pm = pm
@@ -173,6 +180,17 @@ class PreviewWidget(QFrame):
         _info = wf.get_window_info(self.hwnd)
         if _info is not None:
             self._last_pid = _info.pid
+
+        # 卡片被拖到另一块不同缩放的显示器上时,重算嵌入尺寸。
+        # 旧实现只监听 Resize:跨屏移动时尺寸不变但屏幕 DPI 变了,
+        # 嵌入的游戏窗口就会留黑边或被裁。screenChanged 在新版 Qt 才有,
+        # 老版本拿不到就跳过(不影响主流程)。
+        try:
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.screenChanged.connect(self._on_screen_changed)
+        except Exception:  # noqa: BLE001
+            pass
 
         v = QVBoxLayout(self)
         v.setContentsMargins(4, 4, 4, 4)
@@ -773,6 +791,25 @@ class PreviewWidget(QFrame):
         return (max(32, int(self._image_lab.width() * self._dpr())),
                 max(32, int(self._image_lab.height() * self._dpr())))
 
+    def _game_scale(self) -> float:
+        """容器与游戏窗口的 DPI 比值.
+
+        ``_embed_viewport`` 给的是**容器所在屏幕**的物理像素;而 MoveWindow
+        对游戏窗口的坐标按**游戏自己的 DPI** 解释。两边缩放不一致时(游戏
+        DPI-unaware 又在 150% 屏,或者卡片被拖到另一块不同缩放的屏)直接
+        传物理像素会尺寸偏大 / 偏小 —— 表现就是黑边或画面被裁。
+        ``game_scale`` 是游戏 DPI/96,容器 dpr 是屏幕 DPI/96,比值就是要乘的系数。
+        """
+        try:
+            g = max(0.5, min(4.0, float(window_host.game_scale(self.hwnd))))
+            c = self._dpr()
+            if c <= 0:
+                return 1.0
+            # 游戏相对容器的缩放:1.0 表示两边 DPI 一致,不需要换算
+            return max(0.25, min(4.0, g / c))
+        except Exception:  # noqa: BLE001
+            return 1.0
+
     def _natural_size(self, cw: int, ch: int) -> tuple[int, int]:
         nat = window_host.natural_client_size(self.hwnd)
         nw, nh = nat if nat else (cw, ch)
@@ -783,24 +820,71 @@ class PreviewWidget(QFrame):
 
         fill:铺满容器(旧行为);fit:按原始宽高比完整显示居中;
         free:按 zoom/offset 任意摆放,超出容器部分被裁掉 = 平移缩放。
+
+        v1.8.10:加 DPI 换算。目标尺寸按 ``_game_scale()`` 折算成游戏坐标系,
+        并把结果按游戏客户区真实尺寸再校验一次 —— 跨屏 / 高 DPI 下不再出黑边。
         """
         if not self._embedded:
             return
         cw, ch = self._embed_viewport()
         nw, nh = self._natural_size(cw, ch)
+        gs = self._game_scale()
+
+        def _to_game(v: float) -> int:
+            return max(16, int(round(float(v) * gs)))
+
         if self._view_mode == "fit":
             s = min(cw / nw, ch / nh)
-            w, h = max(16, int(nw * s)), max(16, int(nh * s))
-            window_host.place(self.hwnd, (cw - w) // 2, (ch - h) // 2, w, h)
+            w, h = _to_game(nw * s), _to_game(nh * s)
+            cx, cy = _to_game((cw - nw * s) / 2), _to_game((ch - nh * s) / 2)
+            window_host.place(self.hwnd, cx, cy, w, h)
         elif self._view_mode == "free":
             z = max(0.05, min(8.0, float(self._view_zoom)))
-            w, h = max(16, int(nw * z)), max(16, int(nh * z))
-            x = max(-(w - 48), min(int(self._view_off[0]), cw - 48))
-            y = max(-(h - 48), min(int(self._view_off[1]), ch - 48))
+            w, h = _to_game(nw * z), _to_game(nh * z)
+            x = max(-(w - 48), min(int(self._view_off[0]), max(0, cw - 48)))
+            y = max(-(h - 48), min(int(self._view_off[1]), max(0, ch - 48)))
             self._view_off = (x, y)
             window_host.place(self.hwnd, x, y, w, h)
         else:  # fill
-            window_host.place(self.hwnd, 0, 0, cw, ch)
+            window_host.place(self.hwnd, 0, 0, _to_game(cw), _to_game(ch))
+
+        # 高 DPI 屏 + DPI 不感知的游戏:系统会放大画面导致发糊。
+        # 这是目标游戏自身的问题,本软件只能提示怎么处理。
+        try:
+            self._maybe_warn_dpi_blurry()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _maybe_warn_dpi_blurry(self) -> None:
+        """画面可能发糊时,在卡片上给一条可操作的提示(只提示一次)."""
+        if self._dpi_hint_shown:
+            return
+        if not window_host.is_dpi_blurry(self.hwnd):
+            return
+        self._dpi_hint_shown = True
+        self._log.info(
+            "窗口 %s 的 DPI 与显示器不匹配,画面可能发糊(建议给游戏 exe 勾「替代高 DPI 缩放行为」)",
+            self.hwnd,
+        )
+        try:
+            self._status_lab.setText(
+                "画面可能发糊:右键游戏 exe → 属性 → 兼容性 → 更改高 DPI 设置 → "
+                "勾「替代高 DPI 缩放行为」"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_screen_changed(self, *_args) -> None:
+        """卡片被拖到另一块不同缩放的显示器上时,重算嵌入尺寸.
+
+        旧实现只监听 Resize:跨屏移动时尺寸不变(但屏幕 DPI 变了),
+        嵌入的游戏窗口就会留黑边或被裁掉。
+        """
+        try:
+            if self._embedded:
+                self._apply_embed_view()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _init_free_from_fit(self) -> None:
         """进入自由查看时,先按「完整显示」的缩放居中,方便用户再放大. """
@@ -874,19 +958,30 @@ class PreviewWidget(QFrame):
     def _on_frame(self, frame: PreviewFrame) -> None:
         """截图回调(子线程).切到主线程渲染.
 
-        两个防崩点:
+        三个防崩 / 防涨点:
         - ``QTimer.singleShot(0, self, ...)`` 带上接收者:卡片被销毁后,
           还没执行的回调会被 Qt 直接丢弃,不会在已删除的对象上渲染。
-        - ``_frame_pending`` 节流:上一帧还没渲染完就丢弃新帧,
-          避免窗口很多 / fps 调高时事件队列被截图回调刷爆。
+        - **单槽覆盖**:上一帧还没渲染完时,新帧直接替换掉待渲染的那一帧,
+          而不是排进队列。旧实现把整帧像素塞进闭包,主线程一忙就攒着
+          好几帧 —— 10 个 4K 窗口峰值能到几百 MB,这正是「多开越高帧率
+          内存越涨」的来源。现在每张卡片最多只持 1 帧。
+        - 覆盖而不是丢弃:预览永远是**最新画面**,不会因为主线程忙而停在旧帧。
         """
+        self._pending_frame = frame
         if self._frame_pending:
-            return
+            return  # 已经排了一个渲染回调,它会把最新帧取走
         self._frame_pending = True
-        QTimer.singleShot(0, self, lambda: self._render_frame(frame))
+        QTimer.singleShot(0, self, self._render_pending)
+
+    def _render_pending(self) -> None:
+        """把待渲染的最新一帧画上去,然后清空槽位."""
+        frame = self._pending_frame
+        self._pending_frame = None
+        self._frame_pending = False
+        if frame is not None:
+            self._render_frame(frame)
 
     def _render_frame(self, frame: PreviewFrame) -> None:
-        self._frame_pending = False
         if self._embedded:
             return
         try:
@@ -895,9 +990,11 @@ class PreviewWidget(QFrame):
                          QImage.Format.Format_BGRX8888)
             pix = QPixmap.fromImage(img)
             target = self._image_lab.size()
-            scaled = pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation)
-            self._image_lab.setPixmap(scaled)
+            if target.width() > 0 and target.height() > 0:
+                # 缩到卡片尺寸再显示:保留大图没意义,还多占一份显存
+                pix = pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+            self._image_lab.setPixmap(pix)
         except RuntimeError:
             # 底层 C++ 对象已被销毁(卡片关闭竞态),静默丢弃
             pass
