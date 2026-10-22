@@ -262,6 +262,44 @@ class _InputHelper:
         time.sleep(max(0, hold_ms) / 1000.0)
         _InputHelper.key_up(vk)
 
+    @staticmethod
+    def key_unicode(ch: str) -> None:
+        """按字符发一个键(SendInput + KEYEVENTF_UNICODE).
+
+        比 ``key_press(ord(c.upper()))`` 强的地方:
+          * 中文 / emoji 之类的非 ASCII 能原样进去,不会被 ``& 0xFF`` 截成乱码;
+          * 大小写和符号原样保留,不需要自己拼 Shift 组合。
+        """
+        if not ch:
+            return
+        code = ord(ch) & 0xFFFF
+        ki_down = KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0)
+        ki_up = KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+        _send_inputs([
+            INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=ki_down)),
+            INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=ki_up)),
+        ])
+
+
+def _wait_foreground(hwnd: int, *, timeout: float = 0.5) -> bool:
+    """确认 hwnd 真的成了前台窗口;超时返回 False.
+
+    为什么不能信 ``SetForegroundWindow`` 的返回值 + sleep:
+    Windows 有「前台锁」,进程不在前台时 SetForegroundWindow 常常返回成功
+    但实际没切过去(或者闪一下就回去了)。用 ``GetForegroundWindow`` 轮询
+    回读才是唯一可信的判据 —— 宁可慢 100ms,也不能把这一下点到别处。
+    """
+    deadline = time.time() + max(0.0, timeout)
+    while True:
+        try:
+            if int(_user32.GetForegroundWindow() or 0) == int(hwnd):
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.02)
+
 
 def _send_inputs(inputs: list[INPUT]) -> int:
     """底层 SendInput 封装,返回成功发送数."""
@@ -324,9 +362,12 @@ class InputSender:
                 return (False, "post 返回 0(目标未响应消息,可能是独占全屏或 UAC 隔离)")
 
         # send 模式 / auto 回退
+        # 真实输入是**全局**的:鼠标会按屏幕绝对坐标点下去。所以必须先确认
+        # 目标窗口真的拿到了前台,否则这一下就点到用户正在用的别的软件上了
+        # (关掉一个窗口、触发一个按钮,都是真实发生的误操作)。
         try:
-            wf.force_foreground(hwnd)
-            time.sleep(0.02)
+            if not _wait_foreground(hwnd, timeout=0.5):
+                return (False, "未能把目标窗口切到前台,已中止(避免误点其它窗口)")
             sx, sy = ox + x, oy + y
             _InputHelper.click_at(sx, sy, button)
             if double:
@@ -348,8 +389,9 @@ class InputSender:
         if m == "post":
             return wf.post_mouse_move(hwnd, int(x), int(y))
         ox, oy = wf.client_origin(hwnd)
-        wf.set_foreground(hwnd)
-        time.sleep(0.005)
+        # 真实移动同样是全局的,先确认前台再动
+        if not _wait_foreground(hwnd, timeout=0.3):
+            return False
         _InputHelper.move_abs(ox + int(x), oy + int(y))
         return True
 
@@ -378,14 +420,21 @@ class InputSender:
         return True
 
     def type_text(self, text: str, *, hwnd: int | None = None, mode: str | None = None) -> bool:
-        """输入纯文本(键盘事件)."""
+        """输入纯文本(键盘事件).
+
+        post 模式下用 WM_CHAR 直接把字符码投给窗口 —— 这样中文 / 符号 /
+        大小写都能原样进去,不需要拆 Shift 组合,也不会被 ``ord(c.upper())``
+        把非 ASCII 截成乱码(之前小写会被变成大写,『abc』打进去是『ABC』)。
+        """
         m = mode or self.default_mode
-        for ch in text:
-            if m == "post" and hwnd is not None:
-                wf.post_key(hwnd, ord(ch.upper()) & 0xFF, down=True)
-                wf.post_key(hwnd, ord(ch.upper()) & 0xFF, down=False)
-            else:
-                _InputHelper.key_press(ord(ch.upper()) & 0xFF)
+        if m == "post" and hwnd is not None:
+            for ch in text:
+                code = ord(ch) & 0xFFFF
+                wf.post_key(hwnd, code, down=True, char_msg=True)
+                wf.post_key(hwnd, code, down=False, char_msg=True)
+        else:
+            for ch in text:
+                _InputHelper.key_unicode(ch)
         return True
 
     def scroll(self, delta: int, *, hwnd: int | None = None, mode: str | None = None) -> bool:
