@@ -11,6 +11,7 @@ import ctypes
 import ctypes.wintypes as w
 import ctypes as c
 import enum
+import threading
 import time
 from dataclasses import dataclass
 
@@ -309,6 +310,71 @@ def _send_inputs(inputs: list[INPUT]) -> int:
     return int(_user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT)))
 
 
+# === 按下键追踪(防「Shift/Ctrl 卡住」)===
+# 已发出 key_down 但还没 key_up 的键。宏线程被杀、抛异常、进程退出时,
+# 这些键会永远停在按下态 —— 之后用户所有输入都变成 Ctrl+X 之类,
+# 只能重启系统或手动按一下那个键才能恢复。所以必须记账 + 兜底释放。
+_pressed: dict[int, int] = {}      # vk -> 剩余按下次数(允许嵌套)
+_pressed_lock = threading.Lock()
+_atexit_hooked = False
+
+
+def _track_down(vk: int) -> None:
+    with _pressed_lock:
+        k = int(vk) & 0xFFFF
+        _pressed[k] = _pressed.get(k, 0) + 1
+
+
+def _track_up(vk: int) -> None:
+    with _pressed_lock:
+        k = int(vk) & 0xFFFF
+        n = _pressed.get(k, 0)
+        if n <= 1:
+            _pressed.pop(k, None)
+        else:
+            _pressed[k] = n - 1
+
+
+def pressed_keys() -> list[int]:
+    """当前仍停在按下态的键(调试 / 测试用)."""
+    with _pressed_lock:
+        return sorted(_pressed)
+
+
+def release_all_pressed() -> int:
+    """把还停在按下态的键全部抬起,返回释放个数.
+
+    幂等:没有按下键时返回 0。释放失败的键保留在集合里(下次还能重试),
+    成功的移出。这个函数在宏线程 finally、进程退出 atexit、以及
+    「急停」里都会被调用 —— 宁可多调几次,也不能留一个卡住的 Ctrl。
+    """
+    with _pressed_lock:
+        keys = list(_pressed)
+    n = 0
+    for vk in keys:
+        try:
+            _InputHelper.key_up(vk)
+        except Exception:  # noqa: BLE001
+            continue
+        with _pressed_lock:
+            _pressed.pop(vk, None)
+        n += 1
+    return n
+
+
+def _install_atexit() -> None:
+    global _atexit_hooked
+    if _atexit_hooked:
+        return
+    try:
+        import atexit
+
+        atexit.register(release_all_pressed)
+        _atexit_hooked = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # === 公共入口 ===
 class InputSender:
     """对外的高级输入发送器."""
@@ -396,28 +462,95 @@ class InputSender:
         return True
 
     def key_down(self, vk: int, *, hwnd: int | None = None, mode: str | None = None) -> bool:
+        """按下键.真实输入路径会记账,供异常/退出时兜底释放."""
+        _install_atexit()
         m = mode or self.default_mode
         if m == "post" and hwnd is not None:
             return wf.post_key(hwnd, vk, down=True)
         _InputHelper.key_down(vk)
+        _track_down(vk)
         return True
 
     def key_up(self, vk: int, *, hwnd: int | None = None, mode: str | None = None) -> bool:
+        """抬起键."""
         m = mode or self.default_mode
         if m == "post" and hwnd is not None:
             return wf.post_key(hwnd, vk, down=False)
         _InputHelper.key_up(vk)
+        _track_up(vk)
         return True
 
     def key_press(self, vk: int, *, hwnd: int | None = None, hold_ms: int = 30, mode: str | None = None) -> bool:
+        """按一下(按下 → 保持 → 抬起).用 try/finally 保证一定会抬起.
+
+        之前 send 路径直接调 ``_InputHelper.key_press``,中间那 30ms 里要是
+        线程被杀 / 抛异常,键就永远停在按下态。
+        """
         m = mode or self.default_mode
         if m == "post" and hwnd is not None:
-            self.key_down(vk, hwnd=hwnd, mode=m)
-            time.sleep(max(0, hold_ms) / 1000.0)
-            self.key_up(vk, hwnd=hwnd, mode=m)
+            wf.post_key(hwnd, vk, down=True)
+            try:
+                time.sleep(max(0, hold_ms) / 1000.0)
+            finally:
+                wf.post_key(hwnd, vk, down=False)
             return True
-        _InputHelper.key_press(vk, hold_ms=hold_ms)
+        _install_atexit()
+        _InputHelper.key_down(vk)
+        _track_down(vk)
+        try:
+            time.sleep(max(0, hold_ms) / 1000.0)
+        finally:
+            # 不管上面怎么退出,这一下必须发出去
+            try:
+                _InputHelper.key_up(vk)
+                _track_up(vk)
+            except Exception:  # noqa: BLE001
+                pass
         return True
+
+    def key_combo(
+        self,
+        modifiers: list[int],
+        vk: int,
+        *,
+        hwnd: int | None = None,
+        hold_ms: int = 30,
+        mode: str | None = None,
+    ) -> bool:
+        """组合键:按住所有 modifiers → 按键 → 反序抬起 modifiers.
+
+        为什么需要它:宏里「Shift+点击」「Ctrl+A」这类操作,如果分成多个
+        独立步骤,中途失败就会留下按住的 Shift。这里把整组当原子操作,
+        并在 finally 里反序释放 —— 即使按键那一步抛异常,修饰键也会抬起。
+
+        ``modifiers`` 是虚拟键码列表(用 ``parse_vk("ctrl")`` 之类转换)。
+        """
+        m = mode or self.default_mode
+        held: list[int] = []
+        try:
+            for mod in modifiers:
+                if m == "post" and hwnd is not None:
+                    wf.post_key(hwnd, mod, down=True)
+                else:
+                    _install_atexit()
+                    _InputHelper.key_down(mod)
+                    _track_down(mod)
+                held.append(mod)
+            self.key_press(vk, hwnd=hwnd, hold_ms=hold_ms, mode=m)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            # 反序抬起:修饰键最后按下、最先抬起,和真人手序一致
+            for mod in reversed(held):
+                try:
+                    if m == "post" and hwnd is not None:
+                        wf.post_key(hwnd, mod, down=False)
+                    else:
+                        _InputHelper.key_up(mod)
+                        _track_up(mod)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def type_text(self, text: str, *, hwnd: int | None = None, mode: str | None = None) -> bool:
         """输入纯文本(键盘事件).
