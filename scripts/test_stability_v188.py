@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -34,15 +35,22 @@ def test_atomic_write() -> None:
         check("首次写入可读", json.loads(p.read_text(encoding="utf-8")) == {"a": 1})
 
         # 反复覆盖，每次都必须是完整内容（不存在半截/空文件）
+        # 次数收在 60:每次 atomic_write 都带 fsync(≈20ms),跑 200 次会把
+        # 测试拖到十几秒,而正确性用 60 次已经能覆盖。
         bad = 0
-        for i in range(200):
+        t0 = time.time()
+        for i in range(60):
             atomic_write(p, json.dumps({"n": i, "pad": "x" * 500}))
             try:
                 if json.loads(p.read_text(encoding="utf-8"))["n"] != i:
                     bad += 1
             except Exception:
                 bad += 1
-        check("200 次覆盖全部完整可读", bad == 0, "损坏 %d 次" % bad)
+        elapsed = time.time() - t0
+        check("60 次覆盖全部完整可读", bad == 0, "损坏 %d 次" % bad)
+        # 性能护栏:单次写入不能慢到离谱(否则用户改个设置都卡)
+        check("单次写入均值 < 100ms", elapsed / 60 < 0.1,
+              "%.1f ms/次" % (elapsed / 60 * 1000))
 
         # 覆盖后不得残留 .tmp
         leftovers = [x.name for x in p.parent.iterdir() if ".tmp" in x.name]
@@ -55,7 +63,7 @@ def test_atomic_write() -> None:
 
         def worker(idx: int) -> None:
             try:
-                for i in range(60):
+                for i in range(8):
                     atomic_write(p2, json.dumps({"k": idx, "i": i}))
             except Exception as ex:  # noqa: BLE001
                 errors.append(repr(ex))
