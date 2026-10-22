@@ -35,6 +35,12 @@ class BundleResult:
     started: int = 0
     failed: int = 0
     message: str = ""
+    # (hwnd, 哪一半没起来) —— 「连点起来了但宏没起来」这类部分成功
+    partial: list = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.partial is None:
+            self.partial = []
 
 
 class AutomationHub:
@@ -88,18 +94,31 @@ class AutomationHub:
 
     # ---------- 配置读写(单窗口独立) ----------
     def set_clicker_config(self, hwnd: int, cfg: AutoClickerConfig) -> None:
+        """设置某个窗口的连点器配置.
+
+        必须 deepcopy:调用方(尤其是 main_window 的「启动全部」)会把**同一个**
+        ``build_config()`` 结果循环塞给多个窗口。如果直接存引用,
+        ``cfg.hwnd = int(hwnd)`` 会把所有人一起改成最后一个窗口的句柄,
+        连点全打到同一个窗口上;改一个窗口的点位也会污染其它窗口。
+        ``broadcast_clicker_config`` 一直是拷贝的,这里保持一致。
+        """
         with self._lock:
-            cfg.hwnd = int(hwnd)
-            self._clicker_cfg[int(hwnd)] = cfg
+            import copy
+            c = copy.deepcopy(cfg)
+            c.hwnd = int(hwnd)
+            self._clicker_cfg[int(hwnd)] = c
 
     def clicker_config(self, hwnd: int) -> AutoClickerConfig | None:
         with self._lock:
             return self._clicker_cfg.get(int(hwnd))
 
     def set_key_macro_config(self, hwnd: int, cfg: KeyMacroConfig) -> None:
+        """同 ``set_clicker_config``:存拷贝,避免多窗口共享同一份配置."""
         with self._lock:
-            cfg.hwnd = int(hwnd)
-            self._key_cfg[int(hwnd)] = cfg
+            import copy
+            c = copy.deepcopy(cfg)
+            c.hwnd = int(hwnd)
+            self._key_cfg[int(hwnd)] = c
 
     def key_macro_config(self, hwnd: int) -> KeyMacroConfig | None:
         with self._lock:
@@ -220,20 +239,39 @@ class AutomationHub:
     # ---------- 批量启停(同步执行) ----------
     def start_many(self, hwnds: list[int], *, clicker: bool = True,
                    key_macro: bool = True) -> BundleResult:
+        """批量启动(同步执行).
+
+        每个窗口独立 try:一个窗口抛异常不能把整批打断 —— 否则用户勾了 5 个
+        窗口按「同步启动」,第 2 个出问题就只剩 1 个在跑,而且没有任何提示。
+
+        另外连点器和键盘宏**分别统计**:以前 ``ok = start_clicker() or ok``
+        再 ``ok = start_key_macro() or ok``,会让「连点成功 + 宏失败」整体算
+        成功,宏没起来这件事被藏掉了。
+        """
         res = BundleResult()
         for h in hwnds:
-            ok = False
-            if clicker:
-                ok = self.start_clicker(h) or ok
-            if key_macro:
-                ok = self.start_key_macro(h) or ok
-            if ok:
+            c_ok = m_ok = False
+            try:
+                if clicker:
+                    c_ok = self.start_clicker(h)
+                if key_macro:
+                    m_ok = self.start_key_macro(h)
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("启动窗口 %s 失败: %s", h, e)
+            if c_ok or m_ok:
                 res.started += 1
             else:
                 res.failed += 1
-        res.message = f"已启动 {res.started} 个窗口" + (
-            f",{res.failed} 个未启动(缺配置或窗口无效)" if res.failed else ""
-        )
+            # 只成功一半的,明确说清楚是哪一半
+            if clicker and key_macro and c_ok != m_ok:
+                which = "连点器" if c_ok else "键盘宏"
+                res.partial.append((h, which))
+        msg = f"已启动 {res.started} 个窗口"
+        if res.failed:
+            msg += f",{res.failed} 个未启动(缺配置或窗口无效)"
+        if res.partial:
+            msg += ";" + ",".join(f"窗口 {h} 的{which}未启动" for h, which in res.partial)
+        res.message = msg
         return res
 
     def stop_many(self, hwnds: list[int]) -> BundleResult:
@@ -302,22 +340,35 @@ class AutomationHub:
                 out.setdefault(str(h), {})["key_macro"] = cfg.to_dict()
         return out
 
-    def import_configs(self, data: dict[str, dict]) -> None:
-        """导入窗口配置(持久化恢复)."""
+    def import_configs(self, data: dict[str, dict]) -> int:
+        """导入窗口配置(持久化恢复),返回成功导入的条目数.
+
+        之前这里**完全没加锁**,和模块开头「所有公开方法都加锁」的承诺矛盾;
+        而且 ``except Exception: pass`` 会把解析失败的配置静默丢掉,
+        界面上显示「已恢复 N 个窗口」,实际点位是空的。
+        现在加锁 + 记 warning,并返回成功数供上层核对。
+        """
         if not data:
-            return
-        for h_str, blob in data.items():
-            try:
-                h = int(h_str)
-            except (TypeError, ValueError):
-                continue
-            if "clicker" in blob:
+            return 0
+        ok = 0
+        with self._lock:
+            for h_str, blob in data.items():
                 try:
-                    self._clicker_cfg[h] = AutoClickerConfig.from_dict(blob["clicker"])
-                except Exception:  # noqa: BLE001
-                    pass
-            if "key_macro" in blob:
-                try:
-                    self._key_cfg[h] = KeyMacroConfig.from_dict(blob["key_macro"])
-                except Exception:  # noqa: BLE001
-                    pass
+                    h = int(h_str)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(blob, dict):
+                    continue
+                if "clicker" in blob:
+                    try:
+                        self._clicker_cfg[h] = AutoClickerConfig.from_dict(blob["clicker"])
+                        ok += 1
+                    except Exception as e:  # noqa: BLE001
+                        self._log.warning("导入连点配置失败(hwnd=%s): %s", h_str, e)
+                if "key_macro" in blob:
+                    try:
+                        self._key_cfg[h] = KeyMacroConfig.from_dict(blob["key_macro"])
+                        ok += 1
+                    except Exception as e:  # noqa: BLE001
+                        self._log.warning("导入键盘宏配置失败(hwnd=%s): %s", h_str, e)
+        return ok
