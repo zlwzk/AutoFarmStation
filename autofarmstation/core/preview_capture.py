@@ -92,8 +92,27 @@ class BITMAPINFO(ctypes.Structure):
     ]
 
 
+# 单帧像素缓冲上限。
+# 正常窗口 4K(3840x2160)≈ 33MB;这里放到 128MB 给超宽屏 / 多显示器拼接留余量,
+# 但必须有上限:GetClientRect 在某些驱动 / 异常窗口上会报出 32767x32767 这种
+# 值,乘 4 就是 4.3GB —— 直接 create_string_buffer 会把进程打死(OOM 崩溃),
+# 而且崩在截图线程里,用户只看到「预览突然全黑 + 软件没了」。
+_MAX_FRAME_BYTES = 128 * 1024 * 1024
+_MAX_FRAME_SIDE = 16384  # 单边上限,超过必然不是正常窗口
+
+
 def _read_client_pixels(mem: int, bmp: int, w: int, h: int) -> bytes | None:
-    """把 mem DC 里的位图读成自上而下的 BGRX 字节流;读满失败返回 None."""
+    """把 mem DC 里的位图读成自上而下的 BGRX 字节流;读满失败返回 None.
+
+    带尺寸上限:异常尺寸直接返回 None(当作「截不到」),不去分配巨型缓冲。
+    """
+    if w <= 0 or h <= 0:
+        return None
+    if w > _MAX_FRAME_SIDE or h > _MAX_FRAME_SIDE:
+        return None
+    nbytes = w * h * 4
+    if nbytes > _MAX_FRAME_BYTES:
+        return None
     bi = BITMAPINFO()
     bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
     bi.bmiHeader.biWidth = w
@@ -101,7 +120,7 @@ def _read_client_pixels(mem: int, bmp: int, w: int, h: int) -> bytes | None:
     bi.bmiHeader.biPlanes = 1
     bi.bmiHeader.biBitCount = 32
     bi.bmiHeader.biCompression = BI_RGB
-    buf = ctypes.create_string_buffer(w * h * 4)
+    buf = ctypes.create_string_buffer(nbytes)
     got = _gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bi), DIB_RGB_COLORS)
     if got != h:
         return None
@@ -143,6 +162,12 @@ def capture_gdi(hwnd: int) -> tuple[int, int, bytes] | None:
     w = rect.right - rect.left
     h = rect.bottom - rect.top
     if w <= 4 or h <= 4:
+        return None
+    # 异常尺寸必须在这里就挡掉:下面要 CreateCompatibleBitmap + 分配
+    # w*h*4 的缓冲,32767x32767 会直接 OOM 崩在截图线程里
+    if w > _MAX_FRAME_SIDE or h > _MAX_FRAME_SIDE:
+        return None
+    if w * h * 4 > _MAX_FRAME_BYTES:
         return None
 
     hdc_window = _user32.GetWindowDC(hwnd)
