@@ -97,6 +97,22 @@ def _apply_palette(app, theme: str = "dark") -> None:
 def apply_theme(app, theme: str) -> None:
     """设置面板切换主题后立刻调这个. 想要所有页面 100% 跟随需要重启。"""
     _apply_palette(app, theme)
+    # v1.8.8:同步 UI 语义色令牌(theme.py)。theme_adapter 给 setStyleSheet
+    # 装了过滤,里面写死的 #888/#e08080 之类会按主题换成对应色 ——
+    # 不再出现「QPalette 变浅了、提示文字还是深色底的灰」这种割裂。
+    try:
+        from .ui.theme import set_theme as _set_tokens
+        _set_tokens(theme)
+    except Exception:  # noqa: BLE001
+        pass
+    # 已经 setStyleSheet 过的控件要重刷一遍才会跟着变
+    try:
+        from .ui.theme_adapter import refresh_all
+        n = refresh_all()
+        if n:
+            get().debug("主题切换:重刷了 %d 个控件的样式", n)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def run(argv: list[str], version: str) -> int:
@@ -140,6 +156,21 @@ def run(argv: list[str], version: str) -> int:
     except Exception:
         _theme = "dark"
     _apply_palette(app, _theme)
+    # v1.8.8:让 theme.py 的语义色令牌和 QPalette 用同一个主题值,
+    # 启动时就是一致的(否则浅色主题下第一屏仍有硬编码灰)
+    try:
+        from .ui.theme import set_theme as _set_tokens
+        _set_tokens(_theme)
+    except Exception:  # noqa: BLE001
+        pass
+    # v1.8.8:给 setStyleSheet 装主题过滤。必须在创建任何窗口之前装,
+    # 这样 __init__ 里设的样式第一遍就已经是当前主题的色。
+    try:
+        from .ui.theme_adapter import install as _install_theme_adapter
+        if _install_theme_adapter():
+            log.info("UI 主题适配器已启用(硬编码色按主题自动换算)")
+    except Exception as ex:  # noqa: BLE001
+        log.warning("UI 主题适配器启用失败(界面仍可用,仅颜色不跟随主题):%s", ex)
     app._afs_theme = _theme  # 给设置对话框切换主题用
 
     # 主窗口
