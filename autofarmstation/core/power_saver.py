@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 from ctypes import wintypes
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
@@ -23,6 +24,7 @@ _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-
 # === 常量 ===
 PROCESS_SET_INFORMATION = 0x0200
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_QUERY_INFORMATION = 0x0400
 
 ProcessPowerThrottling = 4  # PROCESS_INFORMATION_CLASS
 PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
@@ -31,6 +33,26 @@ PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 4  # 关时附带忽略
 
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 NORMAL_PRIORITY_CLASS = 0x00000020
+IDLE_PRIORITY_CLASS = 0x00000040
+ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+HIGH_PRIORITY_CLASS = 0x00000080
+REALTIME_PRIORITY_CLASS = 0x00000100
+
+# 优先级类 → 可读名(日志 / 测试用)
+CLASS_NAME = {
+    IDLE_PRIORITY_CLASS: "IDLE",
+    BELOW_NORMAL_PRIORITY_CLASS: "BELOW_NORMAL",
+    NORMAL_PRIORITY_CLASS: "NORMAL",
+    ABOVE_NORMAL_PRIORITY_CLASS: "ABOVE_NORMAL",
+    HIGH_PRIORITY_CLASS: "HIGH",
+    REALTIME_PRIORITY_CLASS: "REALTIME",
+}
+
+# pid → 进入省电前的原始优先级类。
+# 不记这个的话,取消省电时一律设成 NORMAL —— 本来跑在 HIGH / ABOVE_NORMAL 的
+# 游戏会被**永久降级**,用户会觉得「点了恢复怎么还是卡」。
+_orig_priority: dict[int, int] = {}
+_lock = threading.Lock()
 
 
 class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
@@ -41,19 +63,33 @@ class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
     ]
 
 
-def _open_process(pid: int) -> int:
-    """以「改设置 + 受限查询」权限打开进程;失败返回 0."""
+def _open_process(pid: int, *, query_only: bool = False) -> int:
+    """以「改设置 + 查询」权限打开进程;失败返回 0."""
     if not pid or int(pid) <= 0:
         return 0
     try:
-        h = _kernel32.OpenProcess(
-            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
-            False,
-            int(pid),
-        )
+        access = (PROCESS_QUERY_LIMITED_INFORMATION if query_only
+                  else PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION)
+        h = _kernel32.OpenProcess(access, False, int(pid))
     except Exception:  # noqa: BLE001
         return 0
     return int(h or 0)
+
+
+def current_priority(pid: int) -> int:
+    """读进程当前优先级类;失败返回 0."""
+    hproc = _open_process(int(pid) if pid else 0, query_only=True)
+    if not hproc:
+        return 0
+    try:
+        return int(_kernel32.GetPriorityClass(hproc) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+    finally:
+        try:
+            _kernel32.CloseHandle(hproc)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _set_throttling(hproc: int, on: bool) -> bool:
@@ -76,11 +112,9 @@ def _set_throttling(hproc: int, on: bool) -> bool:
     return bool(ok)
 
 
-def _set_priority(hproc: int, on: bool) -> bool:
-    """开关低于正常的进程优先级."""
+def _set_priority_class(hproc: int, cls: int) -> bool:
     try:
-        cls = BELOW_NORMAL_PRIORITY_CLASS if on else NORMAL_PRIORITY_CLASS
-        ok = _kernel32.SetPriorityClass(hproc, cls)
+        ok = _kernel32.SetPriorityClass(hproc, int(cls))
     except Exception:  # noqa: BLE001
         return False
     return bool(ok)
@@ -89,15 +123,39 @@ def _set_priority(hproc: int, on: bool) -> bool:
 def set_eco(pid: int, on: bool) -> bool:
     """把指定进程设为 / 取消「省电降帧」模式.
 
+    开启时把**原始优先级类**记进 ``_orig_priority``;关闭时按记录精确还原,
+    而不是一律设成 NORMAL(那会把 HIGH / ABOVE_NORMAL 的游戏永久降级)。
+
     返回 True 表示至少电源节流设置成功(优先级失败不视为整体失败)。
     任何异常都静默吞掉 —— 这是锦上添花的功能,绝不影响主流程。
     """
-    hproc = _open_process(int(pid) if pid else 0)
+    pid = int(pid) if pid else 0
+    hproc = _open_process(pid)
     if not hproc:
         return False
     try:
-        ok = _set_throttling(hproc, bool(on))
-        _set_priority(hproc, bool(on))
+        if on:
+            # 只在第一次进入省电时记录原始优先级;重复调用不覆盖
+            with _lock:
+                if pid not in _orig_priority:
+                    cur = 0
+                    try:
+                        cur = int(_kernel32.GetPriorityClass(hproc) or 0)
+                    except Exception:  # noqa: BLE001
+                        cur = 0
+                    _orig_priority[pid] = cur
+            ok = _set_throttling(hproc, True)
+            _set_priority_class(hproc, BELOW_NORMAL_PRIORITY_CLASS)
+            return ok
+        # 关闭:优先还原原始优先级
+        with _lock:
+            orig = _orig_priority.pop(pid, 0)
+        ok = _set_throttling(hproc, False)
+        if orig:
+            _set_priority_class(hproc, orig)
+        else:
+            # 没记录(比如重启软件后)就退回 NORMAL,至少不会留在 BELOW_NORMAL
+            _set_priority_class(hproc, NORMAL_PRIORITY_CLASS)
         return ok
     except Exception:  # noqa: BLE001
         return False
@@ -106,6 +164,33 @@ def set_eco(pid: int, on: bool) -> bool:
             _kernel32.CloseHandle(hproc)
         except Exception:  # noqa: BLE001
             pass
+
+
+def restore_all() -> int:
+    """把所有还在省电模式的进程还原,返回成功个数.
+
+    程序退出时必须调 —— 否则被降频的游戏会一直停在 BELOW_NORMAL + EcoQoS,
+    用户下次开游戏发现「怎么这么卡」却找不到原因。
+    """
+    with _lock:
+        pids = list(_orig_priority.keys())
+    n = 0
+    for pid in pids:
+        try:
+            if set_eco(pid, False):
+                n += 1
+            else:
+                with _lock:
+                    _orig_priority.pop(pid, None)
+        except Exception:  # noqa: BLE001
+            continue
+    return n
+
+
+def eco_pids() -> list[int]:
+    """当前处于省电模式的 pid(调试 / 测试用)."""
+    with _lock:
+        return sorted(_orig_priority)
 
 
 def is_supported() -> bool:
