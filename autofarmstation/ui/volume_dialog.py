@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel,
     QPushButton, QSlider, QVBoxLayout, QWidget,
@@ -20,6 +20,10 @@ from PySide6.QtWidgets import (
 
 from ..core import audio
 from ..utils.sanitize import sanitize
+
+# 拖动滑块时 valueChanged 会连着触发几十次,每次都写盘会把磁盘刷爆。
+# 改成「停手 400ms 后写一次」;关闭对话框时再强制补一次,保证不漏。
+_SAVE_DEBOUNCE_MS = 400
 
 
 class SessionVolumeDialog(QDialog):
@@ -108,6 +112,11 @@ class GroupVolumeDialog(QDialog):
         self.setMinimumWidth(420)
         self._pids_provider = pids_provider
         self._cfg = cfg
+        # 防抖落盘:拖动滑块 / 连续勾选时不会每动一下就写盘
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(_SAVE_DEBOUNCE_MS)
+        self._save_timer.timeout.connect(self._flush_config)
 
         v = QVBoxLayout(self)
         tip = QLabel(
@@ -220,11 +229,56 @@ class GroupVolumeDialog(QDialog):
         except Exception:  # noqa: BLE001
             return []
 
+    # --- 关闭兜底 ---
+    def done(self, code: int) -> None:
+        """对话框关闭前把还没落盘的设置补写一次.
+
+        拖动滑块后 400ms 内直接关窗口,防抖定时器还没点火,
+        不在这里补一刀,这次改动就白改了。
+        """
+        try:
+            self._flush_config()
+        except Exception:  # noqa: BLE001
+            pass
+        super().done(code)
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        """标题栏 X 关闭同样兜底(done 覆盖不到这条路径)."""
+        try:
+            self._flush_config()
+        except Exception:  # noqa: BLE001
+            pass
+        super().closeEvent(event)
+
     def _refresh_status(self) -> None:
         if not audio.available():
             return
         pids = self._pids()
         self._status.setText(audio.describe_for_pids(pids))
+
+    def _flush_config(self) -> None:
+        """把内存里的音量设置真正写到 config.json.
+
+        之前这里是 4 处 ``cfg.set()`` 却一次 ``cfg.save()`` 都没有 ——
+        用户在音量对话框调完,一关对话框 / 一重启软件,设置全部丢干净
+        (设置页里同样的字段有 save,所以「设置里改能记住、音量对话框改记不住」)。
+        """
+        if self._cfg is None:
+            return
+        try:
+            self._cfg.save()
+        except Exception as ex:  # noqa: BLE001
+            # 落盘失败不能让界面跟着炸,只在状态栏提示
+            try:
+                self._status.setText(f"保存失败:{ex}")
+            except Exception:
+                pass
+
+    def _schedule_save(self) -> None:
+        """防抖保存:连续操作只写最后一次."""
+        if self._cfg is None:
+            return
+        self._save_timer.start()
 
     def _on_value_changed(self, val: int) -> None:
         pids = self._pids()
@@ -232,6 +286,7 @@ class GroupVolumeDialog(QDialog):
         self._value_lab.setText(f"{val}%({n}/{len(pids)})")
         if self._cfg is not None:
             self._cfg.set("audio.group_volume", val / 100.0)
+            self._schedule_save()
 
     def _on_mute_toggled(self, on: bool) -> None:
         pids = self._pids()
@@ -245,14 +300,17 @@ class GroupVolumeDialog(QDialog):
             self._refresh_status()
         if self._cfg is not None:
             self._cfg.set("audio.group_mute", bool(on))
+            self._schedule_save()
 
     def _on_sys_toggled(self, on: bool) -> None:
         self._sys_box.setVisible(on)
         if self._cfg is not None:
             self._cfg.set("audio.control_system_master", bool(on))
+            self._schedule_save()
 
     def _on_sys_value_changed(self, val: int) -> None:
         audio.set_master_volume(val / 100.0)
         self._sys_lab.setText(f"{val}%")
         if self._cfg is not None:
             self._cfg.set("audio.system_master_volume", val / 100.0)
+            self._schedule_save()
