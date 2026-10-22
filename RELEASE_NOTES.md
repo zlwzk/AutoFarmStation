@@ -1,3 +1,75 @@
+# AutoFarmStation v1.8.8 · 稳定性重构：防数据丢失 + 跨线程安全
+
+这一版不追新功能，专心补**会让用户数据丢失或行为错误的深层缺陷**。所有条目都带回归测试，
+已并入 `python -m scripts.selftest`（60 → 65 项），另加 GUI 冒烟 `scripts/smoke_gui.py`。
+
+---
+
+## P0：会丢数据 / 会静默损坏（4 条）
+
+| # | 问题 | 后果 | 修法 |
+|---|------|------|------|
+| 1 | `atomic_write` 用「unlink 原文件 → move」，两步之间原文件**不存在**，且无 fsync | 崩溃/断电时 `config.json` 连同 `.corrupt.json` 备份**一起彻底消失**，所有设置、窗口列表归零 | `write → flush → os.fsync → os.replace`；tmp 名带 pid；失败清半截 tmp |
+| 2 | `set_window_pos` 的 `if y is None` 分支误写 `SWP_NOMOVE`（应为 `SWP_NOSIZE` 语义分组） | 只传 y 时 x=-1 未保护，窗口瞬移到 (-1,-1) **飞出屏幕** | `if x is None or y is None: SWP_NOMOVE` |
+| 3 | `set_clicker_config` 原地改 `cfg.hwnd` 后存**引用**，「启动全部」把同一对象循环塞给 N 个窗口 | `_clicker_cfg` 所有 entry 指向同一对象且 hwnd=最后一个 → **所有窗口的点全打到同一个窗口**；改一个窗口的点位污染全部 | 入口 `deepcopy`（与 `broadcast_*` 一致） |
+| 4 | 全局热键 / 定时任务 / 进程监控回调**直接在非 GUI 线程**摸 Qt 控件、`close()`、`start_many()` | dict 迭代 RuntimeError；热键与 GUI 线程同时 `start_many` → **同窗口两个连点器，点击翻倍**；定时「退出软件」在调度线程自 join → 清理全不执行（Steam 不还原、嵌入窗口不还原） | 统一切主线程 `QTimer.singleShot(0, receiver, slot)`（复用项目已有 `_on_monitor_event` / `_on_frame` 范式） |
+
+> 第 4 条的根因是「范式没铺开」而非算法难题：项目里本来就有三个正确样板，复制到热键、
+> scheduler、`pm.on_change` 三个入口即全清。
+
+## P1：功能偶发失效（已修 6 条）
+
+| # | 问题 | 后果 | 修法 |
+|---|------|------|------|
+| 5 | `audio._ensure_com` 用**进程级** flag，但 COM 初始化是**每线程**的 | GUI 线程初始化后，调度线程调音量跳过 `CoInitialize` → comtypes 抛错被吞 → **定时调音量静默失效**，UI 还显示成功 | 改 `threading.local()` |
+| 6 | Steam 状态联动把「当前已等于挂机态」的 state 当成挂机前状态存下 | 还原时反而设成挂机态，**用户原状态永久丢失** | 相等时不记录、不切换；加单调 `generation` token，排队中的过期意图直接丢弃 |
+| 7 | 音量「降音量」不拍快照，还原时一刀切推 100% | 用户原来 30% 的音量被抹成 100% | 降音量也拍快照；无快照时只取消静音、**不再推 100%**；加锁（GUI/调度双线程） |
+| 8 | 挂机时段 `action=pause` 的「回到时段自动恢复」**从未实现**（`_farm_paused` 只写不读，记完就清空） | README 承诺自动恢复，实际从不恢复，用户得手动一个个点启动 | 真正调 `start_many` 恢复（只恢复还活着的窗口） |
+| 9 | 时间**已过**的一次性任务永不执行（`if not t.next_run: continue` 永远跳过触发分支），且每秒写盘 | 用户选了个过去的时间保存，任务**永远不跑** | 过期 ONCE 立即补跑一次再自禁用 |
+| 10 | `scheduler._loop` / `_try_restart` 无异常隔离、重启无上限 | 落盘失败 → 调度线程死 → **所有定时任务永久静默失效**；游戏反复崩溃 → **重启风暴打满 CPU** | 循环体逐任务 try + 整体兜底；重启限流（5 分钟 3 次 + 10 秒冷却 + 风暴提示） |
+| 11 | `client_origin` / `client_size` 不校验 Win32 返回值 | 窗口刚销毁时返回 (0,0) 被当合法坐标 → **连点打到屏幕左上角** | 加 `_is_window` 前置校验；新增 `*_checked` 变体（返回 None）供需要区分的调用方，**保持原 tuple 契约不破坏 23 个调用方** |
+| 12 | `import_configs` 完全无锁 + `except: pass` 静默丢配置 | 界面显示「已恢复 N 个窗口」，实际点位是空的 | 加锁 + 记 warning + 返回成功条数供上层核对 |
+
+## 体验与健壮性细节
+
+- **输入发送**：send 回退前用 `GetForegroundWindow` 轮询确认前台（带 0.5s 超时），
+  抢不到前台就**中止**——不再往用户正在用的别的软件上真实点击；`move` / `scroll` 同样处理。
+- **文本输入**：`type_text` 改用 `KEYEVENTF_UNICODE`（SendInput）和 `WM_CHAR`（post），
+  中文 / 符号 / 大小写原样进去，不再被 `ord(c.upper()) & 0xFF` 截成乱码。
+- **同步启动**：`start_many` 逐窗口 try（一个窗口抛异常不再打断整批），
+  连点器与键盘宏**分别统计**——「连点起来了宏没起来」不再被藏成成功。
+- **批量启动补同步**：`pm.on_change` 改成切主线程异步派发后，`add_by_*` 之后显式 `sync_now()`，
+  保证卡片立刻可见（不等事件循环）。
+- **窗口失效语义**：新增 `client_size_checked` / `client_origin_checked`（失效返回 None），
+  原函数保持 tuple 契约，避免一次性改炸 23 个解包调用点。
+
+## 测试与验证
+
+```
+python -m scripts.selftest            # 65/65 通过(原 60 + 新增 5)
+python -u scripts/smoke_gui.py 6      # GUI 冒烟:真实拉起主窗口 + 线程范式 + 干净退出
+```
+
+新增回归（全部并入 selftest）：
+`t_v188_atomic_write`（200 次覆盖 + 5 线程并发写 + 无 tmp/lock 残留）、
+`t_v188_shared_config`（多窗口配置隔离 + import 返回值）、
+`t_v188_overdue_once_task`（过期任务补跑）、
+`t_v188_scheduler_survives_save_fail`（落盘失败调度循环不死）、
+`t_v188_restart_storm_guard`（重启限流 + 参数不切碎）。
+
+> 独立测试脚本 `scripts/test_stability_v188*.py` / `test_volume_persist.py` /
+> `test_p0_shared_config.py` 仍保留，可单独跑。
+
+## 已知未修（下一批候选）
+
+- `window_host` 嵌入失败路径的完整回滚（缺 `SWP_FRAMECHANGED`、`SetParent` 无返回值检查）
+- 嵌入 DPI 双坐标系错配（Per-Monitor V2 vs 游戏自身线程 DPI）
+- EcoQoS 退出时不批量还原、原始优先级类未记录
+- 备份还原无事务（中途失败不回滚）
+- 更新下载在 GUI 线程同步跑（下载期间界面冻结）
+
+---
+
 # AutoFarmStation v1.8.7 · 标签与分类可设置 + 截图选点逻辑完善
 
 这次补上两处「有字段但没有入口」的缺口：**标签以前根本没法设置**（`tags` 字段从没有任何界面写入，
